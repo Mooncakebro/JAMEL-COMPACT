@@ -1,12 +1,12 @@
 # JAMEL: Joint Agent Memory and Exploration Learning via Novelty Signals
 
-[![Paper](https://img.shields.io/badge/Paper-JAMEL-red)](docs/paper.pdf)
+[![Paper](https://img.shields.io/badge/arXiv-2606.01528-red)](https://arxiv.org/abs/2606.01528)
 [![dataset](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Model%20TBD-FFD21E)](https://huggingface.co)
 [![dataset](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Data%20TBD-FFD21E)](https://huggingface.co)
 
 ![arch](docs/arch.png)
 
-This repository implements the core ideas of [Joint Agent Memory and Exploration Learning via Novelty Signals](docs/paper.pdf). In open-ended environments, agents often struggle to explore effectively, especially when external task rewards are sparse or unavailable. A central reason is that effective exploration requires memory. Without remembering what has already been tried, an agent can easily repeat exhausted behaviors instead of discovering new states.
+This repository implements the core ideas of [Joint Agent Memory and Exploration Learning via Novelty Signals](https://arxiv.org/abs/2606.01528). In open-ended environments, agents often struggle to explore effectively, especially when external task rewards are sparse or unavailable. A central reason is that effective exploration requires memory. Without remembering what has already been tried, an agent can easily repeat exhausted behaviors instead of discovering new states.
 
 The paper proposes **JAMEL** — **Joint Agent Memory and Exploration Learning** — a framework that trains agent memory and exploration policy together. Its main insight is that memory and exploration form a mutually reinforcing loop: memory helps the agent avoid repeated behaviors and identify unexplored actions, while novelty-driven exploration provides supervision for what the memory should encode. Instead of relying on manually annotated memory labels, JAMEL uses persistent novelty signals, such as JavaScript code coverage in GUI environments, as an intrinsic reward for discovering new behavior. Experiments on the [ScaleWoB](https://github.com/ScaleWoB/ScaleWoB) GUI benchmark show that JAMEL generalizes to unseen applications.
 
