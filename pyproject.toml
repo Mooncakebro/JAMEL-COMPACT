@@ -1,0 +1,115 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["jamel*"]
+
+[project]
+name = "jamel"
+version = "0.1.0"
+description = "JAMEL: latent-memory browser exploration with novelty-driven coverage reward"
+authors = [
+    {name = "JAMEL Authors"}
+]
+license = {text = "Apache-2.0"}
+readme = "README.md"
+requires-python = ">=3.10"
+keywords = ["browser-agents", "web-automation", "latent-memory", "coverage-reward", "llm", "playwright"]
+
+dependencies = [
+    "playwright>=1.40.0",
+    "browsergym-core>=0.14.0",
+    "openai>=1.0.0",
+    "httpx>=0.25.0",
+    "beautifulsoup4>=4.12.0",
+    "gymnasium>=0.29.0",
+    "torch>=2.0.0",
+    "structlog>=23.0.0",
+    "python-dotenv>=1.0.0",
+    "fastapi>=0.104.0",
+    "uvicorn[standard]>=0.24.0",
+    "pydantic>=2.0.0",
+    "pydantic-settings>=2.0.0",
+    "transformers>=4.35.0",
+    "torchvision>=0.15.0",
+    "pillow>=10.0.0",
+    "numpy",
+    "pandas",
+    "pyarrow",
+    "matplotlib",
+    "qwen-vl-utils[decord]",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "black>=23.0.0",
+    "isort>=5.12.0",
+    "mypy>=1.0.0",
+]
+train = [
+    "accelerate",
+    "datasets",
+    "hydra-core",
+    "peft",
+    "ray[default]",
+    "tensordict<=0.6.2",
+    "torchdata",
+    "wandb",
+]
+
+[project.scripts]
+jamel = "jamel.cli.main:main"
+explore = "jamel.cli.main:main"
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+torchvision = [
+    { index = "pytorch-cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.setuptools.package-data]
+"*" = ["*.py", "*.yaml", "*.json"]
+
+[tool.black]
+line-length = 88
+target-version = ['py310']
+include = '\.pyi?$'
+extend-exclude = '''
+/(
+  \.git
+  | \.venv
+  | _build
+  | buck-out
+  | build
+  | dist
+)/
+'''
+
+[tool.isort]
+profile = "black"
+multi_line_output = 3
+line_length = 88
+known_first_party = ["jamel"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"

@@ -1,40 +1,14 @@
 # Training
 
-JAMEL training has two stages:
+Start from the environment setup in the README. Training uses the same Python
+environment as evaluation, plus `third_party/verl-agent/requirements.txt`.
 
-1. Convert exploration trajectories into memory-augmented SFT parquet files.
-2. Train `MemoryAugmentedCausalLM` with the bundled `third_party/verl-agent`
-   FSDP SFT trainer.
-
-## Key Code
-
-```text
-jamel/train/memory/prepare_sft_dataset.py
-jamel/train/memory/jamel_sft_dataset.py
-jamel/train/memory/modeling.py
-jamel/train/memory/encoder.py
-jamel/train/memory/web_prompt.py
-shell/run_qwen25vl_7b_sft.sh
-third_party/verl-agent/verl/trainer/fsdp_sft_trainer.py
-```
-
-## Hardware
-
-The full 7B multimodal SFT recipe was designed for 8 x 80GB GPUs. Smaller
-experiments can use fewer GPUs by changing the `torchrun --nproc_per_node` line
-in `shell/run_qwen25vl_7b_sft.sh`, but batch size, gradient checkpointing, and
-maximum length may need adjustment.
-
-## Prepare Data
-
-Input trajectories are parquet files with screenshots, observations, actions,
-rewards, and coverage artifacts. The preparation step recomputes the canonical
-JAMEL prompt and precomputes latent memory tokens from previous session steps.
+## 1. Prepare SFT data
 
 ```bash
 cd JAMEL
 
-uv run python jamel/train/memory/prepare_sft_dataset.py \
+python jamel/train/memory/prepare_sft_dataset.py \
   --input /path/to/trajectory.parquet \
   --output data/jamel_sft_data \
   --compressor-model /path/to/Qwen3-VL-2B-Instruct \
@@ -44,48 +18,37 @@ uv run python jamel/train/memory/prepare_sft_dataset.py \
   --compression-batch-size 4
 ```
 
-Output files:
+This writes:
 
 ```text
 data/jamel_sft_data/jamel_memory_sft_train.parquet
 data/jamel_sft_data/jamel_memory_sft_val.parquet
 ```
 
-## Run SFT
+## 2. Train and package the model
 
 ```bash
 TRAIN_FILE=data/jamel_sft_data/jamel_memory_sft_train.parquet \
 VAL_FILE=data/jamel_sft_data/jamel_memory_sft_val.parquet \
-MODEL_PATH=/path/to/Qwen2.5-VL-7B-Instruct \
+BASE_MODEL_PATH=Qwen/Qwen2.5-VL-7B-Instruct \
+COMPRESSOR_MODEL=/path/to/Qwen3-VL-2B-Instruct \
 OUTPUT_DIR=outputs/jamel_sft_ckpt \
-TOTAL_EPOCHS=3 \
+OUTPUT_MODEL_PATH=outputs/jamel_model \
+NPROC_PER_NODE=8 \
+TOTAL_EPOCHS=1 \
 VAL_STEPS=200 \
 bash shell/run_qwen25vl_7b_sft.sh
 ```
 
-Important defaults:
+`OUTPUT_DIR` stores actor checkpoints such as `global_step_*`.
+`NPROC_PER_NODE` is the number of training GPUs used by `torchrun`.
+`OUTPUT_MODEL_PATH` stores the final JAMEL model used by evaluation:
 
 ```text
-memory_max_items = 512
-memory_hidden_size = 2048
-max_length = 8192
-model input image = 640 x 360
-browser viewport = 1280 x 720
-response format = <action>...</action>
+outputs/jamel_model/
+  actor/
+  compressor/
+  model.json
 ```
 
-The training script sets `PYTHONPATH` to include both this repository and
-`third_party/verl-agent`.
-
-## Small Smoke Training
-
-For a single-app smoke run, use:
-
-```bash
-INPUT_PARQUET=/path/to/react-vision/youdao/trajectory.parquet \
-DATASET_DIR=data/jamel_youdao_sft \
-OUTPUT_DIR=outputs/jamel_youdao_ckpt \
-MODEL_PATH=/path/to/Qwen2.5-VL-7B-Instruct \
-COMPRESSOR_MODEL=/path/to/Qwen3-VL-2B-Instruct \
-bash shell/run_youdao_sft.sh
-```
+Use `OUTPUT_MODEL_PATH` as `MODEL_PATH` in [EVALUATION.md](EVALUATION.md).

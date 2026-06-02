@@ -1,0 +1,82 @@
+FROM verlai/verl:vllm011.latest
+
+# ---------------------------------------------------------------------------
+# Base environment for verl-agent
+# ---------------------------------------------------------------------------
+ENV MAX_JOBS=32
+ENV VLLM_WORKER_MULTIPROC_METHOD=spawn
+ENV DEBIAN_FRONTEND=noninteractive
+ENV NODE_OPTIONS=""
+ENV PIP_ROOT_USER_ACTION=ignore
+ENV HF_HUB_ENABLE_HF_TRANSFER="1"
+
+# Build arguments
+ARG APT_SOURCE=https://mirrors.tuna.tsinghua.edu.cn/ubuntu
+ARG PIP_INDEX=https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
+
+# Python package index
+RUN pip config set global.index-url "${PIP_INDEX}" && \
+    pip config set global.extra-index-url "${PIP_INDEX}" && \
+    python -m pip install --upgrade pip
+
+# ---------------------------------------------------------------------------
+# verl-agent base dependencies
+# ---------------------------------------------------------------------------
+COPY requirements.txt /
+WORKDIR /
+RUN pip install -r requirements.txt
+
+# Sokoban dependencies
+RUN pip install matplotlib && \
+    pip install gym==0.26.2 && \
+    pip install gym_sokoban==0.0.6
+
+# ---------------------------------------------------------------------------
+# JAMEL extra runtime dependencies on top of verl
+# - browser runtime libraries
+# - BrowserGym / Playwright stack
+# - chromium installation
+# JAMEL source itself is expected to be bind-mounted at runtime, e.g.
+# `-v ../JAMEL:/workspace/JAMEL`
+# ---------------------------------------------------------------------------
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends curl ca-certificates && \
+    curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
+    apt-get install -y --no-install-recommends nodejs && \
+    apt-get install -y --no-install-recommends \
+        libatk1.0-0 \
+        libatk-bridge2.0-0 \
+        libcups2 \
+        libatspi2.0-0 && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN if [ -n "${HTTP_PROXY}" ]; then npm config set proxy ${HTTP_PROXY}; fi \
+    && if [ -n "${HTTPS_PROXY}" ]; then npm config set https-proxy ${HTTPS_PROXY}; fi \
+    && npm install -g monocart-coverage-reports \
+    && npm config delete proxy \
+    && npm config delete https-proxy \
+    && npm cache clean --force
+
+RUN pip install \
+    browsergym-core==0.14.3 \
+    gymnasium==1.2.3 \
+    playwright==1.44.0 \
+    beautifulsoup4 \
+    pydantic-settings \
+    lxml \
+    starlette==0.48.0 && \
+    playwright install chromium
+    
+WORKDIR /workspace/verl-agent
+COPY . /workspace/verl-agent
+
+# Install current verl-agent workspace instead of PyPI verl
+RUN pip install -e .
+
+RUN pip install structlog
+
+# Reset pip config
+RUN pip config unset global.index-url && \
+    pip config unset global.extra-index-url
+
+ENTRYPOINT ["/bin/bash"]

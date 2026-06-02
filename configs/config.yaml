@@ -1,0 +1,94 @@
+# web config
+record_coverage: true
+target_urls:
+  - http://localhost:8000/weibo/
+url_parallelism: 1
+trajectory_parallelism_per_url: 1
+curriculum_stage_iterations: 10
+# inference
+model_api_port: 8888
+model_api_host: 0.0.0.0
+jinja_template_path: jamel/models/chat_template/qwen3_continue.jinja
+inference_kwargs:
+  temperature: 1.0
+  # top_p: 0.9
+  max_tokens: 500
+  chat_template_kwargs:
+    enable_thinking: false
+    add_generation_prompt: false
+    # continue_final_message: true
+  # repetition_penalty: 1.2
+
+memory_type: parametric
+brain_type: parametric_memory
+
+# Hyperparameters for training
+# basic
+max_steps_per_trajectory: 6
+explore_num_per_iteration: 6
+least_sample_num_per_iteration: 6 # 每次更新最少的样本训练数量
+data_processors: # top_k or threshold
+  memory: # memory 部分的训练方式。
+    name: no_filter # memory 是所有样本都要学习的。
+  policy: # policy 部分的训练方式。
+    name: top_k # 选择分数最高的样本用于训练，可以用 percent or top_k
+    kwargs:
+      percent: 0.6
+update_iterations: 10
+training_api_type: swift_cli
+output_base_dir: 'outputs/pipeline_models'
+max_version_limit: 2 # 至少需要留两个。
+# model
+model: 'Qwen/Qwen3-8B-Base'  # model_id or local model path
+start_iteration_step: 0
+output_dir: 'outputs/test_model' # 在 pipeline 中会被覆盖，因此没什么用，pipeline 需要管理多个版本的 checkpoint。
+overwrite_output_dir: true
+add_version: false
+model_author: jamel
+model_type: qwen3 # learn memory only
+model_name: jamel # 输出模型名称
+external_plugins: jamel/train/agent/swift/plugin.py
+# new_special_tokens:
+#   - "--- Thought ---"
+#   - "--- Action ---"
+#   - "--- Memory ---"
+stage_training_args:
+  memory: # memory 训练阶段的特定 training args
+    template: qwen3_memory
+  policy: # policy 训练阶段的特定 training args
+    template: qwen3_policy
+# dataset
+data_seed: 42
+# dataset: 'jamel/exploration'
+max_length: 32768
+truncation_strategy: left
+split_dataset_ratio: 0.1  # Split validation set
+dataset_num_proc: 1  # The number of processes for data loading.
+dataloader_num_workers: 1
+
+# train
+ignore_args_error: true
+tuner_type: full
+attn_impl: flash_attn
+deepspeed: configs/zero2.json
+learning_rate: 5e-6
+per_device_train_batch_size: 1
+per_device_eval_batch_size: 1
+gradient_checkpointing: true
+weight_decay: 0.1
+lr_scheduler_type: 'cosine'
+warmup_ratio: 0.05
+torch_dtype: bfloat16
+ddp_timeout: 180000000
+report_to: ['tensorboard']
+logging_first_step: true
+save_strategy: 'epoch'
+save_steps: 500
+save_only_model: true
+eval_strategy: 'steps'
+eval_steps: 10
+gradient_accumulation_steps: 1
+num_train_epochs: 1
+metric_for_best_model: 'loss'
+save_total_limit: 3
+logging_steps: 1

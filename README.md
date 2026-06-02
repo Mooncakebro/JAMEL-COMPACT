@@ -12,18 +12,23 @@ The paper proposes **JAMEL** — **Joint Agent Memory and Exploration Learning**
 
 ## Quick Start
 
-Create and synchronize the local Python environment with `uv`:
+Create and synchronize the local environment with `uv`:
 
 ```bash
+git clone https://github.com/MobileLLM/JAMEL.git
 cd JAMEL
 
-bash shell/setup_env.sh
+uv sync --locked --python 3.10 --extra dev --extra train
+uv run playwright install chromium
 source .venv/bin/activate
 ```
 
-Install the Node.js coverage tools used by browser evaluation:
+Install system fonts and the Node.js (18+) coverage tools used by browser evaluation:
 
 ```bash
+sudo apt-get update
+sudo apt-get install -y fontconfig fonts-noto-cjk fonts-noto-color-emoji
+fc-cache -fv
 npm install -g monocart-coverage-reports monocart-locator
 ```
 
@@ -36,63 +41,69 @@ export SCALEWOB_ROOT=$PWD/env/browser_env/scalewob-env
 export PYTHONPATH=$JAMEL_ROOT:$VERL_AGENT_ROOT:${PYTHONPATH:-}
 ```
 
-Download and serve the browser environment:
+Download ScaleWoB benchmark:
 
 ```bash
-bash shell/download_scalewob_env.sh --mode all
-bash shell/serve_scalewob.sh
-# Open http://127.0.0.1:8000/expedia/index.html
+python scripts/download_scalewob_env.py
 ```
 
-## Evaluation
-
-Run JAMEL evaluation on `test10`:
-
+You can preview the browser environment now:
 ```bash
-CHECKPOINT=/path/to/jamel_checkpoint \
-JAMEL_BASE_MODEL=/path/to/base-model-used-by-checkpoint \
-COMPRESSOR_MODEL=/path/to/Qwen3-VL-2B-Instruct \
-NUM_GPUS=4 WORKERS_PER_GPU=1 \
-EVAL_OUTPUT=outputs/eval_test10 \
-bash shell/run_eval.sh
+python scripts/serve_scalewob.py
+# Open http://127.0.0.1:8000/<app_name>/index.html to browse the benchmark. e.g., http://127.0.0.1:8000/expedia/index.html
 ```
 
-### App Split
-
-The release uses the paper split:
-
-- `train86`: 86 training apps.
-- `test10`: `vipshop alibaba expedia taobao pinduoduo dongchedi youku keep meituan temu`.
-
-See [docs/APP_SPLIT.md](docs/APP_SPLIT.md) and
-[configs/benchmark_apps.json](configs/benchmark_apps.json).
-
-## TRAINING
-
-Prepare SFT data and train:
+For training dependencies, install:
 
 ```bash
-uv run python jamel/train/memory/prepare_sft_dataset.py \
+uv pip install -r third_party/verl-agent/requirements.txt
+```
+
+### Training
+
+The training entry point is [docs/TRAINING.md](docs/TRAINING.md). Prepare SFT data from trajectories, then train the actor. If `OUTPUT_MODEL_PATH` is set, the trainer packages the final JAMEL model for evaluation automatically.
+
+```bash
+python jamel/train/memory/prepare_sft_dataset.py \
   --input /path/to/trajectory.parquet \
   --output data/jamel_sft_data \
   --compressor-model /path/to/Qwen3-VL-2B-Instruct \
   --max-memory-items 512 \
   --max-length 8192 \
-  --val-ratio 0.02
+  --val-ratio 0.02 \
+  --compression-batch-size 4
 
 TRAIN_FILE=data/jamel_sft_data/jamel_memory_sft_train.parquet \
 VAL_FILE=data/jamel_sft_data/jamel_memory_sft_val.parquet \
-MODEL_PATH=/path/to/Qwen2.5-VL-7B-Instruct \
+BASE_MODEL_PATH=Qwen/Qwen2.5-VL-7B-Instruct \
+COMPRESSOR_MODEL=/path/to/Qwen3-VL-2B-Instruct \
 OUTPUT_DIR=outputs/jamel_sft_ckpt \
+OUTPUT_MODEL_PATH=outputs/jamel_model \
+NPROC_PER_NODE=8 \
+TOTAL_EPOCHS=2 \
+VAL_STEPS=200 \
 bash shell/run_qwen25vl_7b_sft.sh
 ```
 
-## Documentation
 
-- [Setup](docs/SETUP.md)
-- [Environment Layout](docs/ENVIRONMENTS.md)
-- [Browser Environment](docs/ENVIRONMENT.md)
+### Evaluation
+
+The evaluation entry point is [docs/EVALUATION.md](docs/EVALUATION.md). Run JAMEL evaluation on 10 test apps:
+
+```bash
+MODEL_PATH=/path/to/jamel_model \
+APPS_MODE=test10 \
+MAX_STEPS=50 \
+NUM_SESSIONS=1 \
+NUM_GPUS=4 \
+WORKERS_PER_GPU=1 \
+EVAL_OUTPUT=outputs/eval_test10 \
+bash shell/run_eval.sh
+```
+
+For more details, please refer to [this document](docs/EVALUATION.md).
+
+### Documentation
+
 - [Training](docs/TRAINING.md)
 - [Evaluation](docs/EVALUATION.md)
-- [Models and Data](docs/MODELS.md)
-- [App Split](docs/APP_SPLIT.md)
