@@ -1,7 +1,7 @@
 # JAMEL: Joint Agent Memory and Exploration Learning via Novelty Signals
 
 [![Paper](https://img.shields.io/badge/arXiv-2606.01528-red)](https://arxiv.org/abs/2606.01528)
-[![dataset](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Model%20TBD-FFD21E)](https://huggingface.co)
+[![dataset](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-JAMEL--9B-FFD21E)](https://huggingface.co/BlitherBoom/JAMEL-9B)
 [![dataset](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Data%20TBD-FFD21E)](https://huggingface.co)
 
 ![arch](docs/arch.png)
