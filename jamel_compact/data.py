@@ -461,39 +461,48 @@ def prepare_compact_dataset(
     train_writer = None
     val_writer = None
 
-    for p in parquet_files:
+    try:
+        for p in parquet_files:
+            try:
+                df_chunk = pd.read_parquet(p, columns=essential_cols)
+            except (ValueError, KeyError):
+                df_chunk = pd.read_parquet(p)
+            chunk_len = len(df_chunk)
+
+            chunk_global_indices = list(range(global_idx, global_idx + chunk_len))
+            train_local = [j for j in range(chunk_len) if chunk_global_indices[j] in train_indices]
+            val_local = [j for j in range(chunk_len) if chunk_global_indices[j] in val_indices]
+
+            if train_local:
+                train_table = pa.Table.from_pandas(df_chunk.iloc[train_local])
+                if train_writer is None:
+                    train_writer = pq.ParquetWriter(train_path, train_table.schema)
+                train_writer.write_table(train_table)
+
+            if val_local:
+                val_table = pa.Table.from_pandas(df_chunk.iloc[val_local])
+                if val_writer is None:
+                    val_writer = pq.ParquetWriter(val_path, val_table.schema)
+                val_writer.write_table(val_table)
+
+            global_idx += chunk_len
+            del df_chunk
+            if global_idx % 3000 == 0:
+                gc.collect()
+                print(f"  ... processed {global_idx}/{len(indices)} rows")
+    finally:
+        # Close writers and release pyarrow C++ resources to avoid
+        # "terminate called without an active exception" on exit.
+        if train_writer is not None:
+            train_writer.close()
+        if val_writer is not None:
+            val_writer.close()
+        del train_writer, val_writer
+        # Force pyarrow to release internal memory pool
         try:
-            df_chunk = pd.read_parquet(p, columns=essential_cols)
-        except (ValueError, KeyError):
-            df_chunk = pd.read_parquet(p)
-        chunk_len = len(df_chunk)
-
-        chunk_global_indices = list(range(global_idx, global_idx + chunk_len))
-        train_local = [j for j in range(chunk_len) if chunk_global_indices[j] in train_indices]
-        val_local = [j for j in range(chunk_len) if chunk_global_indices[j] in val_indices]
-
-        if train_local:
-            train_table = pa.Table.from_pandas(df_chunk.iloc[train_local])
-            if train_writer is None:
-                train_writer = pq.ParquetWriter(train_path, train_table.schema)
-            train_writer.write_table(train_table)
-
-        if val_local:
-            val_table = pa.Table.from_pandas(df_chunk.iloc[val_local])
-            if val_writer is None:
-                val_writer = pq.ParquetWriter(val_path, val_table.schema)
-            val_writer.write_table(val_table)
-
-        global_idx += chunk_len
-        del df_chunk
-        if global_idx % 3000 == 0:
-            gc.collect()
-            print(f"  ... processed {global_idx}/{len(indices)} rows")
-
-    if train_writer:
-        train_writer.close()
-    if val_writer:
-        val_writer.close()
+            pa.default_memory_pool().release_unused()
+        except Exception:
+            pass
 
     del train_indices, val_indices, indices
     gc.collect()
