@@ -28,9 +28,18 @@ from pathlib import Path
 from typing import Any, List, Optional
 
 import pandas as pd
-import torch
 from PIL import Image
-from torch.utils.data import Dataset
+
+# torch is only needed for CompactDataset and collate_fn, not for
+# prepare_compact_dataset.  Import lazily to allow data prep without torch.
+try:
+    import torch
+    from torch.utils.data import Dataset
+    _TORCH_AVAILABLE = True
+except ImportError:
+    _TORCH_AVAILABLE = False
+    torch = None
+    Dataset = object  # fallback base class
 
 
 def _decode_png(image_bytes: bytes | None) -> Image.Image | None:
@@ -282,61 +291,218 @@ def collate_fn(batch: list[dict], pad_token_id: int = 0) -> dict:
     return result
 
 
+def discover_parquet_files(input_path: str | list[str]) -> list[str]:
+    """
+    Discover all trajectory.parquet files from the input path.
+
+    Supports three input formats:
+      1. A single parquet file:  "data/weibo/trajectory.parquet"
+      2. A list of parquet files: ["data/weibo/trajectory.parquet", ...]
+      3. A directory containing app subdirectories (ExplorerSFT-ReAct layout):
+         "data/ExplorerSFT-ReAct_Dataset/data/react-vision"
+         → discovers data/ExplorerSFT-ReAct_Dataset/data/react-vision/*/trajectory.parquet
+
+    The ExplorerSFT-ReAct dataset has this structure:
+      data/
+      ├── react-text/
+      │   ├── weibo/
+      │   │   ├── trajectory.parquet   (150 rows)
+      │   │   └── summary.json
+      │   ├── alibaba/
+      │   │   ├── trajectory.parquet
+      │   │   └── summary.json
+      │   └── ... (80 apps)
+      └── react-vision/
+          ├── weibo/
+          │   ├── trajectory.parquet   (150 rows, includes screenshots)
+          │   └── summary.json
+          └── ... (80 apps)
+
+    Each trajectory.parquet has ~150 rows (one per step in a 150-step session).
+    Total: 80 apps × 150 steps × 2 variants = ~24,000 rows.
+    """
+    if isinstance(input_path, list):
+        # Already a list of files
+        return [f for f in input_path if f.endswith(".parquet")]
+
+    p = Path(input_path)
+    if p.is_file() and p.suffix == ".parquet":
+        return [str(p)]
+
+    if p.is_dir():
+        # Directory: discover all trajectory.parquet under app subdirectories
+        parquets = sorted(p.glob("*/trajectory.parquet"))
+        if not parquets:
+            # Try deeper: variant/app/trajectory.parquet
+            parquets = sorted(p.glob("*/*/trajectory.parquet"))
+        if not parquets:
+            # Try any .parquet
+            parquets = sorted(p.glob("**/*.parquet"))
+        return [str(f) for f in parquets]
+
+    return [str(p)]
+
+
 def prepare_compact_dataset(
     input_files: str | list[str],
     output_dir: str,
     val_ratio: float = 0.05,
     seed: int = 42,
+    variant: str | None = None,
+    apps: list[str] | None = None,
 ) -> tuple[str, str]:
     """
     Prepare SFT data for JAMEL-COMPACT training.
 
     Unlike original JAMEL, no memory compression is needed — the model
-    learns memory online.  We just split into train/val parquet files.
+    learns memory online.  We just concatenate, shuffle, and split into
+    train/val parquet files.
 
     Args:
-        input_files: augmented session-schema parquet file(s)
+        input_files: can be:
+                      - A single parquet file path
+                      - A list of parquet file paths
+                      - A directory path (e.g. ".../react-vision" or
+                        ".../ExplorerSFT-ReAct_Dataset/data")
+                      The directory case auto-discovers all
+                      trajectory.parquet files under app subdirectories.
         output_dir:  directory to write train/val parquet
         val_ratio:   fraction of data for validation
         seed:        random seed for shuffling
+        variant:     if input_files is a root containing both "react-text"
+                     and "react-vision", filter to one variant.
+                     Set to None to use both.
+        apps:        optional list of app names to filter (e.g. ["weibo", "alibaba"])
 
     Returns:
         (train_path, val_path)
     """
-    if not isinstance(input_files, list):
-        input_files = [input_files]
+    # ── Discover parquet files ──
+    parquet_files = discover_parquet_files(input_files)
 
-    frames = [pd.read_parquet(p) for p in input_files]
-    df = pd.concat(frames, ignore_index=True)
+    # ── Filter by variant if specified ──
+    if variant is not None:
+        parquet_files = [f for f in parquet_files if f"/{variant}/" in f or
+                         f"\\{variant}\\" in f]
 
-    print(f"[data] Loaded {len(df)} rows from {len(input_files)} files")
-    print(f"  sessions: {df.get('session_id', pd.Series()).nunique() if 'session_id' in df.columns else 'N/A'}")
-    print(f"  apps:     {df.get('target_app', pd.Series()).nunique() if 'target_app' in df.columns else 'N/A'}")
+    # ── Filter by app names if specified ──
+    if apps is not None:
+        app_set = set(apps)
+        parquet_files = [f for f in parquet_files
+                         if any(f"/{app}/" in f or f"\\{app}\\" in f
+                                for app in app_set)]
 
-    # Shuffle and split
+    if not parquet_files:
+        raise ValueError(f"No parquet files found in: {input_files}")
+
+    print(f"[data] Discovered {len(parquet_files)} parquet files")
+    for f in parquet_files[:5]:
+        print(f"  {f}")
+    if len(parquet_files) > 5:
+        print(f"  ... and {len(parquet_files) - 5} more")
+
+    # ── Two-phase loading to avoid OOM ──
+    import gc
+
+    essential_cols = [
+        "session_id", "episode_idx", "step_idx", "session_step_idx",
+        "target_app", "start_url", "target_url",
+        "before_observation_str", "before_open_pages_urls",
+        "before_screenshot", "response", "action", "reward",
+        "prompt", "think", "raw_content", "parsed_content",
+        "coverage_delta_score", "coverage_previous_score", "coverage_current_score",
+    ]
+
+    # ── Phase 1: Read metadata ONLY (no screenshots) to build shuffle indices ──
+    no_screenshot_cols = [c for c in essential_cols if c != "before_screenshot"]
+    frames_meta = []
+    for p in parquet_files:
+        try:
+            df_meta_p = pd.read_parquet(p, columns=no_screenshot_cols)
+        except (ValueError, KeyError):
+            df_meta_p = pd.read_parquet(p)
+        frames_meta.append(df_meta_p)
+    df_meta = pd.concat(frames_meta, ignore_index=True)
+    del frames_meta
+    gc.collect()
+
+    print(f"[data] Total: {len(df_meta)} rows | "
+          f"sessions={df_meta['session_id'].nunique() if 'session_id' in df_meta.columns else 'N/A'} | "
+          f"apps={df_meta['target_app'].nunique() if 'target_app' in df_meta.columns else 'N/A'}")
+
+    # ── Shuffle and split ──
     rng = random.Random(seed)
-    indices = list(range(len(df)))
+    indices = list(range(len(df_meta)))
     rng.shuffle(indices)
+
+    if val_ratio <= 0:
+        train_indices = set(indices)
+        val_indices = {indices[0]}
+    else:
+        split_idx = max(1, int(len(df_meta) * (1.0 - val_ratio)))
+        train_indices = set(indices[:split_idx])
+        val_indices = set(indices[split_idx:])
+        if len(val_indices) == 0:
+            val_indices = {indices[0]}
+
+    del df_meta
+    gc.collect()
+
+    # ── Phase 2: Write train/val parquet using pyarrow ParquetWriter ──
+    # Avoids pd.concat OOM by writing each chunk's filtered rows directly.
+    import pyarrow as pa
+    import pyarrow.parquet as pq
 
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
-
-    if val_ratio <= 0:
-        train_df = df.reset_index(drop=True)
-        val_df = train_df.iloc[:1].copy()
-    else:
-        split_idx = max(1, int(len(df) * (1.0 - val_ratio)))
-        train_df = df.iloc[indices[:split_idx]].reset_index(drop=True)
-        val_df = df.iloc[indices[split_idx:]].reset_index(drop=True)
-        if len(val_df) == 0:
-            val_df = train_df.iloc[:1].copy()
-
     train_path = output_path / "compact_train.parquet"
     val_path = output_path / "compact_val.parquet"
-    train_df.to_parquet(train_path, row_group_size=4000)
-    val_df.to_parquet(val_path, row_group_size=4000)
+    global_idx = 0
+    train_writer = None
+    val_writer = None
 
-    print(f"[data] Train: {train_path} ({len(train_df)} rows)")
-    print(f"[data] Val:   {val_path} ({len(val_df)} rows)")
+    for p in parquet_files:
+        try:
+            df_chunk = pd.read_parquet(p, columns=essential_cols)
+        except (ValueError, KeyError):
+            df_chunk = pd.read_parquet(p)
+        chunk_len = len(df_chunk)
+
+        chunk_global_indices = list(range(global_idx, global_idx + chunk_len))
+        train_local = [j for j in range(chunk_len) if chunk_global_indices[j] in train_indices]
+        val_local = [j for j in range(chunk_len) if chunk_global_indices[j] in val_indices]
+
+        if train_local:
+            train_table = pa.Table.from_pandas(df_chunk.iloc[train_local])
+            if train_writer is None:
+                train_writer = pq.ParquetWriter(train_path, train_table.schema)
+            train_writer.write_table(train_table)
+
+        if val_local:
+            val_table = pa.Table.from_pandas(df_chunk.iloc[val_local])
+            if val_writer is None:
+                val_writer = pq.ParquetWriter(val_path, val_table.schema)
+            val_writer.write_table(val_table)
+
+        global_idx += chunk_len
+        del df_chunk
+        if global_idx % 3000 == 0:
+            gc.collect()
+            print(f"  ... processed {global_idx}/{len(indices)} rows")
+
+    if train_writer:
+        train_writer.close()
+    if val_writer:
+        val_writer.close()
+
+    del train_indices, val_indices, indices
+    gc.collect()
+
+    print(f"[data] Train: {train_path}")
+    print(f"[data] Val:   {val_path}")
+    # Quick count
+    train_rows = len(pd.read_parquet(train_path, columns=["action"]))
+    val_rows = len(pd.read_parquet(val_path, columns=["action"]))
+    print(f"[data] Train rows: {train_rows}, Val rows: {val_rows}")
 
     return str(train_path), str(val_path)

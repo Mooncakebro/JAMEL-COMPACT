@@ -30,20 +30,77 @@ python scripts/download_scalewob_env.py
 
 ## Step 1: Data Preparation
 
-Unlike original JAMEL, COMPACT does **not** need offline memory compression. This step just shuffles and splits the augmented trajectory parquet into train/val.
+Unlike original JAMEL, COMPACT does **not** need offline memory compression. This step auto-discovers `trajectory.parquet` files from the ExplorerSFT-ReAct dataset, shuffles, and splits into train/val.
+
+### 1a. Quick test (2-3 apps)
 
 ```bash
-INPUT=data/augmented_accepted_samples.parquet \
+INPUT=/home/spc/JAMEL-DeltaState/data/ExplorerSFT-ReAct_Dataset/data/react-vision \
+OUTPUT_DIR=data/compact_sft_data_example \
+APPS=weibo,alipay \
+VAL_RATIO=0.05 \
+bash shell/run_compact_prepare_data.sh
+```
+
+### 1b. Full react-vision dataset (80 apps, ~12K rows)
+
+```bash
+INPUT=/home/spc/JAMEL-DeltaState/data/ExplorerSFT-ReAct_Dataset/data/react-vision \
 OUTPUT_DIR=data/compact_sft_data \
 VAL_RATIO=0.05 \
 bash shell/run_compact_prepare_data.sh
 ```
 
+> **Note**: The full 80-app dataset is ~2.3GB of screenshots. If memory is limited, use the `APPS` filter to process fewer apps at a time, then manually concatenate the output parquet files.
+
+### 1c. react-text variant (text-only, no screenshots)
+
+```bash
+INPUT=/home/spc/JAMEL-DeltaState/data/ExplorerSFT-ReAct_Dataset/data/react-text \
+OUTPUT_DIR=data/compact_sft_data_text \
+VARIANT=react-text \
+VAL_RATIO=0.05 \
+bash shell/run_compact_prepare_data.sh
+```
+
+### 1d. Both variants combined (160 apps, ~24K rows)
+
+```bash
+INPUT=/home/spc/JAMEL-DeltaState/data/ExplorerSFT-ReAct_Dataset/data \
+OUTPUT_DIR=data/compact_sft_data_all \
+VAL_RATIO=0.05 \
+bash shell/run_compact_prepare_data.sh
+```
+
 **What happens:**
-- Loads the input parquet
-- Shuffles and splits into train (95%) / val (5%)
-- Writes `compact_train.parquet` and `compact_val.parquet`
-- Takes **seconds** (no compressor model loaded)
+- Auto-discovers all `trajectory.parquet` files under app subdirectories
+- Phase 1: reads metadata (no screenshots) from all files → shuffle → produce train/val index sets
+- Phase 2: streams each file, filters rows by index, writes directly to train/val parquet using `pyarrow.ParquetWriter`
+- **No data copies in memory** — avoids OOM even for large datasets
+
+**Input dataset structure:**
+```
+/home/spc/JAMEL-DeltaState/data/ExplorerSFT-ReAct_Dataset/
+├── data/
+│   ├── react-text/         # 80 apps, text-only (still has screenshots)
+│   │   ├── weibo/trajectory.parquet   (150 rows)
+│   │   ├── alipay/trajectory.parquet  (150 rows)
+│   │   └── ...
+│   └── react-vision/       # 80 apps, with vision prompts
+│       ├── weibo/trajectory.parquet   (150 rows)
+│       ├── alipay/trajectory.parquet  (150 rows)
+│       └── ...
+└── metadata/
+    ├── manifest.json
+    └── sessions.csv
+```
+
+**Output columns (essential subset retained):**
+```
+action, before_observation_str, before_open_pages_urls, before_screenshot,
+coverage_delta_score, prompt, response, reward, session_id, step_idx,
+session_step_idx, start_url, target_app, think, parsed_content, ...
+```
 
 **Output:**
 ```
@@ -208,8 +265,8 @@ outputs/compact_eval/
 ## Full Pipeline (All-in-One)
 
 ```bash
-# ── 1. Data prep ──
-INPUT=data/augmented_accepted_samples.parquet \
+# ── 1. Data prep (react-vision, 80 apps) ──
+INPUT=/home/spc/JAMEL-DeltaState/data/ExplorerSFT-ReAct_Dataset/data/react-vision \
 OUTPUT_DIR=data/compact_sft_data \
 bash shell/run_compact_prepare_data.sh
 
@@ -236,9 +293,11 @@ bash shell/run_compact_eval.sh
 
 | Variable | Default | Description |
 |---|---|---|
-| `INPUT` | `data/augmented_accepted_samples.parquet` | Input augmented trajectory parquet |
+| `INPUT` | `.../react-vision` | Path to parquet file, directory, or list |
 | `OUTPUT_DIR` | `data/compact_sft_data` | Output directory for train/val parquet |
 | `VAL_RATIO` | `0.05` | Fraction of data for validation |
+| `VARIANT` | (empty) | Filter: `react-text` or `react-vision` |
+| `APPS` | (empty) | Comma-separated app names to filter |
 
 ### Training (`run_compact_train.sh`)
 
