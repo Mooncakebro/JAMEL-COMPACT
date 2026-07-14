@@ -196,8 +196,13 @@ class SideMemoryModule(nn.Module):
         return self.inject_norm(h + self.inject_weight * delta_up)
 
     def extract_observation(self, h: torch.Tensor, n_act: int = 1) -> torch.Tensor:
-        """Pool image + instruction tokens (skip action token). Returns [B, d]."""
-        return h[:, n_act:, :].mean(dim=1)
+        """Pool all hidden states into a single observation vector [B, d].
+
+        Note: Unlike the prototype, the real VLM input sequence doesn't have
+        a separate action token at position 0. The sequence is text+image+text
+        from the processor. We pool ALL tokens to get a summary observation.
+        """
+        return h.mean(dim=1)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -405,14 +410,74 @@ class JAMELCompactWrapper(nn.Module):
             return self.llm.language_model.get_input_embeddings()
         raise ValueError("Cannot find input embeddings in this model")
 
+    def _has_visual_encoder(self) -> bool:
+        """Check if the model has a visual encoder (for VLMs)."""
+        return hasattr(self.llm, "visual") or (
+            hasattr(self.llm, "model") and hasattr(self.llm.model, "visual")
+        )
+
+    def _inject_visual_features(
+        self,
+        h: torch.Tensor,
+        input_ids: torch.Tensor,
+        pixel_values: torch.Tensor,
+        image_grid_thw: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """
+        Process image through the visual encoder and inject features into
+        the hidden states at image placeholder token positions.
+
+        For Qwen3-VL, the model has a `visual` module that processes pixel
+        values into image features. These features replace the image
+        placeholder tokens in the input embeddings.
+        """
+        # Find the visual encoder
+        visual = getattr(self.llm, "visual", None)
+        if visual is None:
+            visual = getattr(getattr(self.llm, "model", None), "visual", None)
+        if visual is None:
+            return h  # no visual encoder, skip
+
+        # Find image placeholder token IDs
+        # Qwen3-VL uses <|vision_start|><|image_pad|>...<|vision_end|>
+        image_token_id = getattr(self.llm.config, "image_token_id", None)
+        if image_token_id is None:
+            # Try to get from tokenizer
+            image_token_id = self.tokenizer.convert_tokens_to_ids("<|image_pad|>")
+            if image_token_id is None or image_token_id == self.tokenizer.unk_token_id:
+                return h  # can't find image token, skip
+
+        # Process image through visual encoder
+        try:
+            if image_grid_thw is not None:
+                image_embeds = visual(pixel_values.to(h.dtype), grid_thw=image_grid_thw)
+            else:
+                image_embeds = visual(pixel_values.to(h.dtype))
+        except Exception as e:
+            print(f"[model] Visual encoder failed: {e}")
+            return h
+
+        # Scatter image features into hidden states at placeholder positions
+        # image_embeds shape: [num_image_tokens, d]
+        # Find positions of image tokens in input_ids
+        for b in range(h.shape[0]):
+            mask = (input_ids[b] == image_token_id)
+            positions = mask.nonzero(as_tuple=True)[0]
+            if len(positions) > 0 and len(positions) <= image_embeds.shape[0]:
+                h[b, positions] = image_embeds[:len(positions)]
+
+        return h
+
     # ── Memory initialization ──
 
     def init_memory(self, batch_size: int, device: torch.device):
         """Initialize memory states and confidence for t=0."""
+        # Cast to model dtype to avoid bfloat16/float32 mismatches
+        llm_dtype = next(self.llm.parameters()).dtype
         m_states, c_states = [], []
         for sm in self.side_memories:
-            m = sm.init_memory.unsqueeze(0).expand(batch_size, -1, -1).clone().to(device)
-            c = torch.full((batch_size, self.num_mem), 0.5, device=device)
+            m = sm.init_memory.unsqueeze(0).expand(batch_size, -1, -1).clone().to(device=device, dtype=llm_dtype)
+            c = torch.full((batch_size, self.num_mem), 0.5, device=device, dtype=llm_dtype)
             m_states.append(m)
             c_states.append(c)
         return m_states, c_states
@@ -427,18 +492,22 @@ class JAMELCompactWrapper(nn.Module):
         memory_states: List[torch.Tensor],
         confidence_states: List[torch.Tensor],
         labels: Optional[torch.Tensor] = None,
+        pixel_values: Optional[torch.Tensor] = None,
+        image_grid_thw: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> dict:
         """
         One time step through the full memory-augmented LLM.
 
         Args:
-            input_ids:          [B, N] — token IDs
+            input_ids:          [B, N] — token IDs (includes image placeholder tokens)
             attention_mask:     [B, N]
             action_embed_input: [B, d] — raw action embedding (control variable)
             memory_states:      List of [B, N_m, d_mem]
             confidence_states:  List of [B, N_m]
             labels:             [B, N] — token labels for loss (optional)
+            pixel_values:       [B, C, H, W] — processed image tensor (optional)
+            image_grid_thw:     [B, 3] — image grid dimensions (optional)
 
         Returns:
             dict with: logits, new_memory, new_confidence, loss (if labels)
@@ -447,8 +516,20 @@ class JAMELCompactWrapper(nn.Module):
         device = input_ids.device
 
         # ── Embed tokens (pretrained) ──
+        # For Qwen3-VL, the model's forward() handles replacing image placeholder
+        # tokens with vision features. We call the full model's forward() for the
+        # embedding step if pixel_values are provided.
         embed_layer = self._get_input_embeddings()
         h = embed_layer(input_ids)  # [B, N, d]
+
+        # ── Process image features if provided ──
+        # Qwen3-VL replaces <image> placeholder tokens with vision encoder output.
+        # We use the model's visual encoder to get image features, then scatter
+        # them into the hidden states at the image placeholder positions.
+        if pixel_values is not None and self._has_visual_encoder():
+            h = self._inject_visual_features(
+                h, input_ids, pixel_values, image_grid_thw,
+            )
 
         # ── Raw action embedding ──
         action_embed = self.action_embed(action_embed_input)  # [B, d]
@@ -462,8 +543,14 @@ class JAMELCompactWrapper(nn.Module):
             h, attention_mask,
         )
 
+        # ── Convert attention_mask to model dtype ──
+        # Qwen3-VL's SDPA attention expects mask dtype to match query dtype
+        if attention_mask.dtype != h.dtype:
+            attention_mask = attention_mask.to(dtype=h.dtype)
+
         # ── Process through each layer ──
         new_memory, new_confidence = [], []
+        predicted_mems, obs_feats = [], []  # for uncertainty calibration loss
         for l, (layer, sm) in enumerate(zip(decoder_layers, self.side_memories)):
             # 4a. Memory Predict (FiLM-GRU)
             m_hat, c_hat = sm.predict(
@@ -493,6 +580,9 @@ class JAMELCompactWrapper(nn.Module):
 
             new_memory.append(m_new)
             new_confidence.append(c_new)
+            # Save for uncertainty calibration loss
+            predicted_mems.append(m_hat.detach())
+            obs_feats.append(z_t.detach())
 
         # ── LM head (pretrained) ──
         logits = self._get_lm_head()(h)  # [B, N, vocab_size]
@@ -512,6 +602,8 @@ class JAMELCompactWrapper(nn.Module):
                 memory_states=new_memory,
                 confidence_states=new_confidence,
                 config=self.config,
+                predicted_memory=predicted_mems,
+                observation_feat=obs_feats,
             )
             result["loss"] = loss
             result["loss_dict"] = loss_dict
@@ -543,11 +635,15 @@ class JAMELCompactWrapper(nn.Module):
 
         # Process the prompt through all layers
         h = embed_layer(input_ids)
-        position_embeddings = self._compute_position_embeddings(h, attention_mask)
+        # Convert attention_mask to model dtype (Qwen3-VL expects matching dtypes)
+        attn_mask_g = attention_mask
+        if attn_mask_g.dtype != h.dtype:
+            attn_mask_g = attn_mask_g.to(dtype=h.dtype)
+        position_embeddings = self._compute_position_embeddings(h, attn_mask_g)
         new_memory, new_confidence = [], []
         for l, (layer, sm) in enumerate(zip(decoder_layers, self.side_memories)):
             m_hat, c_hat = sm.predict(memory_states[l], confidence_states[l], action_embed)
-            layer_output = layer(h, attention_mask=attention_mask,
+            layer_output = layer(h, attention_mask=attn_mask_g,
                                 position_embeddings=position_embeddings, **kwargs)
             h_layer = layer_output[0] if isinstance(layer_output, tuple) else layer_output
             z_t = sm.extract_observation(h_layer, self.num_act_tokens)
@@ -581,12 +677,13 @@ class JAMELCompactWrapper(nn.Module):
 
             # Feed next token through all layers (no memory update during generation)
             next_h = embed_layer(next_token)
+            single_mask = torch.ones((B, 1), dtype=attn_mask_g.dtype, device=device)
             pos_emb_single = self._compute_position_embeddings(
-                next_h,
-                torch.ones((B, 1), dtype=torch.long, device=device),
+                next_h, single_mask,
             )
             for l, layer in enumerate(decoder_layers):
-                layer_output = layer(next_h, position_embeddings=pos_emb_single,
+                layer_output = layer(next_h, attention_mask=single_mask,
+                                    position_embeddings=pos_emb_single,
                                     **kwargs)
                 next_h = layer_output[0] if isinstance(layer_output, tuple) else layer_output
             cur_h = next_h

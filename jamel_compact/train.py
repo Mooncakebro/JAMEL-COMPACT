@@ -89,6 +89,9 @@ def train_one_epoch(
         attention_mask = batch["attention_mask"].to(device)
         labels = batch["labels"].to(device)
         action_input_ids = batch["action_input_ids"].to(device)
+        pixel_values = batch.get("pixel_values")
+        if pixel_values is not None:
+            pixel_values = pixel_values.to(device)
 
         # Get action embedding input
         action_embed_input = get_action_embedding(action_input_ids, model, device)
@@ -105,6 +108,7 @@ def train_one_epoch(
             memory_states=memory_states,
             confidence_states=confidence_states,
             labels=labels,
+            pixel_values=pixel_values,
         )
 
         loss = outputs["loss"] / accum_steps

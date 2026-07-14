@@ -73,23 +73,33 @@ def compute_compact_loss(
     # ── 3. Uncertainty calibration ──
     # If predicted_memory and observation_feat are available, compute per-token
     # MSE between confidence C and actual observation-to-prediction match.
-    loss_uncert = torch.tensor(0.0, device=logits.device)
+    loss_uncert = torch.tensor(0.0, device=logits.device, dtype=logits.dtype)
     if predicted_memory is not None and observation_feat is not None:
+        uncert_count = 0
         for l_idx, (C, M_hat, Z) in enumerate(
             zip(confidence_states, predicted_memory, observation_feat)
         ):
             # Z: [B, d], M_hat: [B, N_m, d_mem]
-            # Need to project Z to d_mem if dimensions differ
-            # For simplicity, we use the already-projected z_down from the model
-            # Here we approximate by using the first d_mem dims of Z if d > d_mem
-            if Z.shape[-1] != M_hat.shape[-1]:
-                # Dimension mismatch — skip this layer's uncertainty loss
-                continue
-            z_norm = F.normalize(Z, dim=-1)
-            m_norm = F.normalize(M_hat, dim=-1)
-            match = (z_norm.unsqueeze(1) * m_norm).sum(dim=-1).clamp(0, 1)
-            loss_uncert = loss_uncert + F.mse_loss(C, match.detach())
-        loss_uncert = loss_uncert / L
+            # Dimensions may differ (d vs d_mem) — use mean-pooled M_hat
+            # to match Z's dimension for cosine similarity
+            m_hat_pooled = M_hat.mean(dim=1)  # [B, d_mem]
+
+            # If dimensions don't match, truncate or pad to min dim
+            min_dim = min(Z.shape[-1], m_hat_pooled.shape[-1])
+            z_proj = Z[..., :min_dim]
+            m_proj = m_hat_pooled[..., :min_dim]
+
+            z_norm = F.normalize(z_proj, dim=-1)
+            m_norm = F.normalize(m_proj, dim=-1)
+            match = (z_norm * m_norm).sum(dim=-1).clamp(0, 1)  # [B]
+
+            # C is [B, N_m] — mean over N_m to get [B]
+            c_mean = C.mean(dim=-1)  # [B]
+            loss_uncert = loss_uncert + F.mse_loss(c_mean, match.detach())
+            uncert_count += 1
+
+        if uncert_count > 0:
+            loss_uncert = loss_uncert / uncert_count
 
     # ── Total ──
     loss_total = (
