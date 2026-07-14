@@ -310,16 +310,41 @@ class JAMELCompactWrapper(nn.Module):
         raise ValueError("Cannot infer num_layers")
 
     def _get_decoder_layers(self):
-        if hasattr(self.llm, "model") and hasattr(self.llm.model, "layers"):
-            return self.llm.model.layers
-        if hasattr(self.llm, "transformer") and hasattr(self.llm.transformer, "h"):
-            return self.llm.transformer.h
-        # Qwen3-VL via AutoModelForImageTextToText: model.language_model.model.layers
-        if hasattr(self.llm, "language_model"):
-            lm = self.llm.language_model
-            if hasattr(lm, "model") and hasattr(lm.model, "layers"):
-                return lm.model.layers
-        raise ValueError("Cannot find decoder layers")
+        # Try multiple paths to find decoder layers across model architectures.
+        # Cast to list to check if already a ModuleList/Sequential.
+        model = self.llm
+
+        candidates = [
+            # Qwen3-VL via AutoModelForImageTextToText:
+            #   model (Qwen3VLModel) → language_model → layers
+            lambda m: getattr(getattr(m, "model", None), "language_model", None),
+            # Qwen3 text-only: model → layers
+            lambda m: getattr(m, "model", None),
+            # Llama/Mistral: transformer → h
+            lambda m: getattr(m, "transformer", None),
+            # Direct language_model attribute
+            lambda m: getattr(m, "language_model", None),
+        ]
+
+        for get_wrapper in candidates:
+            wrapper = get_wrapper(model)
+            if wrapper is None:
+                continue
+            # wrapper may already be the layer list, or may have .layers / .h
+            if hasattr(wrapper, "layers"):
+                return wrapper.layers
+            if hasattr(wrapper, "h"):
+                return wrapper.h
+            # wrapper might itself be a layer list
+            if isinstance(wrapper, (list, nn.ModuleList)):
+                return wrapper
+
+        # Last resort: print model attributes for debugging
+        attrs = sorted([a for a in dir(model) if not a.startswith("_") and not callable(getattr(model, a))])
+        raise ValueError(
+            f"Cannot find decoder layers in {type(model).__name__}. "
+            f"Top-level attributes: {attrs[:20]}"
+        )
 
     def _get_lm_head(self):
         """Get the LM head, handling multimodal model wrappers."""
