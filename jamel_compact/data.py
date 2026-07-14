@@ -58,20 +58,6 @@ def _get_screenshot(row) -> bytes | None:
     return row.get("screenshot")
 
 
-def _build_action_embedding_input(action_str: str, tokenizer) -> torch.Tensor:
-    """
-    Tokenize the action string and return its embedding-ready representation.
-    For COMPACT, we use the token IDs of the action text as the control variable.
-    The model's action_embed layer will project these into the hidden dimension.
-    """
-    # Simple: tokenize action text and take mean of token embeddings
-    # The actual projection happens in the model's action_embed layer
-    tokens = tokenizer.encode(action_str, add_special_tokens=False, max_length=32, truncation=True)
-    if not tokens:
-        tokens = [tokenizer.pad_token_id or 0]
-    return torch.tensor(tokens, dtype=torch.long)
-
-
 class CompactDataset(Dataset):
     """
     Dataset for JAMEL-COMPACT training.
@@ -98,7 +84,7 @@ class CompactDataset(Dataset):
         image_resize: tuple = (640, 360),
         prompt_key: str = "prompt",
         response_key: str = "response",
-        image_key: str = "current_image_png_bytes",
+        image_key: str = "before_screenshot",  # matches ExplorerSFT-ReAct parquet
         action_key: str = "action",
     ):
         if not isinstance(parquet_files, list):
@@ -118,27 +104,46 @@ class CompactDataset(Dataset):
         self._validate_and_filter()
 
     def _read_files(self):
-        frames = [pd.read_parquet(p) for p in self.parquet_files]
+        # Only load columns needed for training to save memory
+        needed_cols = [self.prompt_key, self.response_key, self.image_key,
+                      self.action_key, "session_id", "step_idx", "target_app"]
+        frames = []
+        for p in self.parquet_files:
+            try:
+                df_p = pd.read_parquet(p, columns=needed_cols)
+            except (ValueError, KeyError):
+                df_p = pd.read_parquet(p)
+            frames.append(df_p)
         self.dataframe = pd.concat(frames, ignore_index=True)
 
     def _validate_and_filter(self):
-        """Filter out samples that exceed max_length after tokenization."""
+        """Filter out samples that exceed max_length.
+
+        Uses fast char-based estimation (chars/3 ≈ tokens for English) instead
+        of tokenizing every row, which would be very slow for large datasets.
+        """
         total = len(self.dataframe)
         valid_indices = []
+
+        # Char-based estimation: ~3 chars per token for English text
+        # Image tokens: ~1175 for Qwen2.5-VL at 640×360
+        CHAT_TEMPLATE_OVERHEAD = 200
+        IMAGE_TOKEN_OVERHEAD = 1175
 
         for i in range(total):
             row = self.dataframe.iloc[i]
             prompt = str(row.get(self.prompt_key, ""))
             response = str(row.get(self.response_key, ""))
 
-            try:
-                prompt_tokens = len(self.tokenizer.encode(prompt, add_special_tokens=False))
-                response_tokens = len(self.tokenizer.encode(response, add_special_tokens=False))
-            except Exception:
-                continue
+            prompt_chars = len(prompt)
+            response_chars = len(response)
+            has_image = "<image>" in prompt
 
-            # Estimate total (prompt + response + chat template overhead)
-            estimated = prompt_tokens + response_tokens + 200
+            # Estimate tokens: chars/3 + image overhead + template overhead
+            estimated = (prompt_chars + response_chars) // 3 + CHAT_TEMPLATE_OVERHEAD
+            if has_image:
+                estimated += IMAGE_TOKEN_OVERHEAD
+
             if estimated <= self.max_length:
                 valid_indices.append(i)
 
@@ -160,28 +165,38 @@ class CompactDataset(Dataset):
         action = str(row.get(self.action_key, ""))
 
         # ── Build chat messages ──
-        has_image = "<image>" in prompt
+        # Always load the screenshot if available, even if prompt has no <image> tag.
+        # The ExplorerSFT-ReAct dataset's prompt column may not contain <image>,
+        # but the before_screenshot column has the image bytes.
+        raw_screenshot = row.get(self.image_key)
         image = None
-        if has_image:
-            raw = row.get(self.image_key)
-            if raw is not None:
-                image = _decode_png(raw)
-                if image is not None and image.size != self.image_resize:
-                    image = image.resize(self.image_resize, Image.BILINEAR)
+        if raw_screenshot is not None:
+            image = _decode_png(raw_screenshot)
+            if image is not None and image.size != self.image_resize:
+                image = image.resize(self.image_resize, Image.BILINEAR)
 
-        # Split prompt on <image> tag for multimodal content
-        segments = prompt.split("<image>")
-        content = []
-        for idx, seg in enumerate(segments):
-            if seg:
-                content.append({"type": "text", "text": seg})
-            if idx < len(segments) - 1:
-                content.append({"type": "image"})
+        has_image = image is not None
+
+        # Build content: if prompt has <image> tag, split on it; otherwise
+        # append the image at the end before the response instruction.
+        if "<image>" in prompt:
+            segments = prompt.split("<image>")
+            content = []
+            for idx, seg in enumerate(segments):
+                if seg:
+                    content.append({"type": "text", "text": seg})
+                if idx < len(segments) - 1:
+                    content.append({"type": "image"})
+        elif has_image:
+            # No <image> tag in prompt — append image at the end
+            content = [{"type": "text", "text": prompt}, {"type": "image"}]
+        else:
+            content = [{"type": "text", "text": prompt}]
 
         messages = [{"role": "user", "content": content}]
 
         # ── Tokenize ──
-        if self.processor is not None and has_image and image is not None:
+        if self.processor is not None and has_image:
             prompt_text = self.processor.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=True,
             )
@@ -283,10 +298,14 @@ def collate_fn(batch: list[dict], pad_token_id: int = 0) -> dict:
         "step_indices": [item["step_idx"] for item in batch],
     }
 
-    # Pixel values (may be None for text-only)
+    # Pixel values (may be None for text-only or different shapes)
     pixel_values = [item.get("pixel_values") for item in batch]
     if all(pv is not None for pv in pixel_values):
-        result["pixel_values"] = torch.stack(pixel_values)
+        try:
+            result["pixel_values"] = torch.stack(pixel_values)
+        except RuntimeError:
+            # Different shapes — return as list
+            result["pixel_values"] = pixel_values
 
     return result
 

@@ -7,7 +7,13 @@
 #   BASE_MODEL=Qwen/Qwen3-VL-2B-Instruct \
 #   OUTPUT_DIR=outputs/compact_ckpt \
 #   TB_LOG_DIR=outputs/compact_tb \
+#   GPU_IDS=0 \
 #   bash shell/run_compact_train.sh
+#
+# GPU selection:
+#   GPU_IDS=0          # single GPU 0
+#   GPU_IDS=0,1,2      # GPUs 0, 1, 2
+#   GPU_IDS=""          # all available GPUs (default)
 #
 # TensorBoard:
 #   tensorboard --logdir outputs/compact_tb
@@ -33,6 +39,7 @@ LR=${LR:-2e-5}
 LOG_STEPS=${LOG_STEPS:-10}
 SAVE_STEPS=${SAVE_STEPS:-500}
 VAL_STEPS=${VAL_STEPS:-200}
+GPU_IDS=${GPU_IDS:-}              # e.g. "0" or "0,1,2" or "" (all)
 
 if [[ ! -f "$TRAIN_FILE" ]]; then
     echo "ERROR: TRAIN_FILE not found: $TRAIN_FILE" >&2
@@ -43,12 +50,19 @@ if [[ ! -f "$VAL_FILE" ]]; then
     exit 2
 fi
 
+# Build GPU args
+GPU_ARG=""
+if [[ -n "$GPU_IDS" ]]; then
+    GPU_ARG="--gpu-ids $GPU_IDS"
+fi
+
 echo "=== JAMEL-COMPACT Training ==="
 echo "  Base model:  $BASE_MODEL"
 echo "  Train file:   $TRAIN_FILE"
 echo "  Val file:     $VAL_FILE"
 echo "  Output:       $OUTPUT_DIR"
 echo "  TensorBoard:  $TB_LOG_DIR"
+echo "  GPUs:         ${GPU_IDS:-all}"
 echo "  Mem dim:      $MEM_DIM"
 echo "  Num mem:      $NUM_MEM"
 echo "  Max length:   $MAX_LENGTH"
@@ -73,4 +87,5 @@ python -m jamel_compact.train \
     --log-steps "$LOG_STEPS" \
     --save-steps "$SAVE_STEPS" \
     --val-steps "$VAL_STEPS" \
+    $GPU_ARG \
     "$@"

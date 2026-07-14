@@ -42,7 +42,7 @@ VAL_RATIO=0.05 \
 bash shell/run_compact_prepare_data.sh
 ```
 
-### 1b. Full react-vision dataset (80 apps, ~12K rows)
+### 1b. Full react-vision dataset (80 apps, 12,000 rows)
 
 ```bash
 INPUT=/home/spc/JAMEL-DeltaState/data/ExplorerSFT-ReAct_Dataset/data/react-vision \
@@ -53,7 +53,7 @@ bash shell/run_compact_prepare_data.sh
 
 > **Note**: The full 80-app dataset is ~2.3GB of screenshots. If memory is limited, use the `APPS` filter to process fewer apps at a time, then manually concatenate the output parquet files.
 
-### 1c. react-text variant (text-only, no screenshots)
+### 1c. react-text variant (80 apps, 12,000 rows, also has screenshots)
 
 ```bash
 INPUT=/home/spc/JAMEL-DeltaState/data/ExplorerSFT-ReAct_Dataset/data/react-text \
@@ -63,7 +63,9 @@ VAL_RATIO=0.05 \
 bash shell/run_compact_prepare_data.sh
 ```
 
-### 1d. Both variants combined (160 apps, ~24K rows)
+> **Note**: Despite the name "react-text", this variant also contains `before_screenshot` bytes in every row. The difference from `react-vision` is the prompt format (text-only AXTree vs vision-augmented prompt), not the presence of screenshots.
+
+### 1d. Both variants combined (160 app-dirs, 24,000 rows)
 
 ```bash
 INPUT=/home/spc/JAMEL-DeltaState/data/ExplorerSFT-ReAct_Dataset/data \
@@ -82,17 +84,20 @@ bash shell/run_compact_prepare_data.sh
 ```
 /home/spc/JAMEL-DeltaState/data/ExplorerSFT-ReAct_Dataset/
 ├── data/
-│   ├── react-text/         # 80 apps, text-only (still has screenshots)
+│   ├── react-text/         # 80 apps, 12,000 rows (text-only prompts, has screenshots)
 │   │   ├── weibo/trajectory.parquet   (150 rows)
 │   │   ├── alipay/trajectory.parquet  (150 rows)
-│   │   └── ...
-│   └── react-vision/       # 80 apps, with vision prompts
+│   │   └── ... (80 apps total)
+│   └── react-vision/       # 80 apps, 12,000 rows (vision-augmented prompts, has screenshots)
 │       ├── weibo/trajectory.parquet   (150 rows)
 │       ├── alipay/trajectory.parquet  (150 rows)
-│       └── ...
+│       └── ... (80 apps total)
 └── metadata/
     ├── manifest.json
     └── sessions.csv
+
+Total: 160 app-dirs, 24,000 rows (80 apps × 150 rows × 2 variants)
+Each row = one step in a 150-step browser exploration session.
 ```
 
 **Output columns (essential subset retained):**
@@ -113,7 +118,7 @@ data/compact_sft_data/
 
 ## Step 2: Training
 
-### 2a. Train with Qwen3-VL-2B (default)
+### 2a. Train with Qwen3-VL-2B (default, single GPU)
 
 ```bash
 TRAIN_FILE=data/compact_sft_data/compact_train.parquet \
@@ -121,6 +126,7 @@ VAL_FILE=data/compact_sft_data/compact_val.parquet \
 BASE_MODEL=Qwen/Qwen3-VL-2B-Instruct \
 OUTPUT_DIR=outputs/compact_ckpt \
 TB_LOG_DIR=outputs/compact_tb \
+GPU_IDS=0 \
 MEM_DIM=512 \
 NUM_MEM=16 \
 MAX_LENGTH=8192 \
@@ -134,7 +140,7 @@ VAL_STEPS=200 \
 bash shell/run_compact_train.sh
 ```
 
-### 2b. Train with Qwen3-VL-8B
+### 2b. Train with Qwen3-VL-8B (single GPU)
 
 ```bash
 TRAIN_FILE=data/compact_sft_data/compact_train.parquet \
@@ -142,6 +148,7 @@ VAL_FILE=data/compact_sft_data/compact_val.parquet \
 BASE_MODEL=Qwen/Qwen3-VL-8B-Instruct \
 OUTPUT_DIR=outputs/compact_ckpt_8b \
 TB_LOG_DIR=outputs/compact_tb_8b \
+GPU_IDS=0 \
 MEM_DIM=512 \
 NUM_MEM=16 \
 MAX_LENGTH=8192 \
@@ -155,7 +162,20 @@ VAL_STEPS=200 \
 bash shell/run_compact_train.sh
 ```
 
-### 2c. Freeze base model (train only side memory)
+### 2c. Train on multiple GPUs
+
+```bash
+# Use GPUs 0, 1, 2
+TRAIN_FILE=data/compact_sft_data/compact_train.parquet \
+VAL_FILE=data/compact_sft_data/compact_val.parquet \
+BASE_MODEL=Qwen/Qwen3-VL-2B-Instruct \
+OUTPUT_DIR=outputs/compact_ckpt \
+TB_LOG_DIR=outputs/compact_tb \
+GPU_IDS=0,1,2 \
+bash shell/run_compact_train.sh
+```
+
+### 2d. Freeze base model (train only side memory)
 
 ```bash
 TRAIN_FILE=data/compact_sft_data/compact_train.parquet \
@@ -163,11 +183,12 @@ VAL_FILE=data/compact_sft_data/compact_val.parquet \
 BASE_MODEL=Qwen/Qwen3-VL-2B-Instruct \
 OUTPUT_DIR=outputs/compact_ckpt_frozen \
 TB_LOG_DIR=outputs/compact_tb_frozen \
+GPU_IDS=0 \
 FREEZE_BASE=1 \
 bash shell/run_compact_train.sh --freeze-base
 ```
 
-### 2d. Monitor training with TensorBoard
+### 2e. Monitor training with TensorBoard
 
 Open a separate terminal:
 
@@ -265,7 +286,7 @@ outputs/compact_eval/
 ## Full Pipeline (All-in-One)
 
 ```bash
-# ── 1. Data prep (react-vision, 80 apps) ──
+# ── 1. Data prep (react-vision, 80 apps, 12K rows) ──
 INPUT=/home/spc/JAMEL-DeltaState/data/ExplorerSFT-ReAct_Dataset/data/react-vision \
 OUTPUT_DIR=data/compact_sft_data \
 bash shell/run_compact_prepare_data.sh
@@ -276,6 +297,7 @@ VAL_FILE=data/compact_sft_data/compact_val.parquet \
 BASE_MODEL=Qwen/Qwen3-VL-2B-Instruct \
 OUTPUT_DIR=outputs/compact_ckpt \
 TB_LOG_DIR=outputs/compact_tb \
+GPU_IDS=0 \
 bash shell/run_compact_train.sh
 
 # ── 3. Eval ──
@@ -308,6 +330,7 @@ bash shell/run_compact_eval.sh
 | `BASE_MODEL` | `Qwen/Qwen3-VL-2B-Instruct` | Pretrained base model name or path |
 | `OUTPUT_DIR` | `outputs/compact_ckpt` | Checkpoint output directory |
 | `TB_LOG_DIR` | `outputs/compact_tb` | TensorBoard log directory |
+| `GPU_IDS` | (empty = all) | Comma-separated GPU IDs (e.g. `0` or `0,1,2`) |
 | `MEM_DIM` | `512` | Reduced memory dimension $d_{mem}$ |
 | `NUM_MEM` | `16` | Memory tokens per layer $N_m$ |
 | `MAX_LENGTH` | `8192` | Max token length |

@@ -252,11 +252,32 @@ def main():
     parser.add_argument("--no-grad-checkpoint", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--bf16", action="store_true", default=True)
+    parser.add_argument("--gpu-ids", type=str, default="",
+                        help="Comma-separated GPU IDs to use (e.g. '0,1,2'). "
+                             "Empty = all available GPUs. "
+                             "For single-GPU training, specify one ID (e.g. '0').")
     args = parser.parse_args()
 
+    # ── GPU selection ──
+    if args.gpu_ids:
+        gpu_ids = [int(g.strip()) for g in args.gpu_ids.split(",") if g.strip()]
+        os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in gpu_ids)
+        print(f"[train] Using GPUs: {gpu_ids} (CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']})")
+        if len(gpu_ids) == 1:
+            device = torch.device(f"cuda:0")
+        else:
+            device = torch.device("cuda:0")  # DataParallel would use all visible
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     set_seed(args.seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[train] device={device}")
+    if torch.cuda.is_available():
+        num_gpus = torch.cuda.device_count()
+        print(f"[train] Available GPUs: {num_gpus}")
+        for i in range(num_gpus):
+            print(f"  GPU {i}: {torch.cuda.get_device_name(i)} "
+                  f"({torch.cuda.get_device_properties(i).total_mem / 1e9:.1f}GB)")
 
     # ── Build config ──
     config = CompactConfig.from_args(
