@@ -273,6 +273,13 @@ class JAMELCompactWrapper(nn.Module):
         # ── Action embedding (NEW) ──
         self.action_embed = nn.Linear(self.hidden_dim, self.hidden_dim)
 
+        # ── Cast new modules to the same dtype as the pretrained LLM ──
+        # (All new parameters are created in float32 by default)
+        llm_dtype = next(self.llm.parameters()).dtype
+        self.action_embed = self.action_embed.to(dtype=llm_dtype)
+        for sm in self.side_memories:
+            sm.to(dtype=llm_dtype)
+
         # ── Optionally freeze the base LLM ──
         if config.freeze_base:
             for param in self.llm.parameters():
