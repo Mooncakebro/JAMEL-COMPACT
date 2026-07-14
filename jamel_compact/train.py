@@ -60,7 +60,7 @@ def get_action_embedding(action_input_ids: torch.Tensor, model: JAMELCompactWrap
     Uses the pretrained token embedding layer + mean pooling.
     """
     action_input_ids = action_input_ids.to(device)
-    embed_layer = model.llm.get_input_embeddings()
+    embed_layer = model._get_input_embeddings()
     action_embeds = embed_layer(action_input_ids)  # [B, L_act, d]
     # Mean pool over action tokens
     return action_embeds.mean(dim=1)  # [B, d]

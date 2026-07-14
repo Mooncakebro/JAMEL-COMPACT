@@ -159,7 +159,7 @@ class CompactAgent:
         if not tokens:
             tokens = [self.tokenizer.pad_token_id or 0]
         token_ids = torch.tensor([tokens], dtype=torch.long, device=self.device)
-        embed_layer = self.model.llm.get_input_embeddings()
+        embed_layer = self.model._get_input_embeddings()
         return embed_layer(token_ids).mean(dim=1)  # [1, d]
 
     @torch.inference_mode()

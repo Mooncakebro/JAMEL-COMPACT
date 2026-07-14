@@ -222,12 +222,25 @@ class JAMELCompactWrapper(nn.Module):
         self.config = config
 
         # ── Load pretrained LLM ──
+        # Qwen3-VL is a multimodal model — AutoModelForCausalLM won't work.
+        # We try causal first (for text-only models like Qwen3-8B), then fall
+        # back to ImageTextToText (for vision-language models like Qwen3-VL).
         dtype = torch.bfloat16 if config.bf16 else torch.float32
-        self.llm = AutoModelForCausalLM.from_pretrained(
-            config.base_model_name,
-            torch_dtype=dtype,
-            trust_remote_code=True,
-        )
+        try:
+            self.llm = AutoModelForCausalLM.from_pretrained(
+                config.base_model_name,
+                torch_dtype=dtype,
+                trust_remote_code=True,
+            )
+        except (ValueError, OSError) as e:
+            print(f"[model] AutoModelForCausalLM failed ({e}), "
+                  f"trying AutoModelForImageTextToText...")
+            from transformers import AutoModelForImageTextToText
+            self.llm = AutoModelForImageTextToText.from_pretrained(
+                config.base_model_name,
+                torch_dtype=dtype,
+                trust_remote_code=True,
+            )
         self.tokenizer = AutoTokenizer.from_pretrained(
             config.base_model_name, trust_remote_code=True,
         )
@@ -294,7 +307,30 @@ class JAMELCompactWrapper(nn.Module):
             return self.llm.model.layers
         if hasattr(self.llm, "transformer") and hasattr(self.llm.transformer, "h"):
             return self.llm.transformer.h
+        # Qwen3-VL via AutoModelForImageTextToText: model.language_model.model.layers
+        if hasattr(self.llm, "language_model"):
+            lm = self.llm.language_model
+            if hasattr(lm, "model") and hasattr(lm.model, "layers"):
+                return lm.model.layers
         raise ValueError("Cannot find decoder layers")
+
+    def _get_lm_head(self):
+        """Get the LM head, handling multimodal model wrappers."""
+        if hasattr(self.llm, "lm_head"):
+            return self.llm.lm_head
+        if hasattr(self.llm, "language_model") and hasattr(self.llm.language_model, "lm_head"):
+            return self.llm.language_model.lm_head
+        raise ValueError("Cannot find lm_head in this model")
+
+    def _get_input_embeddings(self):
+        """Get token embeddings, handling multimodal model wrappers."""
+        try:
+            return self.llm.get_input_embeddings()
+        except (AttributeError, NotImplementedError):
+            pass
+        if hasattr(self.llm, "language_model"):
+            return self.llm.language_model.get_input_embeddings()
+        raise ValueError("Cannot find input embeddings in this model")
 
     # ── Memory initialization ──
 
@@ -338,7 +374,7 @@ class JAMELCompactWrapper(nn.Module):
         device = input_ids.device
 
         # ── Embed tokens (pretrained) ──
-        embed_layer = self.llm.get_input_embeddings()
+        embed_layer = self._get_input_embeddings()
         h = embed_layer(input_ids)  # [B, N, d]
 
         # ── Raw action embedding ──
@@ -379,7 +415,7 @@ class JAMELCompactWrapper(nn.Module):
             new_confidence.append(c_new)
 
         # ── LM head (pretrained) ──
-        logits = self.llm.lm_head(h)  # [B, N, vocab_size]
+        logits = self._get_lm_head()(h)  # [B, N, vocab_size]
 
         result = {
             "logits": logits,
@@ -423,7 +459,7 @@ class JAMELCompactWrapper(nn.Module):
 
         action_embed = self.action_embed(action_embed_input)
         decoder_layers = self._get_decoder_layers()
-        embed_layer = self.llm.get_input_embeddings()
+        embed_layer = self._get_input_embeddings()
 
         # Process the prompt through all layers
         h = embed_layer(input_ids)
@@ -444,7 +480,7 @@ class JAMELCompactWrapper(nn.Module):
         cur_token = input_ids[:, -1:]
 
         for _ in range(max_new_tokens):
-            logits = self.llm.lm_head(cur_h)  # [B, 1, vocab]
+            logits = self._get_lm_head()(cur_h)  # [B, 1, vocab]
             logits = logits[:, -1, :] / max(temperature, 1e-8)
 
             # Top-p sampling
