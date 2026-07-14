@@ -30,7 +30,9 @@ python scripts/download_scalewob_env.py
 
 ## Step 1: Data Preparation
 
-Unlike original JAMEL, COMPACT does **not** need offline memory compression. This step auto-discovers `trajectory.parquet` files from the ExplorerSFT-ReAct dataset, shuffles, and splits into train/val.
+Unlike original JAMEL, COMPACT does **not** need offline memory compression. This step auto-discovers `trajectory.parquet` files from the ExplorerSFT-ReAct dataset, rebuilds canonical prompts (same `build_web_prompt()` as eval), shuffles, and splits into train/val.
+
+> **Recommended**: Use **1d** (both variants, 24K rows) — this matches original JAMEL's training data size. Since prompts are rebuilt from atomic columns, both `react-text` and `react-vision` produce identical canonical prompts.
 
 ### 1a. Quick test (2-3 apps)
 
@@ -42,7 +44,7 @@ VAL_RATIO=0.05 \
 bash shell/run_compact_prepare_data.sh
 ```
 
-### 1b. Full react-vision dataset (80 apps, 12,000 rows)
+### 1b. Full react-vision only (80 apps, 12,000 rows)
 
 ```bash
 INPUT=/home/spc/JAMEL-DeltaState/data/ExplorerSFT-ReAct_Dataset/data/react-vision \
@@ -51,9 +53,7 @@ VAL_RATIO=0.05 \
 bash shell/run_compact_prepare_data.sh
 ```
 
-> **Note**: The full 80-app dataset is ~2.3GB of screenshots. If memory is limited, use the `APPS` filter to process fewer apps at a time, then manually concatenate the output parquet files.
-
-### 1c. react-text variant (80 apps, 12,000 rows, also has screenshots)
+### 1c. react-text only (80 apps, 12,000 rows)
 
 ```bash
 INPUT=/home/spc/JAMEL-DeltaState/data/ExplorerSFT-ReAct_Dataset/data/react-text \
@@ -63,9 +63,7 @@ VAL_RATIO=0.05 \
 bash shell/run_compact_prepare_data.sh
 ```
 
-> **Note**: Despite the name "react-text", this variant also contains `before_screenshot` bytes in every row. The difference from `react-vision` is the prompt format (text-only AXTree vs vision-augmented prompt), not the presence of screenshots.
-
-### 1d. Both variants combined (160 app-dirs, 24,000 rows)
+### 1d. Both variants combined ★ (160 app-dirs, 24,000 rows — recommended)
 
 ```bash
 INPUT=/home/spc/JAMEL-DeltaState/data/ExplorerSFT-ReAct_Dataset/data \
@@ -74,11 +72,16 @@ VAL_RATIO=0.05 \
 bash shell/run_compact_prepare_data.sh
 ```
 
+> **Why both variants work**: After prompt rebuilding, `react-text` and `react-vision` produce identical canonical prompts because both are rebuilt from the same atomic columns (`before_observation_str`, `before_screenshot`, etc.). This matches original JAMEL's behavior. The upstream `prompt` column is ignored.
+
 **What happens:**
 - Auto-discovers all `trajectory.parquet` files under app subdirectories
 - Phase 1: reads metadata (no screenshots) from all files → shuffle → produce train/val index sets
-- Phase 2: streams each file, filters rows by index, writes directly to train/val parquet using `pyarrow.ParquetWriter`
+- Phase 2: streams each file, filters rows by index, rebuilds prompts via `build_web_prompt()` (canonical JAMEL format with `<image>` tag), strips `<think>` from responses, writes directly to train/val parquet using `pyarrow.ParquetWriter`
 - **No data copies in memory** — avoids OOM even for large datasets
+- **Training/eval prompt consistency** — prompts match the canonical format used at evaluation time
+
+> **Note**: By default, `prompt` is rebuilt from atomic columns (`before_observation_str`, etc.) and `response` has `<think>` stripped — this matches what original JAMEL does. Pass `--no-rebuild-prompts` to the CLI if you want to keep the upstream prompt/response as-is.
 
 **Input dataset structure:**
 ```
@@ -121,8 +124,8 @@ data/compact_sft_data/
 ### 2a. Train with Qwen3-VL-2B (default, single GPU)
 
 ```bash
-TRAIN_FILE=data/compact_sft_data/compact_train.parquet \
-VAL_FILE=data/compact_sft_data/compact_val.parquet \
+TRAIN_FILE=data/compact_sft_data_all/compact_train.parquet \
+VAL_FILE=data/compact_sft_data_all/compact_val.parquet \
 BASE_MODEL=Qwen/Qwen3-VL-2B-Instruct \
 OUTPUT_DIR=outputs/compact_ckpt \
 TB_LOG_DIR=outputs/compact_tb \
@@ -143,8 +146,8 @@ bash shell/run_compact_train.sh
 ### 2b. Train with Qwen3-VL-8B (single GPU)
 
 ```bash
-TRAIN_FILE=data/compact_sft_data/compact_train.parquet \
-VAL_FILE=data/compact_sft_data/compact_val.parquet \
+TRAIN_FILE=data/compact_sft_data_all/compact_train.parquet \
+VAL_FILE=data/compact_sft_data_all/compact_val.parquet \
 BASE_MODEL=Qwen/Qwen3-VL-8B-Instruct \
 OUTPUT_DIR=outputs/compact_ckpt_8b \
 TB_LOG_DIR=outputs/compact_tb_8b \
@@ -286,9 +289,9 @@ outputs/compact_eval/
 ## Full Pipeline (All-in-One)
 
 ```bash
-# ── 1. Data prep (react-vision, 80 apps, 12K rows) ──
-INPUT=/home/spc/JAMEL-DeltaState/data/ExplorerSFT-ReAct_Dataset/data/react-vision \
-OUTPUT_DIR=data/compact_sft_data \
+# ── 1. Data prep (both variants, 24K rows — same as original JAMEL) ──
+INPUT=/home/spc/JAMEL-DeltaState/data/ExplorerSFT-ReAct_Dataset/data \
+OUTPUT_DIR=data/compact_sft_data_all \
 bash shell/run_compact_prepare_data.sh
 
 # ── 2. Train ──
@@ -325,8 +328,8 @@ bash shell/run_compact_eval.sh
 
 | Variable | Default | Description |
 |---|---|---|
-| `TRAIN_FILE` | `data/compact_train.parquet` | Train parquet file |
-| `VAL_FILE` | `data/compact_val.parquet` | Val parquet file |
+| `TRAIN_FILE` | `data/compact_train.parquet` | Train parquet file (set to `data/compact_sft_data_all/compact_train.parquet` for 24K rows) |
+| `VAL_FILE` | `data/compact_val.parquet` | Val parquet file (set to `data/compact_sft_data_all/compact_val.parquet` for 24K rows) |
 | `BASE_MODEL` | `Qwen/Qwen3-VL-2B-Instruct` | Pretrained base model name or path |
 | `OUTPUT_DIR` | `outputs/compact_ckpt` | Checkpoint output directory |
 | `TB_LOG_DIR` | `outputs/compact_tb` | TensorBoard log directory |

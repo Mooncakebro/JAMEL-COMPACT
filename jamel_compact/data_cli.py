@@ -42,6 +42,12 @@ def main():
         "--apps", default=None,
         help="Comma-separated app names to filter (default: all apps)",
     )
+    parser.add_argument(
+        "--no-rebuild-prompts", action="store_true",
+        help="Keep upstream prompt/response columns as-is. "
+             "Default: rebuild prompts from atomic columns via build_web_prompt() "
+             "and strip <think> from response (matches original JAMEL behavior).",
+    )
     args = parser.parse_args()
 
     apps_list = None
@@ -55,6 +61,7 @@ def main():
         seed=args.seed,
         variant=args.variant,
         apps=apps_list,
+        rebuild_prompts=not args.no_rebuild_prompts,
     )
     print(f"\nTrain: {train_path}")
     print(f"Val:   {val_path}")

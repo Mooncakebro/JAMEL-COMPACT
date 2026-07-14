@@ -362,6 +362,213 @@ def discover_parquet_files(input_path: str | list[str]) -> list[str]:
     return [str(p)]
 
 
+def _apply_prompt_rebuild_inplace(df_chunk, source_path, chunk_size: int) -> None:
+    """
+    Rebuild ``prompt`` and strip ``<think>`` from ``response`` for every row
+    in a chunk DataFrame, IN-PLACE.  Uses the canonical ``build_web_prompt``
+    from ``jamel.train.memory.web_prompt``.
+
+    This matches what original JAMEL's ``prepare_sft_dataset.py`` does.
+
+    All imports are done inside this function to avoid triggering heavy
+    dependencies (gymnasium, torch) during import time.
+    """
+    # ── Inline imports to avoid gymnasium dependency chain ──
+    import re as _re
+
+    # --- strip_think (inline from web_prompt.py) ---
+    _STRIP_THINK_RE = _re.compile(r"<think>.*?</think>", _re.DOTALL)
+
+    # --- extract_axtree_from_observation_str (inline from web_prompt.py) ---
+    def _extract_axtree(obs_str: str) -> str:
+        marker = "Current Observation:"
+        idx = obs_str.rfind(marker)
+        if idx == -1:
+            return obs_str.strip()
+        return obs_str[idx + len(marker):].strip()
+
+    # --- prune_axtree (inline from jamel/core/env/web/axtree_utils.py) ---
+    # Keeps all lines with interactive bids + structural ancestors.
+    # Falls back to interactive-element-only if still too long.
+    _IE_PATTERN = _re.compile(r"\[(\d+)\]\s+([A-Za-z]+)\s+'([^']*)'")
+    _STRUCTURAL = {
+        "heading", "labeltext", "banner", "navigation", "main", "region",
+        "complementary", "contentinfo", "search", "article", "section",
+        "list", "listitem", "table", "rowgroup", "row", "gridcell",
+        "menu", "menubar", "menuitem", "toolbar", "tablist", "tab",
+        "tabpanel", "dialog", "alert", "form", "group",
+    }
+
+    def _prune_axtree(text: str, max_chars: int = 8000) -> str:
+        if not text or len(text) <= max_chars:
+            return text
+        lines = text.split("\n")
+        n = len(lines)
+        if n <= 1:
+            return text
+        parsed = []
+        for line in lines:
+            stripped = line.lstrip("\t")
+            indent = len(line) - len(stripped)
+            m = _IE_PATTERN.search(stripped)
+            parsed.append({
+                "indent": indent, "text": stripped,
+                "has_bid": m is not None,
+                "role": m.group(2).lower() if m else None,
+            })
+        keep = [False] * n
+        if n > 0:
+            keep[0] = True
+        for i, p in enumerate(parsed):
+            if not p["has_bid"]:
+                continue
+            keep[i] = True
+            target_indent = p["indent"] - 1
+            for j in range(i - 1, -1, -1):
+                if parsed[j]["indent"] == target_indent:
+                    role = parsed[j]["role"]
+                    if role and role in _STRUCTURAL:
+                        keep[j] = True
+                    elif parsed[j]["indent"] <= 1:
+                        keep[j] = True
+                    target_indent -= 1
+                    if target_indent < 0:
+                        break
+        result = "\n".join(lines[i] for i in range(n) if keep[i])
+        if len(result) <= max_chars:
+            return result
+        # Fallback: interactive lines only
+        bid_result = "\n".join(lines[i] for i in range(n) if keep[i] and parsed[i]["has_bid"])
+        return bid_result[:max_chars]
+
+    # --- build_web_prompt (inline from web_prompt.py) ---
+    _WEB_ACTION_SPACE = """\
+noop(wait_ms: float = 1000)
+send_msg_to_user(text: str)
+report_infeasible(reason: str)
+scroll(delta_x: float, delta_y: float)
+fill(bid: str, value: str)
+select_option(bid: str, options: str | list[str])
+click(bid: str, button: Literal['left', 'middle', 'right'] = 'left', modifiers: list[Literal['Alt', 'Control', 'ControlOrMeta', 'Meta', 'Shift']] = [])
+dblclick(bid: str, button: Literal['left', 'middle', 'right'] = 'left', modifiers: list[Literal['Alt', 'Control', 'ControlOrMeta', 'Meta', 'Shift']] = [])
+hover(bid: str)
+press(bid: str, key_comb: str)
+focus(bid: str)
+clear(bid: str)
+drag_and_drop(from_bid: str, to_bid: str)
+upload_file(bid: str, file: str | list[str])
+tab_close()
+tab_focus(index: int)
+new_tab()
+go_back()
+go_forward()
+goto(url: str)
+reset()"""
+
+    _WEB_PROMPT_TEMPLATE = """\
+You are an autonomous browser exploration agent.
+
+This is session step {step_idx}.
+Your goal is to explore the target app and maximize novel JavaScript execution coverage.
+
+Target app: {target_app}
+Start URL: {start_url}
+
+Browser action space:
+{action_space}
+
+Current open pages URLs:
+{open_urls}
+
+Current Observation:
+{pruned_axtree}
+
+Current valid interactive element ids:
+{element_ids}
+
+The current webpage screenshot is:
+<image>
+
+Respond with exactly:
+<action>one action</action>
+
+The <action> content must be one single BrowserGym action call. If the action
+uses a bid, use one exact id from the valid interactive element list. Never
+invent bids and never combine two actions in one response."""
+
+    _BID_LINE_RE = _re.compile(r"\[(\d+)\]\s+([A-Za-z]+)\s+'([^']*)'")
+
+    def _format_open_urls(urls: object) -> str:
+        if isinstance(urls, str):
+            s = urls.strip()
+            if s.startswith("(") and s.endswith(")"):
+                return s
+            return repr((s,))
+        try:
+            items = tuple(str(u) for u in urls)
+            return repr(items)
+        except TypeError:
+            return repr((str(urls),))
+
+    def _extract_element_ids(pruned: str, limit: int = 200) -> str:
+        seen = set()
+        lines = []
+        for raw in pruned.splitlines():
+            m = _BID_LINE_RE.search(raw)
+            if not m:
+                continue
+            bid, role, label = m.groups()
+            if bid in seen:
+                continue
+            seen.add(bid)
+            lines.append(f"- {bid}: {role.lower()} {label.strip()!r}")
+            if len(lines) >= limit:
+                lines.append(f"- ... {limit}+ ids omitted")
+                break
+        return "\n".join(lines) if lines else "(none)"
+
+    def _build_prompt(*, step_idx, target_app, start_url, open_urls,
+                      pruned_axtree, element_ids=None):
+        if element_ids is None:
+            element_ids = _extract_element_ids(pruned_axtree)
+        return _WEB_PROMPT_TEMPLATE.format(
+            step_idx=int(step_idx),
+            target_app=str(target_app),
+            start_url=str(start_url),
+            action_space=_WEB_ACTION_SPACE,
+            open_urls=_format_open_urls(open_urls),
+            pruned_axtree=pruned_axtree,
+            element_ids=element_ids,
+        )
+
+    # ── Apply to each row ──
+    for i in range(chunk_size):
+        row = df_chunk.iloc[i]
+        try:
+            obs_str = str(row.get("before_observation_str", "") or "")
+            axtree_raw = _extract_axtree(obs_str)
+            pruned = _prune_axtree(axtree_raw, max_chars=8000)
+            target_app = str(row.get("target_app", ""))
+            start_url = str(row.get("start_url", row.get("target_url", "")))
+            step_idx = int(row.get("step_idx", row.get("session_step_idx", 0)))
+            open_urls = row.get("before_open_pages_urls", (start_url,))
+
+            new_prompt = _build_prompt(
+                step_idx=step_idx, target_app=target_app,
+                start_url=start_url, open_urls=open_urls,
+                pruned_axtree=pruned,
+            )
+            new_response = _STRIP_THINK_RE.sub(
+                "", str(row.get("response", "") or ""),
+            ).strip()
+
+            df_chunk.iat[i, df_chunk.columns.get_loc("prompt")] = new_prompt
+            df_chunk.iat[i, df_chunk.columns.get_loc("response")] = new_response
+        except Exception as e:
+            app_hint = Path(source_path).parent.name
+            print(f"  [warn] Prompt rebuild failed for {app_hint} row {i}: {e}")
+
+
 def prepare_compact_dataset(
     input_files: str | list[str],
     output_dir: str,
@@ -369,6 +576,7 @@ def prepare_compact_dataset(
     seed: int = 42,
     variant: str | None = None,
     apps: list[str] | None = None,
+    rebuild_prompts: bool = True,
 ) -> tuple[str, str]:
     """
     Prepare SFT data for JAMEL-COMPACT training.
@@ -392,6 +600,11 @@ def prepare_compact_dataset(
                      and "react-vision", filter to one variant.
                      Set to None to use both.
         apps:        optional list of app names to filter (e.g. ["weibo", "alibaba"])
+        rebuild_prompts: if True (default), rebuild the ``prompt`` column from
+                     atomic columns (``before_observation_str``, etc.) using
+                     ``build_web_prompt()`` and strip ``<think>`` from
+                     ``response``. This ensures training/eval prompt format
+                     consistency, exactly as original JAMEL does.
 
     Returns:
         (train_path, val_path)
@@ -493,13 +706,19 @@ def prepare_compact_dataset(
             val_local = [j for j in range(chunk_len) if chunk_global_indices[j] in val_indices]
 
             if train_local:
-                train_table = pa.Table.from_pandas(df_chunk.iloc[train_local])
+                train_chunk = df_chunk.iloc[train_local]
+                if rebuild_prompts:
+                    _apply_prompt_rebuild_inplace(train_chunk, p, len(train_chunk))
+                train_table = pa.Table.from_pandas(train_chunk)
                 if train_writer is None:
                     train_writer = pq.ParquetWriter(train_path, train_table.schema)
                 train_writer.write_table(train_table)
 
             if val_local:
-                val_table = pa.Table.from_pandas(df_chunk.iloc[val_local])
+                val_chunk = df_chunk.iloc[val_local]
+                if rebuild_prompts:
+                    _apply_prompt_rebuild_inplace(val_chunk, p, len(val_chunk))
+                val_table = pa.Table.from_pandas(val_chunk)
                 if val_writer is None:
                     val_writer = pq.ParquetWriter(val_path, val_table.schema)
                 val_writer.write_table(val_table)
