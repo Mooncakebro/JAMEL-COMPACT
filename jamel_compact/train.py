@@ -31,6 +31,14 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
+# tqdm progress bar
+try:
+    from tqdm import tqdm
+    _TQDM_AVAILABLE = True
+except ImportError:
+    _TQDM_AVAILABLE = False
+    tqdm = None
+
 # TensorBoard is optional — training works without it (logs to stdout only)
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -82,7 +90,16 @@ def train_one_epoch(
     accum_steps = config.gradient_accumulation_steps
     optimizer.zero_grad()
 
-    for step, batch in enumerate(dataloader):
+    # Build progress bar
+    if _TQDM_AVAILABLE:
+        pbar = tqdm(
+            dataloader, desc=f"Epoch {epoch}", total=total_steps,
+            unit="batch", leave=True,
+        )
+    else:
+        pbar = dataloader
+
+    for step, batch in enumerate(pbar):
         batch_start = time.time()
 
         input_ids = batch["input_ids"].to(device)
@@ -171,11 +188,24 @@ def train_one_epoch(
                     f"time={elapsed:.2f}s"
                 )
 
+            # Update progress bar
+            if _TQDM_AVAILABLE:
+                pbar.set_postfix({
+                    "loss": f"{loss_dict['total']:.4f}",
+                    "action": f"{loss_dict['action']:.4f}",
+                    "lr": f"{optimizer.param_groups[0]['lr']:.2e}",
+                    "step": global_step,
+                })
+
             # ── Save checkpoint ──
             if global_step % config.save_steps == 0:
                 ckpt_dir = Path(config.output_dir) / f"global_step_{global_step}"
                 model.save_pretrained(ckpt_dir)
                 print(f"  [checkpoint] saved to {ckpt_dir}")
+
+    # Close progress bar
+    if _TQDM_AVAILABLE:
+        pbar.close()
 
     return global_step
 
@@ -197,7 +227,12 @@ def validate(
     num_batches = 0
 
     with torch.no_grad():
-        for batch in dataloader:
+        if _TQDM_AVAILABLE:
+            pbar = tqdm(dataloader, desc="Validating", unit="batch", leave=False)
+        else:
+            pbar = dataloader
+
+        for batch in pbar:
             input_ids = batch["input_ids"].to(device)
             attention_mask = batch["attention_mask"].to(device)
             labels = batch["labels"].to(device)
@@ -229,6 +264,12 @@ def validate(
             total_mem_loss += outputs["loss_dict"]["mem_l2"]
             total_uncert_loss += outputs["loss_dict"]["uncert"]
             num_batches += 1
+
+            if _TQDM_AVAILABLE:
+                pbar.set_postfix({"val_loss": f"{outputs['loss_dict']['total']:.4f}"})
+
+        if _TQDM_AVAILABLE:
+            pbar.close()
 
     avg_loss = total_loss / max(num_batches, 1)
     avg_action = total_action_loss / max(num_batches, 1)
