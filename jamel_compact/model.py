@@ -294,11 +294,6 @@ class JAMELCompactWrapper(nn.Module):
             self.llm.gradient_checkpointing_enable()
             self.llm.config.use_cache = False
 
-        # Pre-find and cache rotary_emb so DataParallel replicas inherit it
-        self._cached_rotary_emb = None
-        self._rotary_printed = False
-        self._find_rotary_emb()
-
     # ── Architecture helpers ──
 
     @staticmethod
@@ -391,10 +386,11 @@ class JAMELCompactWrapper(nn.Module):
         return (cos.to(dtype=h.dtype), sin.to(dtype=h.dtype))
 
     def _find_rotary_emb(self):
-        """Find the rotary embedding module in the model (cached)."""
-        if hasattr(self, "_cached_rotary_emb"):
-            return self._cached_rotary_emb
+        """Find the rotary embedding module in the model.
 
+        We do NOT cache the result because DataParallel creates fresh replicas
+        each forward pass, and a cached reference would point to the original
+        device's module, causing device mismatches."""
         model = self.llm
         for path in [
             lambda m: getattr(m, "rotary_emb", None),
@@ -403,13 +399,7 @@ class JAMELCompactWrapper(nn.Module):
         ]:
             result = path(model)
             if result is not None:
-                # Only print once per process
-                if not getattr(self, "_rotary_printed", False):
-                    print(f"[model] Found rotary_emb")
-                    self._rotary_printed = True
-                self._cached_rotary_emb = result
                 return result
-        self._cached_rotary_emb = None
         return None
 
     def _get_input_embeddings(self):
@@ -593,6 +583,9 @@ class JAMELCompactWrapper(nn.Module):
         labels: Optional[torch.Tensor] = None,
         pixel_values: Optional[torch.Tensor] = None,
         image_grid_thw: Optional[torch.Tensor] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        deepstack_features: Optional[List] = None,
+        visual_pos_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> dict:
         """
@@ -607,6 +600,10 @@ class JAMELCompactWrapper(nn.Module):
             labels:             [B, N] — token labels for loss (optional)
             pixel_values:       [B, C, H, W] — processed image tensor (optional)
             image_grid_thw:     [B, 3] — image grid dimensions (optional)
+            inputs_embeds:      [B, N, d] — pre-computed embeddings (optional,
+                                bypasses visual encoder — used for DataParallel)
+            deepstack_features: Pre-computed deepstack features (for DataParallel)
+            visual_pos_mask:    Pre-computed visual position mask (for DataParallel)
 
         Returns:
             dict with: logits, new_memory, new_confidence, loss (if labels)
@@ -614,23 +611,25 @@ class JAMELCompactWrapper(nn.Module):
         B = input_ids.shape[0]
         device = input_ids.device
 
-        # ── Embed tokens (pretrained) ──
-        # For Qwen3-VL, the model's forward() handles replacing image placeholder
-        # tokens with vision features. We call the full model's forward() for the
-        # embedding step if pixel_values are provided.
-        embed_layer = self._get_input_embeddings()
-        h = embed_layer(input_ids)  # [B, N, d]
+        # ── Embed tokens ──
+        if inputs_embeds is not None:
+            # Pre-computed embeddings (visual features already injected)
+            h = inputs_embeds
+            if deepstack_features is None:
+                deepstack_features = []
+            if visual_pos_mask is None:
+                visual_pos_mask = None
+        else:
+            embed_layer = self._get_input_embeddings()
+            h = embed_layer(input_ids)  # [B, N, d]
 
-        # ── Process image features if provided ──
-        # Qwen3-VL replaces image placeholder tokens with vision encoder output.
-        # We use the model's get_image_features() to get projected features (via
-        # the merger), and also collect deepstack_features for per-layer injection.
-        deepstack_features = []
-        visual_pos_mask = None
-        if pixel_values is not None and self._has_visual_encoder():
-            h, deepstack_features, visual_pos_mask = self._inject_visual_features(
-                h, input_ids, pixel_values, image_grid_thw,
-            )
+            # ── Process image features if provided ──
+            if deepstack_features is None:
+                deepstack_features = []
+            if pixel_values is not None and self._has_visual_encoder():
+                h, deepstack_features, visual_pos_mask = self._inject_visual_features(
+                    h, input_ids, pixel_values, image_grid_thw,
+                )
 
         # ── Raw action embedding ──
         action_embed = self.action_embed(action_embed_input)  # [B, d]

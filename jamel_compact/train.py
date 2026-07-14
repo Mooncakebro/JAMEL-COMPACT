@@ -133,8 +133,24 @@ def train_one_epoch(
 
         # Initialize memory (fresh for each batch — no cross-batch memory in SFT)
         B = input_ids.shape[0]
-        raw = model.module if isinstance(model, torch.nn.DataParallel) else model
-        memory_states, confidence_states = raw.init_memory(B, device)
+        raw_model = _unwrap(model)
+        memory_states, confidence_states = raw_model.init_memory(B, device)
+
+        # Pre-compute visual features on the raw model before DataParallel
+        # scatter. This avoids DataParallel issues with the visual encoder
+        # (replicated visual model has no floating-point parameters).
+        inputs_embeds = None
+        deepstack_features = None
+        visual_pos_mask = None
+        if pixel_values is not None and raw_model._has_visual_encoder():
+            embed_layer = raw_model._get_input_embeddings()
+            h_embed = embed_layer(input_ids)
+            inputs_embeds, deepstack_features, visual_pos_mask = \
+                raw_model._inject_visual_features(
+                    h_embed, input_ids, pixel_values, image_grid_thw,
+                )
+            pixel_values = None  # already processed
+            image_grid_thw = None
 
         # Forward pass
         outputs = model(
@@ -146,6 +162,9 @@ def train_one_epoch(
             labels=labels,
             pixel_values=pixel_values,
             image_grid_thw=image_grid_thw,
+            inputs_embeds=inputs_embeds,
+            deepstack_features=deepstack_features,
+            visual_pos_mask=visual_pos_mask,
         )
 
         # Handle DataParallel gathered loss (concatenated per-GPU scalars → 1-D tensor)
@@ -275,6 +294,20 @@ def validate(
             B = input_ids.shape[0]
             memory_states, confidence_states = raw_model.init_memory(B, device)
 
+            # Pre-compute visual features on raw model (same as training)
+            inputs_embeds = None
+            deepstack_features = None
+            visual_pos_mask = None
+            if pixel_values is not None and raw_model._has_visual_encoder():
+                embed_layer = raw_model._get_input_embeddings()
+                h_embed = embed_layer(input_ids)
+                inputs_embeds, deepstack_features, visual_pos_mask = \
+                    raw_model._inject_visual_features(
+                        h_embed, input_ids, pixel_values, image_grid_thw,
+                    )
+                pixel_values = None
+                image_grid_thw = None
+
             outputs = model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -284,6 +317,9 @@ def validate(
                 labels=labels,
                 pixel_values=pixel_values,
                 image_grid_thw=image_grid_thw,
+                inputs_embeds=inputs_embeds,
+                deepstack_features=deepstack_features,
+                visual_pos_mask=visual_pos_mask,
             )
 
             ld = outputs["loss_dict"]
