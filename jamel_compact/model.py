@@ -416,6 +416,32 @@ class JAMELCompactWrapper(nn.Module):
             hasattr(self.llm, "model") and hasattr(self.llm.model, "visual")
         )
 
+    @staticmethod
+    def _build_causal_attention_mask(
+        attention_mask: torch.Tensor, dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """
+        Convert a 2D padding mask [B, N] into a 4D causal attention mask
+        [B, 1, N, N] suitable for SDPA.
+
+        - Positions where attention_mask == 0 (padding) are masked to -inf.
+        - Upper triangle is masked (causal).
+        """
+        B, N = attention_mask.shape
+        # Start with causal mask: lower triangle = 0, upper = -inf
+        causal = torch.triu(
+            torch.full((N, N), float('-inf'), dtype=dtype, device=attention_mask.device),
+            diagonal=1,
+        )  # [N, N]
+        causal = causal.unsqueeze(0).unsqueeze(0).expand(B, 1, N, N)  # [B, 1, N, N]
+
+        # Apply padding mask: set columns for padding positions to -inf
+        if (attention_mask == 0).any():
+            pad_mask = attention_mask[:, None, None, :] == 0  # [B, 1, 1, N]
+            causal = causal.masked_fill(pad_mask, float('-inf'))
+
+        return causal
+
     def _inject_visual_features(
         self,
         h: torch.Tensor,
@@ -439,11 +465,11 @@ class JAMELCompactWrapper(nn.Module):
             return h  # no visual encoder, skip
 
         # Find image placeholder token IDs
-        # Qwen3-VL uses <|vision_start|><|image_pad|>...<|vision_end|>
+        # Qwen3-VL uses ◣
         image_token_id = getattr(self.llm.config, "image_token_id", None)
         if image_token_id is None:
             # Try to get from tokenizer
-            image_token_id = self.tokenizer.convert_tokens_to_ids("<|image_pad|>")
+            image_token_id = self.tokenizer.convert_tokens_to_ids("◣")
             if image_token_id is None or image_token_id == self.tokenizer.unk_token_id:
                 return h  # can't find image token, skip
 
@@ -457,14 +483,18 @@ class JAMELCompactWrapper(nn.Module):
             print(f"[model] Visual encoder failed: {e}")
             return h
 
-        # Scatter image features into hidden states at placeholder positions
-        # image_embeds shape: [num_image_tokens, d]
-        # Find positions of image tokens in input_ids
+        # Scatter image features into hidden states at placeholder positions.
+        # image_embeds from Qwen3-VL visual encoder is [total_image_tokens, d],
+        # i.e. all images' features concatenated. We need to assign each batch
+        # element its own slice.
+        offset = 0
         for b in range(h.shape[0]):
             mask = (input_ids[b] == image_token_id)
             positions = mask.nonzero(as_tuple=True)[0]
-            if len(positions) > 0 and len(positions) <= image_embeds.shape[0]:
-                h[b, positions] = image_embeds[:len(positions)]
+            n_img_tokens = len(positions)
+            if n_img_tokens > 0 and offset + n_img_tokens <= image_embeds.shape[0]:
+                h[b, positions] = image_embeds[offset:offset + n_img_tokens]
+                offset += n_img_tokens
 
         return h
 
@@ -543,10 +573,12 @@ class JAMELCompactWrapper(nn.Module):
             h, attention_mask,
         )
 
-        # ── Convert attention_mask to model dtype ──
-        # Qwen3-VL's SDPA attention expects mask dtype to match query dtype
-        if attention_mask.dtype != h.dtype:
-            attention_mask = attention_mask.to(dtype=h.dtype)
+        # ── Convert attention_mask to 4D causal mask ──
+        # Qwen3-VL's SDPA attention expects a [B, 1, N, N] causal mask,
+        # not a 2D [B, N] padding mask.
+        attention_mask_4d = self._build_causal_attention_mask(
+            attention_mask, h.dtype,
+        )
 
         # ── Process through each layer ──
         new_memory, new_confidence = [], []
@@ -560,7 +592,7 @@ class JAMELCompactWrapper(nn.Module):
             # 4b. Run pretrained layer (self-attn + FFN)
             layer_output = layer(
                 h,
-                attention_mask=attention_mask,
+                attention_mask=attention_mask_4d,
                 position_embeddings=position_embeddings,
                 **kwargs,
             )
@@ -623,27 +655,44 @@ class JAMELCompactWrapper(nn.Module):
         max_new_tokens: int = 256,
         temperature: float = 0.8,
         top_p: float = 0.9,
+        pixel_values: Optional[torch.Tensor] = None,
+        image_grid_thw: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> dict:
-        """Generate action tokens autoregressively with memory."""
+        """Generate action tokens autoregressively with memory.
+
+        Images are processed once for the prompt. During generation, each new
+        token goes through all decoder layers (self-attn + FFN) and memory
+        is updated. Position embeddings use correct absolute positions.
+        """
         B = input_ids.shape[0]
         device = input_ids.device
+        seq_len = input_ids.shape[1]
 
         action_embed = self.action_embed(action_embed_input)
         decoder_layers = self._get_decoder_layers()
         embed_layer = self._get_input_embeddings()
 
-        # Process the prompt through all layers
-        h = embed_layer(input_ids)
-        # Convert attention_mask to model dtype (Qwen3-VL expects matching dtypes)
-        attn_mask_g = attention_mask
-        if attn_mask_g.dtype != h.dtype:
-            attn_mask_g = attn_mask_g.to(dtype=h.dtype)
-        position_embeddings = self._compute_position_embeddings(h, attn_mask_g)
+        # ── Process prompt embeddings ──
+        h = embed_layer(input_ids)  # [B, N, d]
+
+        # Inject visual features if available
+        if pixel_values is not None and self._has_visual_encoder():
+            h = self._inject_visual_features(
+                h, input_ids, pixel_values, image_grid_thw,
+            )
+
+        # ── Build 4D causal mask for the prompt ──
+        attn_mask_4d = self._build_causal_attention_mask(attention_mask, h.dtype)
+
+        # ── Compute position embeddings for prompt ──
+        position_embeddings = self._compute_position_embeddings(h, attention_mask)
+
+        # ── Process prompt through all layers with memory ──
         new_memory, new_confidence = [], []
         for l, (layer, sm) in enumerate(zip(decoder_layers, self.side_memories)):
             m_hat, c_hat = sm.predict(memory_states[l], confidence_states[l], action_embed)
-            layer_output = layer(h, attention_mask=attn_mask_g,
+            layer_output = layer(h, attention_mask=attn_mask_4d,
                                 position_embeddings=position_embeddings, **kwargs)
             h_layer = layer_output[0] if isinstance(layer_output, tuple) else layer_output
             z_t = sm.extract_observation(h_layer, self.num_act_tokens)
@@ -652,10 +701,12 @@ class JAMELCompactWrapper(nn.Module):
             new_memory.append(m_new)
             new_confidence.append(c_new)
 
-        # Generate tokens one by one
+        # ── Generate tokens one by one ──
         generated_ids = []
-        cur_h = h[:, -1:, :]  # last position
-        cur_token = input_ids[:, -1:]
+        cur_pos = seq_len  # absolute position for the next token
+
+        # Use the last position's hidden state (after memory injection) for logits
+        cur_h = h[:, -1:, :]  # [B, 1, d]
 
         for _ in range(max_new_tokens):
             logits = self._get_lm_head()(cur_h)  # [B, 1, vocab]
@@ -668,25 +719,48 @@ class JAMELCompactWrapper(nn.Module):
                 sorted_indices_to_remove = cum_probs > top_p
                 sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
                 sorted_indices_to_remove[..., 0] = False
-                indices_to_remove = sorted_indices.scatter(1, sorted_indices, sorted_indices_to_remove)
+                indices_to_remove = sorted_logits.scatter(1, sorted_indices, sorted_indices_to_remove)
                 logits = logits.masked_fill(indices_to_remove, float('-inf'))
 
             probs = F.softmax(logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)  # [B, 1]
             generated_ids.append(next_token)
 
-            # Feed next token through all layers (no memory update during generation)
-            next_h = embed_layer(next_token)
-            single_mask = torch.ones((B, 1), dtype=attn_mask_g.dtype, device=device)
-            pos_emb_single = self._compute_position_embeddings(
-                next_h, single_mask,
-            )
-            for l, layer in enumerate(decoder_layers):
-                layer_output = layer(next_h, attention_mask=single_mask,
+            # ── Feed next token through all layers with memory ──
+            next_h = embed_layer(next_token)  # [B, 1, d]
+
+            # Single-token causal mask (no padding possible for 1 token)
+            single_mask_4d = torch.zeros(
+                (B, 1, 1, 1), dtype=h.dtype, device=device,
+            )  # [B, 1, 1, 1] — attend to self
+
+            # Position embedding for this token at absolute position cur_pos
+            single_pos_ids = torch.tensor(
+                [[cur_pos]], dtype=torch.long, device=device,
+            )  # [B, 1]
+            rotary_emb = self._find_rotary_emb()
+            if rotary_emb is not None:
+                cos_single, sin_single = rotary_emb(next_h, single_pos_ids)
+                pos_emb_single = (cos_single.to(dtype=next_h.dtype),
+                                  sin_single.to(dtype=next_h.dtype))
+            else:
+                pos_emb_single = None
+
+            for l, (layer, sm) in enumerate(zip(decoder_layers, self.side_memories)):
+                layer_output = layer(next_h, attention_mask=single_mask_4d,
                                     position_embeddings=pos_emb_single,
                                     **kwargs)
-                next_h = layer_output[0] if isinstance(layer_output, tuple) else layer_output
-            cur_h = next_h
+                next_h_layer = layer_output[0] if isinstance(layer_output, tuple) else layer_output
+                # Update memory with the new token's hidden state
+                z_t = sm.extract_observation(next_h_layer, self.num_act_tokens)
+                m_hat, c_hat = sm.predict(new_memory[l], new_confidence[l], action_embed)
+                m_new, c_new = sm.correct(m_hat, c_hat, z_t)
+                next_h = sm.inject(next_h_layer, m_new)
+                new_memory[l] = m_new
+                new_confidence[l] = c_new
+
+            cur_h = next_h  # [B, 1, d] — use injected output for next logits
+            cur_pos += 1
 
             # Stop at EOS
             if self.tokenizer.eos_token_id is not None and \

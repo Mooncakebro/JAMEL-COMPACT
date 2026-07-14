@@ -240,8 +240,11 @@ class CompactDataset(Dataset):
 
         # ── Extract pixel values if available ──
         pixel_values = None
+        image_grid_thw = None
         if "pixel_values" in full_inputs:
             pixel_values = full_inputs["pixel_values"][0]
+        if "image_grid_thw" in full_inputs:
+            image_grid_thw = full_inputs["image_grid_thw"][0]
 
         return {
             "input_ids": input_ids,
@@ -249,6 +252,7 @@ class CompactDataset(Dataset):
             "labels": labels,
             "action_input_ids": action_input_ids,
             "pixel_values": pixel_values,
+            "image_grid_thw": image_grid_thw,
             "session_id": str(row.get("session_id", "")),
             "step_idx": int(row.get("step_idx", 0)),
             "target_app": str(row.get("target_app", "")),
@@ -306,6 +310,14 @@ def collate_fn(batch: list[dict], pad_token_id: int = 0) -> dict:
         except RuntimeError:
             # Different shapes — return as list
             result["pixel_values"] = pixel_values
+
+    # image_grid_thw (Qwen3-VL: [num_images, 3])
+    grid_thws = [item.get("image_grid_thw") for item in batch]
+    if all(g is not None for g in grid_thws):
+        try:
+            result["image_grid_thw"] = torch.stack(grid_thws)
+        except RuntimeError:
+            result["image_grid_thw"] = grid_thws
 
     return result
 

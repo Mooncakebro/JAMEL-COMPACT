@@ -92,6 +92,9 @@ def train_one_epoch(
         pixel_values = batch.get("pixel_values")
         if pixel_values is not None:
             pixel_values = pixel_values.to(device)
+        image_grid_thw = batch.get("image_grid_thw")
+        if image_grid_thw is not None and isinstance(image_grid_thw, torch.Tensor):
+            image_grid_thw = image_grid_thw.to(device)
 
         # Get action embedding input
         action_embed_input = get_action_embedding(action_input_ids, model, device)
@@ -109,6 +112,7 @@ def train_one_epoch(
             confidence_states=confidence_states,
             labels=labels,
             pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
         )
 
         loss = outputs["loss"] / accum_steps
@@ -198,6 +202,12 @@ def validate(
             attention_mask = batch["attention_mask"].to(device)
             labels = batch["labels"].to(device)
             action_input_ids = batch["action_input_ids"].to(device)
+            pixel_values = batch.get("pixel_values")
+            if pixel_values is not None:
+                pixel_values = pixel_values.to(device)
+            image_grid_thw = batch.get("image_grid_thw")
+            if image_grid_thw is not None and isinstance(image_grid_thw, torch.Tensor):
+                image_grid_thw = image_grid_thw.to(device)
 
             action_embed_input = get_action_embedding(action_input_ids, model, device)
             B = input_ids.shape[0]
@@ -210,6 +220,8 @@ def validate(
                 memory_states=memory_states,
                 confidence_states=confidence_states,
                 labels=labels,
+                pixel_values=pixel_values,
+                image_grid_thw=image_grid_thw,
             )
 
             total_loss += outputs["loss_dict"]["total"]
