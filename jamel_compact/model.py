@@ -294,6 +294,11 @@ class JAMELCompactWrapper(nn.Module):
             self.llm.gradient_checkpointing_enable()
             self.llm.config.use_cache = False
 
+        # Pre-find and cache rotary_emb so DataParallel replicas inherit it
+        self._cached_rotary_emb = None
+        self._rotary_printed = False
+        self._find_rotary_emb()
+
     # ── Architecture helpers ──
 
     @staticmethod
@@ -398,7 +403,10 @@ class JAMELCompactWrapper(nn.Module):
         ]:
             result = path(model)
             if result is not None:
-                print(f"[model] Found rotary_emb")
+                # Only print once per process
+                if not getattr(self, "_rotary_printed", False):
+                    print(f"[model] Found rotary_emb")
+                    self._rotary_printed = True
                 self._cached_rotary_emb = result
                 return result
         self._cached_rotary_emb = None
@@ -468,11 +476,23 @@ class JAMELCompactWrapper(nn.Module):
         """
         model = self.llm
 
+        # Flatten pixel_values and image_grid_thw for the visual encoder.
+        # The Qwen3-VL visual encoder expects:
+        #   pixel_values:  [total_patches, patch_dim]  (all images concatenated)
+        #   image_grid_thw: [num_images, 3]
+        # But collate_fn stacks per-sample tensors, adding a batch dim.
+        if pixel_values.dim() == 3:
+            # [B, num_patches, dim] → [B * num_patches, dim]
+            pixel_values = pixel_values.reshape(-1, pixel_values.shape[-1])
+        if image_grid_thw is not None and image_grid_thw.dim() == 3:
+            # [B, num_images, 3] → [B * num_images, 3]
+            image_grid_thw = image_grid_thw.reshape(-1, 3)
+
         # Use the model's get_image_features if available (handles merger + split)
         if hasattr(model, "get_image_features"):
             try:
                 vision_output = model.get_image_features(
-                    pixel_values, image_grid_thw, return_dict=True,
+                    pixel_values, image_grid_thw,
                 )
                 # pooler_output is a tuple of per-image tensors after split
                 image_embeds_list = vision_output.pooler_output
@@ -481,7 +501,14 @@ class JAMELCompactWrapper(nn.Module):
                 )  # [total_image_tokens, d]
                 deepstack_features = vision_output.deepstack_features or []
             except Exception as e:
+                import traceback
                 print(f"[model] get_image_features failed: {e}")
+                print(f"  pixel_values shape: {pixel_values.shape}, dtype: {pixel_values.dtype}, device: {pixel_values.device}")
+                if image_grid_thw is not None:
+                    print(f"  image_grid_thw shape: {image_grid_thw.shape}, dtype: {image_grid_thw.dtype}, device: {image_grid_thw.device}")
+                print(f"  model type: {type(model).__name__}")
+                print(f"  visual dtype: {model.visual.dtype if hasattr(model, 'visual') else 'N/A'}")
+                traceback.print_exc()
                 return h, [], None
         else:
             # Fallback: call visual encoder directly
