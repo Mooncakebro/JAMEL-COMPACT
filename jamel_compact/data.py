@@ -239,12 +239,22 @@ class CompactDataset(Dataset):
         action_input_ids = torch.tensor(action_tokens, dtype=torch.long)
 
         # ── Extract pixel values if available ──
+        # Qwen3-VL processor returns pixel_values as [num_patches, patch_dim]
+        # (2D, no batch dim) and image_grid_thw as [num_images, 3] (2D).
+        # We keep the full tensors — do NOT index [0] (that would take only
+        # the first patch, not the first image).
         pixel_values = None
         image_grid_thw = None
         if "pixel_values" in full_inputs:
-            pixel_values = full_inputs["pixel_values"][0]
+            pixel_values = full_inputs["pixel_values"]
+            # Squeeze batch dim if processor returned 3D [1, num_patches, dim]
+            if pixel_values.dim() == 3 and pixel_values.shape[0] == 1:
+                pixel_values = pixel_values.squeeze(0)
         if "image_grid_thw" in full_inputs:
-            image_grid_thw = full_inputs["image_grid_thw"][0]
+            image_grid_thw = full_inputs["image_grid_thw"]
+            # Squeeze batch dim if processor returned 3D [1, num_images, 3]
+            if image_grid_thw.dim() == 3 and image_grid_thw.shape[0] == 1:
+                image_grid_thw = image_grid_thw.squeeze(0)
 
         return {
             "input_ids": input_ids,
@@ -302,20 +312,24 @@ def collate_fn(batch: list[dict], pad_token_id: int = 0) -> dict:
         "step_indices": [item["step_idx"] for item in batch],
     }
 
-    # Pixel values (may be None for text-only or different shapes)
+    # Pixel values: concatenate all patches along dim 0.
+    # Each sample is [num_patches, patch_dim] (2D). Concatenating gives
+    # [total_patches, patch_dim] which is what the visual encoder expects.
     pixel_values = [item.get("pixel_values") for item in batch]
     if all(pv is not None for pv in pixel_values):
         try:
-            result["pixel_values"] = torch.stack(pixel_values)
+            result["pixel_values"] = torch.cat(pixel_values, dim=0)
         except RuntimeError:
             # Different shapes — return as list
             result["pixel_values"] = pixel_values
 
-    # image_grid_thw (Qwen3-VL: [num_images, 3])
+    # image_grid_thw: concatenate along dim 0.
+    # Each sample is [num_images, 3] (e.g. [1, 3]). Concatenating gives
+    # [total_images, 3] which is what the visual encoder expects.
     grid_thws = [item.get("image_grid_thw") for item in batch]
     if all(g is not None for g in grid_thws):
         try:
-            result["image_grid_thw"] = torch.stack(grid_thws)
+            result["image_grid_thw"] = torch.cat(grid_thws, dim=0)
         except RuntimeError:
             result["image_grid_thw"] = grid_thws
 
