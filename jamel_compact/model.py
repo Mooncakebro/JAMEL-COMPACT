@@ -354,6 +354,47 @@ class JAMELCompactWrapper(nn.Module):
             return self.llm.language_model.lm_head
         raise ValueError("Cannot find lm_head in this model")
 
+    def _compute_position_embeddings(self, h: torch.Tensor,
+                                     attention_mask: torch.Tensor):
+        """
+        Compute rotary position embeddings for Qwen3-VL layers.
+
+        Qwen3-VL's decoder layer requires `position_embeddings` as a kwarg.
+        These are computed by the model's `rotary_emb` module from position IDs.
+        """
+        # Find the rotary embedding module
+        rotary_emb = self._find_rotary_emb()
+        if rotary_emb is None:
+            return None  # model doesn't use RoPE
+
+        # Build position IDs from attention mask
+        if attention_mask.dim() == 2:
+            position_ids = attention_mask.long().cumsum(dim=-1) - 1
+            position_ids.masked_fill_(attention_mask == 0, 1)
+        else:
+            position_ids = torch.arange(
+                h.shape[1], device=h.device
+            ).unsqueeze(0).expand(h.shape[0], -1)
+
+        # Compute rotary embeddings for all positions
+        cos, sin = rotary_emb(h, position_ids)
+        return (cos.to(dtype=h.dtype), sin.to(dtype=h.dtype))
+
+    def _find_rotary_emb(self):
+        """Find the rotary embedding module in the model."""
+        model = self.llm
+        # Qwen3-VL: model.rotary_emb
+        for path in [
+            lambda m: getattr(m, "rotary_emb", None),
+            lambda m: getattr(getattr(m, "model", None), "rotary_emb", None),
+            lambda m: getattr(getattr(getattr(m, "model", None), "language_model", None), "rotary_emb", None),
+        ]:
+            result = path(model)
+            if result is not None:
+                print(f"[model] Found rotary_emb via {path.__name__}")
+                return result
+        return None
+
     def _get_input_embeddings(self):
         """Get token embeddings, handling multimodal model wrappers."""
         try:
@@ -415,6 +456,12 @@ class JAMELCompactWrapper(nn.Module):
         # ── Get decoder layers ──
         decoder_layers = self._get_decoder_layers()
 
+        # ── Compute position embeddings if the model uses RoPE ──
+        # Qwen3-VL layers require a `position_embeddings` kwarg.
+        position_embeddings = self._compute_position_embeddings(
+            h, attention_mask,
+        )
+
         # ── Process through each layer ──
         new_memory, new_confidence = [], []
         for l, (layer, sm) in enumerate(zip(decoder_layers, self.side_memories)):
@@ -427,6 +474,7 @@ class JAMELCompactWrapper(nn.Module):
             layer_output = layer(
                 h,
                 attention_mask=attention_mask,
+                position_embeddings=position_embeddings,
                 **kwargs,
             )
             if isinstance(layer_output, tuple):
@@ -495,10 +543,12 @@ class JAMELCompactWrapper(nn.Module):
 
         # Process the prompt through all layers
         h = embed_layer(input_ids)
+        position_embeddings = self._compute_position_embeddings(h, attention_mask)
         new_memory, new_confidence = [], []
         for l, (layer, sm) in enumerate(zip(decoder_layers, self.side_memories)):
             m_hat, c_hat = sm.predict(memory_states[l], confidence_states[l], action_embed)
-            layer_output = layer(h, attention_mask=attention_mask, **kwargs)
+            layer_output = layer(h, attention_mask=attention_mask,
+                                position_embeddings=position_embeddings, **kwargs)
             h_layer = layer_output[0] if isinstance(layer_output, tuple) else layer_output
             z_t = sm.extract_observation(h_layer, self.num_act_tokens)
             m_new, c_new = sm.correct(m_hat, c_hat, z_t)
@@ -531,8 +581,13 @@ class JAMELCompactWrapper(nn.Module):
 
             # Feed next token through all layers (no memory update during generation)
             next_h = embed_layer(next_token)
+            pos_emb_single = self._compute_position_embeddings(
+                next_h,
+                torch.ones((B, 1), dtype=torch.long, device=device),
+            )
             for l, layer in enumerate(decoder_layers):
-                layer_output = layer(next_h, **kwargs)
+                layer_output = layer(next_h, position_embeddings=pos_emb_single,
+                                    **kwargs)
                 next_h = layer_output[0] if isinstance(layer_output, tuple) else layer_output
             cur_h = next_h
 
