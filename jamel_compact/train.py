@@ -30,7 +30,14 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
+
+# TensorBoard is optional — training works without it (logs to stdout only)
+try:
+    from torch.utils.tensorboard import SummaryWriter
+    _TB_AVAILABLE = True
+except ImportError:
+    _TB_AVAILABLE = False
+    SummaryWriter = None
 
 from .config import CompactConfig
 from .model import JAMELCompactWrapper
@@ -119,29 +126,32 @@ def train_one_epoch(
                 lr = optimizer.param_groups[0]["lr"]
 
                 # Loss components
-                writer.add_scalar("train/loss_total", loss_dict["total"], global_step)
-                writer.add_scalar("train/loss_action", loss_dict["action"], global_step)
-                writer.add_scalar("train/loss_mem_l2", loss_dict["mem_l2"], global_step)
-                writer.add_scalar("train/loss_mem_entropy", loss_dict["mem_entropy"], global_step)
-                writer.add_scalar("train/loss_uncert", loss_dict["uncert"], global_step)
-                writer.add_scalar("train/learning_rate", lr, global_step)
-                writer.add_scalar("train/step_time_s", elapsed, global_step)
+                if writer is not None:
+                    writer.add_scalar("train/loss_total", loss_dict["total"], global_step)
+                    writer.add_scalar("train/loss_action", loss_dict["action"], global_step)
+                    writer.add_scalar("train/loss_mem_l2", loss_dict["mem_l2"], global_step)
+                    writer.add_scalar("train/loss_mem_entropy", loss_dict["mem_entropy"], global_step)
+                    writer.add_scalar("train/loss_uncert", loss_dict["uncert"], global_step)
+                    writer.add_scalar("train/learning_rate", lr, global_step)
+                    writer.add_scalar("train/step_time_s", elapsed, global_step)
 
                 # Memory statistics (sample from first layer)
                 new_mem = outputs["new_memory"]
                 new_conf = outputs["new_confidence"]
-                for l_idx in range(min(3, len(new_mem))):
-                    mem = new_mem[l_idx]  # [B, N_m, d_mem]
-                    conf = new_conf[l_idx]  # [B, N_m]
-                    writer.add_scalar(f"memory/layer{l_idx}_mem_mean", mem.mean().item(), global_step)
-                    writer.add_scalar(f"memory/layer{l_idx}_mem_std", mem.std().item(), global_step)
-                    writer.add_scalar(f"memory/layer{l_idx}_conf_mean", conf.mean().item(), global_step)
-                    writer.add_scalar(f"memory/layer{l_idx}_conf_std", conf.std().item(), global_step)
-                    writer.add_scalar(f"memory/layer{l_idx}_mem_norm", mem.norm(dim=-1).mean().item(), global_step)
+                if writer is not None:
+                    for l_idx in range(min(3, len(new_mem))):
+                        mem = new_mem[l_idx]  # [B, N_m, d_mem]
+                        conf = new_conf[l_idx]  # [B, N_m]
+                        writer.add_scalar(f"memory/layer{l_idx}_mem_mean", mem.mean().item(), global_step)
+                        writer.add_scalar(f"memory/layer{l_idx}_mem_std", mem.std().item(), global_step)
+                        writer.add_scalar(f"memory/layer{l_idx}_conf_mean", conf.mean().item(), global_step)
+                        writer.add_scalar(f"memory/layer{l_idx}_conf_std", conf.std().item(), global_step)
+                        writer.add_scalar(f"memory/layer{l_idx}_mem_norm", mem.norm(dim=-1).mean().item(), global_step)
 
                 # Gradient statistics
                 grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float('inf'))
-                writer.add_scalar("train/grad_norm", grad_norm.item(), global_step)
+                if writer is not None:
+                    writer.add_scalar("train/grad_norm", grad_norm.item(), global_step)
 
                 print(
                     f"  [epoch {epoch} step {global_step}] "
@@ -209,10 +219,11 @@ def validate(
     avg_mem = total_mem_loss / max(num_batches, 1)
     avg_uncert = total_uncert_loss / max(num_batches, 1)
 
-    writer.add_scalar("val/loss_total", avg_loss, global_step)
-    writer.add_scalar("val/loss_action", avg_action, global_step)
-    writer.add_scalar("val/loss_mem_l2", avg_mem, global_step)
-    writer.add_scalar("val/loss_uncert", avg_uncert, global_step)
+    if writer is not None:
+        writer.add_scalar("val/loss_total", avg_loss, global_step)
+        writer.add_scalar("val/loss_action", avg_action, global_step)
+        writer.add_scalar("val/loss_mem_l2", avg_mem, global_step)
+        writer.add_scalar("val/loss_uncert", avg_uncert, global_step)
 
     print(
         f"  [val step {global_step}] "
@@ -365,14 +376,17 @@ def main():
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-    # ── TensorBoard ──
-    writer = SummaryWriter(log_dir=config.tb_log_dir)
-    print(f"[train] TensorBoard logging to {config.tb_log_dir}")
-    print(f"  Run: tensorboard --logdir {config.tb_log_dir}")
-
-    # Log config
-    for k, v in config.to_dict().items():
-        writer.add_text("config", f"{k}: {v}")
+    # ── TensorBoard (optional) ──
+    if _TB_AVAILABLE:
+        writer = SummaryWriter(log_dir=config.tb_log_dir)
+        print(f"[train] TensorBoard logging to {config.tb_log_dir}")
+        print(f"  Run: tensorboard --logdir {config.tb_log_dir}")
+        for k, v in config.to_dict().items():
+            writer.add_text("config", f"{k}: {v}")
+    else:
+        writer = None
+        print("[train] TensorBoard not available (pip install tensorboard)")
+        print(f"[train] Logs will go to stdout only")
 
     # ── Training loop ──
     global_step = 0
@@ -403,7 +417,8 @@ def main():
     model.save_pretrained(final_dir)
     print(f"\n[train] Final model saved to {final_dir}")
 
-    writer.close()
+    if writer is not None:
+        writer.close()
     print("[train] Done.")
 
 
