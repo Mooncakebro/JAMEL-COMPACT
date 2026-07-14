@@ -52,8 +52,14 @@ fi
 
 # Build GPU args
 GPU_ARG=""
+# Set CUDA_VISIBLE_DEVICES in the shell BEFORE Python launches.
+# Setting it inside Python (after import torch) is too late — CUDA context
+# is already initialized on the default GPU.
 if [[ -n "$GPU_IDS" ]]; then
+    export CUDA_VISIBLE_DEVICES="$GPU_IDS"
     GPU_ARG="--gpu-ids $GPU_IDS"
+else
+    GPU_ARG=""
 fi
 
 echo "=== JAMEL-COMPACT Training ==="
@@ -71,7 +77,7 @@ echo "  Batch:        $BATCH_SIZE × $GRAD_ACCUM (accum)"
 echo "  LR:           $LR"
 echo ""
 
-python -m jamel_compact.train \
+exec python -m jamel_compact.train \
     --train-file "$TRAIN_FILE" \
     --val-file "$VAL_FILE" \
     --base-model "$BASE_MODEL" \

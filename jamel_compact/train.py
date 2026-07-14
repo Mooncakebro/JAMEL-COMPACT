@@ -18,9 +18,26 @@ Usage:
 """
 from __future__ import annotations
 
+import os
+import sys
+
+# ── Set CUDA_VISIBLE_DEVICES BEFORE importing torch ──
+# If --gpu-ids is passed on the command line, we must set the env var
+# before torch initializes the CUDA context. Once torch is imported and
+# CUDA is initialized, changing CUDA_VISIBLE_DEVICES has no effect.
+_gpu_ids_arg = ""
+for _i, _arg in enumerate(sys.argv):
+    if _arg == "--gpu-ids" and _i + 1 < len(sys.argv):
+        _gpu_ids_arg = sys.argv[_i + 1]
+        break
+    if _arg.startswith("--gpu-ids="):
+        _gpu_ids_arg = _arg.split("=", 1)[1]
+        break
+if _gpu_ids_arg:
+    os.environ["CUDA_VISIBLE_DEVICES"] = _gpu_ids_arg
+
 import argparse
 import math
-import os
 import random
 import time
 from pathlib import Path
@@ -391,10 +408,10 @@ def main():
     args = parser.parse_args()
 
     # ── GPU selection ──
+    # CUDA_VISIBLE_DEVICES was already set before torch import (see top of file).
+    # Here we just report what's visible.
     if args.gpu_ids:
-        gpu_ids = [int(g.strip()) for g in args.gpu_ids.split(",") if g.strip()]
-        os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in gpu_ids)
-        print(f"[train] Requested GPUs: {gpu_ids} (CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']})")
+        print(f"[train] Requested GPUs: {args.gpu_ids} (CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', 'not set')})")
     else:
         print("[train] GPU_IDS not set — using all visible GPUs")
 
