@@ -483,6 +483,18 @@ class JAMELCompactWrapper(nn.Module):
             print(f"[model] Visual encoder failed: {e}")
             return h
 
+        # The visual encoder may return a BaseModelOutput-like object instead
+        # of a plain tensor. Extract the hidden states tensor.
+        if not isinstance(image_embeds, torch.Tensor):
+            if hasattr(image_embeds, "last_hidden_state"):
+                image_embeds = image_embeds.last_hidden_state
+            elif hasattr(image_embeds, "hidden_states"):
+                image_embeds = image_embeds.hidden_states
+            else:
+                print(f"[model] Visual encoder returned {type(image_embeds).__name__}, "
+                      f"cannot extract tensor — skipping visual injection")
+                return h
+
         # Scatter image features into hidden states at placeholder positions.
         # image_embeds from Qwen3-VL visual encoder is [total_image_tokens, d],
         # i.e. all images' features concatenated. We need to assign each batch
