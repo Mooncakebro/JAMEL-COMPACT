@@ -288,7 +288,7 @@ def main():
         print(f"[train] Available GPUs: {num_gpus}")
         for i in range(num_gpus):
             print(f"  GPU {i}: {torch.cuda.get_device_name(i)} "
-                  f"({torch.cuda.get_device_properties(i).total_mem / 1e9:.1f}GB)")
+                  f"({torch.cuda.get_device_properties(i).total_memory / 1e9:.1f}GB)")
 
     # ── Build config ──
     config = CompactConfig.from_args(
