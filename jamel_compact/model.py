@@ -386,9 +386,11 @@ class JAMELCompactWrapper(nn.Module):
         return (cos.to(dtype=h.dtype), sin.to(dtype=h.dtype))
 
     def _find_rotary_emb(self):
-        """Find the rotary embedding module in the model."""
+        """Find the rotary embedding module in the model (cached)."""
+        if hasattr(self, "_cached_rotary_emb"):
+            return self._cached_rotary_emb
+
         model = self.llm
-        # Qwen3-VL: model.rotary_emb
         for path in [
             lambda m: getattr(m, "rotary_emb", None),
             lambda m: getattr(getattr(m, "model", None), "rotary_emb", None),
@@ -396,8 +398,10 @@ class JAMELCompactWrapper(nn.Module):
         ]:
             result = path(model)
             if result is not None:
-                print(f"[model] Found rotary_emb via {path.__name__}")
+                print(f"[model] Found rotary_emb")
+                self._cached_rotary_emb = result
                 return result
+        self._cached_rotary_emb = None
         return None
 
     def _get_input_embeddings(self):
