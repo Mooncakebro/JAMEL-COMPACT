@@ -109,11 +109,11 @@ def compute_compact_loss(
     )
 
     loss_dict = {
-        "total": loss_total.item(),
-        "action": loss_action.item(),
-        "mem_l2": loss_mem_l2.item() if isinstance(loss_mem_l2, torch.Tensor) else loss_mem_l2,
-        "mem_entropy": loss_mem_entropy.item() if isinstance(loss_mem_entropy, torch.Tensor) else loss_mem_entropy,
-        "uncert": loss_uncert.item(),
+        "total": loss_total.detach(),
+        "action": loss_action.detach(),
+        "mem_l2": loss_mem_l2.detach() if isinstance(loss_mem_l2, torch.Tensor) else torch.tensor(float(loss_mem_l2), device=logits.device, dtype=logits.dtype),
+        "mem_entropy": loss_mem_entropy.detach() if isinstance(loss_mem_entropy, torch.Tensor) else torch.tensor(float(loss_mem_entropy), device=logits.device, dtype=logits.dtype),
+        "uncert": loss_uncert.detach(),
     }
 
     return loss_total, loss_dict

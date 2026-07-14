@@ -61,17 +61,31 @@ def set_seed(seed: int):
         torch.cuda.manual_seed_all(seed)
 
 
-def get_action_embedding(action_input_ids: torch.Tensor, model: JAMELCompactWrapper,
+def get_action_embedding(action_input_ids: torch.Tensor, model,
                           device: torch.device) -> torch.Tensor:
     """
     Convert action token IDs into a fixed-size embedding for FiLM-GRU.
     Uses the pretrained token embedding layer + mean pooling.
+    Works with both raw model and DataParallel-wrapped model.
     """
+    raw = model.module if isinstance(model, torch.nn.DataParallel) else model
     action_input_ids = action_input_ids.to(device)
-    embed_layer = model._get_input_embeddings()
+    embed_layer = raw._get_input_embeddings()
     action_embeds = embed_layer(action_input_ids)  # [B, L_act, d]
     # Mean pool over action tokens
     return action_embeds.mean(dim=1)  # [B, d]
+
+
+def _unwrap(m):
+    """Return the underlying model from DataParallel if present."""
+    return m.module if isinstance(m, torch.nn.DataParallel) else m
+
+
+def _scalar(v):
+    """Convert a value (tensor or float) to a Python float."""
+    if isinstance(v, torch.Tensor):
+        return v.mean().item()
+    return float(v)
 
 
 def train_one_epoch(
@@ -86,6 +100,7 @@ def train_one_epoch(
 ) -> int:
     """Train for one epoch. Returns updated global_step."""
     model.train()
+    raw_model = _unwrap(model)
     total_steps = len(dataloader)
     accum_steps = config.gradient_accumulation_steps
     optimizer.zero_grad()
@@ -118,7 +133,8 @@ def train_one_epoch(
 
         # Initialize memory (fresh for each batch — no cross-batch memory in SFT)
         B = input_ids.shape[0]
-        memory_states, confidence_states = model.init_memory(B, device)
+        raw = model.module if isinstance(model, torch.nn.DataParallel) else model
+        memory_states, confidence_states = raw.init_memory(B, device)
 
         # Forward pass
         outputs = model(
@@ -132,8 +148,18 @@ def train_one_epoch(
             image_grid_thw=image_grid_thw,
         )
 
-        loss = outputs["loss"] / accum_steps
-        loss_dict = outputs["loss_dict"]
+        # Handle DataParallel gathered loss (concatenated per-GPU scalars → 1-D tensor)
+        loss = outputs["loss"]
+        if loss.dim() > 0:
+            loss = loss.mean()
+        loss = loss / accum_steps
+
+        # loss_dict values may be gathered tensors (1-D) or scalars
+        def _to_scalar(v):
+            if isinstance(v, torch.Tensor):
+                return v.mean().item()
+            return float(v)
+        loss_dict = {k: _to_scalar(v) for k, v in outputs["loss_dict"].items()}
 
         # Backward
         loss.backward()
@@ -200,7 +226,7 @@ def train_one_epoch(
             # ── Save checkpoint ──
             if global_step % config.save_steps == 0:
                 ckpt_dir = Path(config.output_dir) / f"global_step_{global_step}"
-                model.save_pretrained(ckpt_dir)
+                raw_model.save_pretrained(ckpt_dir)
                 print(f"  [checkpoint] saved to {ckpt_dir}")
 
     # Close progress bar
@@ -220,6 +246,7 @@ def validate(
 ) -> float:
     """Run validation and log to TensorBoard. Returns average loss."""
     model.eval()
+    raw_model = _unwrap(model)
     total_loss = 0.0
     total_action_loss = 0.0
     total_mem_loss = 0.0
@@ -246,7 +273,7 @@ def validate(
 
             action_embed_input = get_action_embedding(action_input_ids, model, device)
             B = input_ids.shape[0]
-            memory_states, confidence_states = model.init_memory(B, device)
+            memory_states, confidence_states = raw_model.init_memory(B, device)
 
             outputs = model(
                 input_ids=input_ids,
@@ -259,14 +286,15 @@ def validate(
                 image_grid_thw=image_grid_thw,
             )
 
-            total_loss += outputs["loss_dict"]["total"]
-            total_action_loss += outputs["loss_dict"]["action"]
-            total_mem_loss += outputs["loss_dict"]["mem_l2"]
-            total_uncert_loss += outputs["loss_dict"]["uncert"]
+            ld = outputs["loss_dict"]
+            total_loss += _scalar(ld["total"])
+            total_action_loss += _scalar(ld["action"])
+            total_mem_loss += _scalar(ld["mem_l2"])
+            total_uncert_loss += _scalar(ld["uncert"])
             num_batches += 1
 
             if _TQDM_AVAILABLE:
-                pbar.set_postfix({"val_loss": f"{outputs['loss_dict']['total']:.4f}"})
+                pbar.set_postfix({"val_loss": f"{_scalar(ld['total']):.4f}"})
 
         if _TQDM_AVAILABLE:
             pbar.close()
@@ -330,19 +358,23 @@ def main():
     if args.gpu_ids:
         gpu_ids = [int(g.strip()) for g in args.gpu_ids.split(",") if g.strip()]
         os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in gpu_ids)
-        print(f"[train] Using GPUs: {gpu_ids} (CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']})")
-        if len(gpu_ids) == 1:
-            device = torch.device(f"cuda:0")
-        else:
-            device = torch.device("cuda:0")  # DataParallel would use all visible
+        print(f"[train] Requested GPUs: {gpu_ids} (CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']})")
     else:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print("[train] GPU_IDS not set — using all visible GPUs")
 
-    set_seed(args.seed)
-    print(f"[train] device={device}")
+    # Clear CUDA cache after changing visible devices
     if torch.cuda.is_available():
-        num_gpus = torch.cuda.device_count()
-        print(f"[train] Available GPUs: {num_gpus}")
+        torch.cuda.empty_cache()
+
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    set_seed(args.seed)
+
+    num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    use_data_parallel = num_gpus > 1
+
+    print(f"[train] device={device}, GPUs visible={num_gpus}, "
+          f"DataParallel={'YES' if use_data_parallel else 'NO'}")
+    if torch.cuda.is_available():
         for i in range(num_gpus):
             print(f"  GPU {i}: {torch.cuda.get_device_name(i)} "
                   f"({torch.cuda.get_device_properties(i).total_memory / 1e9:.1f}GB)")
@@ -375,7 +407,14 @@ def main():
     print(f"[train] Loading base model: {config.base_model_name}")
     model = JAMELCompactWrapper(config).to(device)
 
-    param_info = model.count_parameters()
+    # Wrap with DataParallel for multi-GPU training
+    if use_data_parallel:
+        device_ids = list(range(num_gpus))
+        model = torch.nn.DataParallel(model, device_ids=device_ids)
+        print(f"[train] DataParallel active on {num_gpus} GPUs: {device_ids}")
+
+    raw_model = _unwrap(model)
+    param_info = raw_model.count_parameters()
     print(f"[train] Base params:   {param_info['base'] / 1e9:.2f}B")
     print(f"[train] New params:    {param_info['new'] / 1e6:.1f}M")
     print(f"[train] Total:         {param_info['total'] / 1e9:.2f}B")
@@ -385,30 +424,35 @@ def main():
     print(f"[train] Loading data: {args.train_file}")
     train_dataset = CompactDataset(
         parquet_files=args.train_file,
-        tokenizer=model.tokenizer,
-        processor=model.processor,
+        tokenizer=raw_model.tokenizer,
+        processor=raw_model.processor,
         max_length=config.max_length,
         image_resize=config.image_resize,
     )
     val_dataset = CompactDataset(
         parquet_files=args.val_file,
-        tokenizer=model.tokenizer,
-        processor=model.processor,
+        tokenizer=raw_model.tokenizer,
+        processor=raw_model.processor,
         max_length=config.max_length,
         image_resize=config.image_resize,
     )
 
-    pad_token_id = model.tokenizer.pad_token_id or 0
+    # Effective batch size = per_device_batch_size × num_gpus
+    effective_batch = config.per_device_batch_size * max(num_gpus, 1)
+    print(f"[train] Per-GPU batch size: {config.per_device_batch_size}"
+          f" × {max(num_gpus, 1)} GPUs = effective batch {effective_batch}")
+
+    pad_token_id = raw_model.tokenizer.pad_token_id or 0
     train_loader = DataLoader(
         train_dataset,
-        batch_size=config.per_device_batch_size,
+        batch_size=effective_batch,
         shuffle=True,
         collate_fn=lambda b: collate_fn(b, pad_token_id),
         num_workers=2,
     )
     val_loader = DataLoader(
         val_dataset,
-        batch_size=config.per_device_batch_size,
+        batch_size=effective_batch,
         shuffle=False,
         collate_fn=lambda b: collate_fn(b, pad_token_id),
         num_workers=2,
@@ -466,12 +510,12 @@ def main():
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 best_dir = Path(config.output_dir) / "best"
-                model.save_pretrained(best_dir)
+                raw_model.save_pretrained(best_dir)
                 print(f"  [best] New best val loss: {best_val_loss:.4f}")
 
     # ── Save final model ──
     final_dir = Path(config.output_dir) / "final"
-    model.save_pretrained(final_dir)
+    raw_model.save_pretrained(final_dir)
     print(f"\n[train] Final model saved to {final_dir}")
 
     if writer is not None:
