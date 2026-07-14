@@ -448,67 +448,93 @@ class JAMELCompactWrapper(nn.Module):
         input_ids: torch.Tensor,
         pixel_values: torch.Tensor,
         image_grid_thw: Optional[torch.Tensor],
-    ) -> torch.Tensor:
+    ) -> tuple:
         """
         Process image through the visual encoder and inject features into
         the hidden states at image placeholder token positions.
 
         For Qwen3-VL, the model has a `visual` module that processes pixel
-        values into image features. These features replace the image
-        placeholder tokens in the input embeddings.
-        """
-        # Find the visual encoder
-        visual = getattr(self.llm, "visual", None)
-        if visual is None:
-            visual = getattr(getattr(self.llm, "model", None), "visual", None)
-        if visual is None:
-            return h  # no visual encoder, skip
+        values into image features. The visual encoder returns:
+          - pooler_output: merged/projected features (dim = LLM hidden_dim)
+          - deepstack_features: list of per-layer features for DeepStack injection
 
-        # Find image placeholder token IDs
-        # Qwen3-VL uses ◣
-        image_token_id = getattr(self.llm.config, "image_token_id", None)
+        Returns:
+            (h, deepstack_features, visual_pos_mask) — updated hidden states,
+            deepstack features list, and boolean mask of image token positions.
+        """
+        model = self.llm
+
+        # Use the model's get_image_features if available (handles merger + split)
+        if hasattr(model, "get_image_features"):
+            try:
+                vision_output = model.get_image_features(
+                    pixel_values, image_grid_thw, return_dict=True,
+                )
+                # pooler_output is a tuple of per-image tensors after split
+                image_embeds_list = vision_output.pooler_output
+                image_embeds = torch.cat(image_embeds_list, dim=0).to(
+                    h.device, h.dtype,
+                )  # [total_image_tokens, d]
+                deepstack_features = vision_output.deepstack_features or []
+            except Exception as e:
+                print(f"[model] get_image_features failed: {e}")
+                return h, [], None
+        else:
+            # Fallback: call visual encoder directly
+            visual = getattr(model, "visual", None)
+            if visual is None:
+                visual = getattr(getattr(model, "model", None), "visual", None)
+            if visual is None:
+                return h, [], None
+
+            try:
+                vision_output = visual(
+                    pixel_values.to(h.dtype),
+                    grid_thw=image_grid_thw,
+                    return_dict=True,
+                )
+                # Use pooler_output (merged/projected to LLM dim), not last_hidden_state
+                if hasattr(vision_output, "pooler_output"):
+                    image_embeds = vision_output.pooler_output
+                elif hasattr(vision_output, "last_hidden_state"):
+                    image_embeds = vision_output.last_hidden_state
+                else:
+                    return h, [], None
+                image_embeds = image_embeds.to(h.device, h.dtype)
+                deepstack_features = getattr(vision_output, "deepstack_features", []) or []
+            except Exception as e:
+                print(f"[model] Visual encoder failed: {e}")
+                return h, [], None
+
+        # Find image placeholder token ID
+        image_token_id = getattr(model.config, "image_token_id", None)
         if image_token_id is None:
-            # Try to get from tokenizer
             image_token_id = self.tokenizer.convert_tokens_to_ids("◣")
             if image_token_id is None or image_token_id == self.tokenizer.unk_token_id:
-                return h  # can't find image token, skip
+                return h, [], None
 
-        # Process image through visual encoder
-        try:
-            if image_grid_thw is not None:
-                image_embeds = visual(pixel_values.to(h.dtype), grid_thw=image_grid_thw)
-            else:
-                image_embeds = visual(pixel_values.to(h.dtype))
-        except Exception as e:
-            print(f"[model] Visual encoder failed: {e}")
-            return h
+        # Build visual position mask [B, N] and scatter features
+        visual_pos_mask = (input_ids == image_token_id)  # [B, N]
+        total_img_tokens = visual_pos_mask.sum().item()
 
-        # The visual encoder may return a BaseModelOutput-like object instead
-        # of a plain tensor. Extract the hidden states tensor.
-        if not isinstance(image_embeds, torch.Tensor):
-            if hasattr(image_embeds, "last_hidden_state"):
-                image_embeds = image_embeds.last_hidden_state
-            elif hasattr(image_embeds, "hidden_states"):
-                image_embeds = image_embeds.hidden_states
-            else:
-                print(f"[model] Visual encoder returned {type(image_embeds).__name__}, "
-                      f"cannot extract tensor — skipping visual injection")
-                return h
+        if total_img_tokens == 0:
+            return h, [], None
 
-        # Scatter image features into hidden states at placeholder positions.
-        # image_embeds from Qwen3-VL visual encoder is [total_image_tokens, d],
-        # i.e. all images' features concatenated. We need to assign each batch
-        # element its own slice.
-        offset = 0
-        for b in range(h.shape[0]):
-            mask = (input_ids[b] == image_token_id)
-            positions = mask.nonzero(as_tuple=True)[0]
-            n_img_tokens = len(positions)
-            if n_img_tokens > 0 and offset + n_img_tokens <= image_embeds.shape[0]:
-                h[b, positions] = image_embeds[offset:offset + n_img_tokens]
-                offset += n_img_tokens
+        # Use masked_scatter like Qwen3-VL does
+        if total_img_tokens == image_embeds.shape[0]:
+            mask_expanded = visual_pos_mask.unsqueeze(-1).expand_as(h)
+            h = h.masked_scatter(mask_expanded, image_embeds)
+        else:
+            # Fallback: per-batch scatter with offset
+            offset = 0
+            for b in range(h.shape[0]):
+                positions = visual_pos_mask[b].nonzero(as_tuple=True)[0]
+                n = len(positions)
+                if n > 0 and offset + n <= image_embeds.shape[0]:
+                    h[b, positions] = image_embeds[offset:offset + n]
+                    offset += n
 
-        return h
+        return h, deepstack_features, visual_pos_mask
 
     # ── Memory initialization ──
 
@@ -565,11 +591,13 @@ class JAMELCompactWrapper(nn.Module):
         h = embed_layer(input_ids)  # [B, N, d]
 
         # ── Process image features if provided ──
-        # Qwen3-VL replaces <image> placeholder tokens with vision encoder output.
-        # We use the model's visual encoder to get image features, then scatter
-        # them into the hidden states at the image placeholder positions.
+        # Qwen3-VL replaces image placeholder tokens with vision encoder output.
+        # We use the model's get_image_features() to get projected features (via
+        # the merger), and also collect deepstack_features for per-layer injection.
+        deepstack_features = []
+        visual_pos_mask = None
         if pixel_values is not None and self._has_visual_encoder():
-            h = self._inject_visual_features(
+            h, deepstack_features, visual_pos_mask = self._inject_visual_features(
                 h, input_ids, pixel_values, image_grid_thw,
             )
 
@@ -612,6 +640,19 @@ class JAMELCompactWrapper(nn.Module):
                 h_layer = layer_output[0]
             else:
                 h_layer = layer_output
+
+            # 4b.5 DeepStack injection (Qwen3-VL adds visual features to
+            #      early decoder layers' hidden states at image positions)
+            if deepstack_features and l < len(deepstack_features):
+                ds_feat = deepstack_features[l].to(h_layer.device, h_layer.dtype)
+                if visual_pos_mask is not None:
+                    mask_1d = visual_pos_mask  # [B, N]
+                    # Add visual features at image token positions
+                    for b in range(h_layer.shape[0]):
+                        positions = mask_1d[b].nonzero(as_tuple=True)[0]
+                        n = len(positions)
+                        if n > 0 and n <= ds_feat.shape[0]:
+                            h_layer[b, positions] = h_layer[b, positions] + ds_feat[:n]
 
             # 4c. Extract observation
             z_t = sm.extract_observation(h_layer, self.num_act_tokens)
@@ -689,8 +730,10 @@ class JAMELCompactWrapper(nn.Module):
         h = embed_layer(input_ids)  # [B, N, d]
 
         # Inject visual features if available
+        deepstack_features = []
+        visual_pos_mask = None
         if pixel_values is not None and self._has_visual_encoder():
-            h = self._inject_visual_features(
+            h, deepstack_features, visual_pos_mask = self._inject_visual_features(
                 h, input_ids, pixel_values, image_grid_thw,
             )
 
@@ -707,6 +750,17 @@ class JAMELCompactWrapper(nn.Module):
             layer_output = layer(h, attention_mask=attn_mask_4d,
                                 position_embeddings=position_embeddings, **kwargs)
             h_layer = layer_output[0] if isinstance(layer_output, tuple) else layer_output
+
+            # DeepStack injection
+            if deepstack_features and l < len(deepstack_features):
+                ds_feat = deepstack_features[l].to(h_layer.device, h_layer.dtype)
+                if visual_pos_mask is not None:
+                    for b in range(h_layer.shape[0]):
+                        positions = visual_pos_mask[b].nonzero(as_tuple=True)[0]
+                        n = len(positions)
+                        if n > 0 and n <= ds_feat.shape[0]:
+                            h_layer[b, positions] = h_layer[b, positions] + ds_feat[:n]
+
             z_t = sm.extract_observation(h_layer, self.num_act_tokens)
             m_new, c_new = sm.correct(m_hat, c_hat, z_t)
             h = sm.inject(h_layer, m_new)
