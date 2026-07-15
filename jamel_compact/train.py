@@ -158,13 +158,30 @@ def _process_chunk_step(
                 h_embed, input_ids, pixel_values, image_grid_thw,
             )
 
+    # ── Detach memory states from the computation graph before passing to
+    # the model forward. This prevents BPTT (backprop through time) which
+    # would require retaining all intermediate steps' graphs and cause OOM.
+    # Instead, the FiLM-GRU learns from the per-step loss signal only —
+    # memory carries forward VALUES but not GRADIENTS.
+    #
+    # This is equivalent to truncated BPTT (TBPTT) with truncation length 1:
+    # each step's loss backprops only through that step's forward pass,
+    # but the memory VALUES (not gradients) carry forward across steps.
+    # This still trains the recurrent dynamics because each step sees a
+    # non-trivial memory state (not the zero-initialized state), so the
+    # inject/correct modules learn to use evolved memory.
+    mem_input = [m.detach() if isinstance(m, torch.Tensor) else m
+                 for m in memory_states]
+    conf_input = [c.detach() if isinstance(c, torch.Tensor) else c
+                  for c in confidence_states]
+
     # Forward pass
     outputs = model(
         input_ids=input_ids,
         attention_mask=attention_mask,
         action_embed_input=action_embed_input,
-        memory_states=memory_states,
-        confidence_states=confidence_states,
+        memory_states=mem_input,
+        confidence_states=conf_input,
         labels=labels,
         pixel_values=None,
         image_grid_thw=None,
@@ -183,7 +200,13 @@ def _process_chunk_step(
         return float(v)
     loss_dict = {k: _to_scalar(v) for k, v in outputs["loss_dict"].items()}
 
-    return loss, loss_dict, outputs["new_memory"], outputs["new_confidence"]
+    # Detach new memory before returning — values carry forward, not gradients
+    new_mem = [m.detach() if isinstance(m, torch.Tensor) else m
+               for m in outputs["new_memory"]]
+    new_conf = [c.detach() if isinstance(c, torch.Tensor) else c
+                for c in outputs["new_confidence"]]
+
+    return loss, loss_dict, new_mem, new_conf
 
 
 def train_one_epoch(
@@ -229,7 +252,7 @@ def train_one_epoch(
             # Initialize memory at the start of each chunk
             memory_states, confidence_states = raw_model.init_memory(1, device)
 
-            total_chunk_loss = torch.tensor(0.0, device=device)
+            total_chunk_loss = torch.tensor(0.0, device=device, requires_grad=False)
             last_loss_dict = {}
             all_loss_dicts = []
 
