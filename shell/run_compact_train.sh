@@ -32,7 +32,7 @@ TB_LOG_DIR=${TB_LOG_DIR:-outputs/compact_tb}
 MEM_DIM=${MEM_DIM:-512}
 NUM_MEM=${NUM_MEM:-16}
 MAX_LENGTH=${MAX_LENGTH:-8192}
-MAX_EPOCHS=${MAX_EPOCHS:-3}
+MAX_EPOCHS=${MAX_EPOCHS:-2}
 BATCH_SIZE=${BATCH_SIZE:-1}
 GRAD_ACCUM=${GRAD_ACCUM:-16}
 LR=${LR:-2e-5}
@@ -40,6 +40,7 @@ LOG_STEPS=${LOG_STEPS:-10}
 SAVE_STEPS=${SAVE_STEPS:-500}
 VAL_STEPS=${VAL_STEPS:-200}
 GPU_IDS=${GPU_IDS:-}              # e.g. "0" or "0,1,2" or "" (all)
+CHUNK_SIZE=${CHUNK_SIZE:-1}         # 1 = single-step, >1 = session-chunked
 
 if [[ ! -f "$TRAIN_FILE" ]]; then
     echo "ERROR: TRAIN_FILE not found: $TRAIN_FILE" >&2
@@ -74,6 +75,7 @@ echo "  Num mem:      $NUM_MEM"
 echo "  Max length:   $MAX_LENGTH"
 echo "  Epochs:       $MAX_EPOCHS"
 echo "  Batch:        $BATCH_SIZE × $GRAD_ACCUM (accum)"
+echo "  Chunk size:   $CHUNK_SIZE"
 echo "  LR:           $LR"
 echo ""
 
@@ -93,5 +95,6 @@ exec python -m jamel_compact.train \
     --log-steps "$LOG_STEPS" \
     --save-steps "$SAVE_STEPS" \
     --val-steps "$VAL_STEPS" \
+    --chunk-size "$CHUNK_SIZE" \
     $GPU_ARG \
     "$@"

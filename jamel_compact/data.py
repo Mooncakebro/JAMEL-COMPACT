@@ -336,6 +336,170 @@ def collate_fn(batch: list[dict], pad_token_id: int = 0) -> dict:
     return result
 
 
+def session_collate_fn(chunk: list[dict], pad_token_id: int = 0) -> dict:
+    """Collate a chunk of consecutive steps from one session.
+
+    Each step in the chunk is a dict from CompactDataset.__getitem__.
+    We pad each step's input_ids/attention_mask/labels to the same length
+    (within the chunk), and concatenate pixel_values across steps.
+
+    Returns a dict where each value is a list of per-step tensors (for
+    sequence-level processing in the training loop).
+    """
+    max_len = max(item["input_ids"].shape[0] for item in chunk)
+    max_action_len = max(item["action_input_ids"].shape[0] for item in chunk)
+
+    input_ids_list = []
+    attention_masks_list = []
+    labels_list = []
+    action_inputs_list = []
+    pixel_values_list = []
+    grid_thws_list = []
+
+    for item in chunk:
+        seq_len = item["input_ids"].shape[0]
+        pad_len = max_len - seq_len
+
+        input_ids_list.append(torch.cat([
+            item["input_ids"],
+            torch.full((pad_len,), pad_token_id, dtype=torch.long),
+        ]))
+        attention_masks_list.append(torch.cat([
+            item["attention_mask"],
+            torch.zeros(pad_len, dtype=torch.long),
+        ]))
+        labels_list.append(torch.cat([
+            item["labels"],
+            torch.full((pad_len,), -100, dtype=torch.long),
+        ]))
+
+        act_len = item["action_input_ids"].shape[0]
+        act_pad = max_action_len - act_len
+        action_inputs_list.append(torch.cat([
+            item["action_input_ids"],
+            torch.full((act_pad,), pad_token_id, dtype=torch.long),
+        ]))
+
+        pv = item.get("pixel_values")
+        pixel_values_list.append(pv)
+        gt = item.get("image_grid_thw")
+        grid_thws_list.append(gt)
+
+    # Stack per-step tensors: each becomes [1, N] (single sample per step)
+    # so the training loop can process one step at a time with B=1
+    result = {
+        "input_ids": [ids.unsqueeze(0) for ids in input_ids_list],
+        "attention_mask": [am.unsqueeze(0) for am in attention_masks_list],
+        "labels": [lab.unsqueeze(0) for lab in labels_list],
+        "action_input_ids": [ai.unsqueeze(0) for ai in action_inputs_list],
+        "pixel_values": pixel_values_list,  # list of [num_patches, dim] or None
+        "image_grid_thw": grid_thws_list,    # list of [num_images, 3] or None
+        "session_ids": [item["session_id"] for item in chunk],
+        "step_indices": [item["step_idx"] for item in chunk],
+        "chunk_size": len(chunk),
+    }
+
+    return result
+
+
+class SessionChunkDataset(Dataset):
+    """
+    Dataset that groups consecutive steps from the same session into chunks.
+
+    This enables sequence-level training where the side memory (FiLM-GRU +
+    Kalman filter) evolves across multiple steps, training the recurrent
+    dynamics that the model needs at inference time.
+
+    Each item is a list of consecutive step dicts from the same session.
+    The chunk_size parameter controls how many steps per chunk.
+    """
+
+    def __init__(
+        self,
+        parquet_files: str | List[str],
+        tokenizer,
+        processor=None,
+        max_length: int = 8192,
+        image_resize: tuple = (640, 360),
+        chunk_size: int = 4,
+        prompt_key: str = "prompt",
+        response_key: str = "response",
+        image_key: str = "before_screenshot",
+        action_key: str = "action",
+    ):
+        if not isinstance(parquet_files, list):
+            parquet_files = [parquet_files]
+
+        self.parquet_files = list(parquet_files)
+        self.tokenizer = tokenizer
+        self.processor = processor
+        self.max_length = max_length
+        self.image_resize = image_resize
+        self.chunk_size = chunk_size
+        self.prompt_key = prompt_key
+        self.response_key = response_key
+        self.image_key = image_key
+        self.action_key = action_key
+
+        # Reuse CompactDataset's data loading and filtering
+        self._base = CompactDataset(
+            parquet_files=parquet_files,
+            tokenizer=tokenizer,
+            processor=processor,
+            max_length=max_length,
+            image_resize=image_resize,
+            prompt_key=prompt_key,
+            response_key=response_key,
+            image_key=image_key,
+            action_key=action_key,
+        )
+        self.dataframe = self._base.dataframe
+        self._build_chunks()
+
+    def _build_chunks(self):
+        """Group consecutive steps from the same session into chunks."""
+        df = self.dataframe
+        valid_indices = self._base._valid_indices
+
+        # Group valid indices by session_id, preserving step_idx order
+        session_groups = {}
+        for idx in valid_indices:
+            row = df.iloc[idx]
+            sid = str(row.get("session_id", ""))
+            step_idx = int(row.get("step_idx", 0))
+            if sid not in session_groups:
+                session_groups[sid] = []
+            session_groups[sid].append((step_idx, idx))
+
+        # Sort each session by step_idx, then build chunks
+        self._chunks = []
+        for sid, steps in session_groups.items():
+            steps.sort(key=lambda x: x[0])  # sort by step_idx
+            for i in range(0, len(steps), self.chunk_size):
+                chunk = steps[i:i + self.chunk_size]
+                # Only keep chunks that are full (or at least 2 steps)
+                # Shorter chunks at session boundaries are still useful
+                if len(chunk) >= 1:
+                    self._chunks.append([idx for _, idx in chunk])
+
+        # Shuffle chunk order (DataLoader will also shuffle, but this helps
+        # when shuffle=True samples are drawn)
+        random.shuffle(self._chunks)
+
+        total_steps = sum(len(c) for c in self._chunks)
+        print(f"[data] SessionChunkDataset: {len(self._chunks)} chunks "
+              f"(chunk_size={self.chunk_size}), {total_steps} total steps, "
+              f"avg {total_steps / max(len(self._chunks), 1):.1f} steps/chunk")
+
+    def __len__(self) -> int:
+        return len(self._chunks)
+
+    def __getitem__(self, index: int) -> list[dict]:
+        """Return a list of step dicts for one chunk."""
+        chunk_indices = self._chunks[index]
+        return [self._base[i] for i in chunk_indices]
+
+
 def discover_parquet_files(input_path: str | list[str]) -> list[str]:
     """
     Discover all trajectory.parquet files from the input path.

@@ -56,6 +56,7 @@ class CompactConfig:
     val_file: str = ""
     val_ratio: float = 0.05
     image_resize: tuple = (640, 360)  # WEB_MODEL_IMAGE_SIZE
+    chunk_size: int = 1  # session-chunked training: 1 = single-step (original), >1 = multi-step
 
     # ── Eval ──
     eval_output: str = "outputs/compact_eval"
