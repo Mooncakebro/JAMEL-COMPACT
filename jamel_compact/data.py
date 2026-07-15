@@ -416,43 +416,47 @@ class SessionChunkDataset(Dataset):
 
     def __init__(
         self,
-        parquet_files: str | List[str],
-        tokenizer,
+        base_dataset_or_files,
+        chunk_size: int = 4,
+        tokenizer=None,
         processor=None,
         max_length: int = 8192,
         image_resize: tuple = (640, 360),
-        chunk_size: int = 4,
         prompt_key: str = "prompt",
         response_key: str = "response",
         image_key: str = "before_screenshot",
         action_key: str = "action",
     ):
-        if not isinstance(parquet_files, list):
-            parquet_files = [parquet_files]
-
-        self.parquet_files = list(parquet_files)
-        self.tokenizer = tokenizer
-        self.processor = processor
-        self.max_length = max_length
-        self.image_resize = image_resize
         self.chunk_size = chunk_size
         self.prompt_key = prompt_key
         self.response_key = response_key
         self.image_key = image_key
         self.action_key = action_key
 
-        # Reuse CompactDataset's data loading and filtering
-        self._base = CompactDataset(
-            parquet_files=parquet_files,
-            tokenizer=tokenizer,
-            processor=processor,
-            max_length=max_length,
-            image_resize=image_resize,
-            prompt_key=prompt_key,
-            response_key=response_key,
-            image_key=image_key,
-            action_key=action_key,
-        )
+        # Accept either an already-built CompactDataset (avoids re-reading
+        # parquet files) or parquet file paths to build a new one.
+        if isinstance(base_dataset_or_files, CompactDataset):
+            self._base = base_dataset_or_files
+        else:
+            parquet_files = base_dataset_or_files
+            if not isinstance(parquet_files, list):
+                parquet_files = [parquet_files]
+            self.parquet_files = list(parquet_files)
+            self.tokenizer = tokenizer
+            self.processor = processor
+            self.max_length = max_length
+            self.image_resize = image_resize
+            self._base = CompactDataset(
+                parquet_files=parquet_files,
+                tokenizer=tokenizer,
+                processor=processor,
+                max_length=max_length,
+                image_resize=image_resize,
+                prompt_key=prompt_key,
+                response_key=response_key,
+                image_key=image_key,
+                action_key=action_key,
+            )
         self.dataframe = self._base.dataframe
         self._build_chunks()
 

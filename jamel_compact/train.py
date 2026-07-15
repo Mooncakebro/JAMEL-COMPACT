@@ -647,8 +647,8 @@ def main():
 
     if use_chunking:
         # Wrap with SessionChunkDataset for multi-step training
-        train_dataset = SessionChunkDataset(train_dataset, config.chunk_size)
-        val_dataset = SessionChunkDataset(val_dataset, config.chunk_size)
+        train_dataset = SessionChunkDataset(train_dataset, chunk_size=config.chunk_size)
+        val_dataset = SessionChunkDataset(val_dataset, chunk_size=config.chunk_size)
         # In chunked mode, each "batch" is one chunk (B=1, multiple steps)
         # batch_size=1 because each chunk already contains chunk_size steps
         chunk_batch_size = config.per_device_batch_size
