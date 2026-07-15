@@ -336,7 +336,7 @@ def collate_fn(batch: list[dict], pad_token_id: int = 0) -> dict:
     return result
 
 
-def session_collate_fn(chunk: list[dict], pad_token_id: int = 0) -> dict:
+def session_collate_fn(batch, pad_token_id: int = 0) -> dict:
     """Collate a chunk of consecutive steps from one session.
 
     Each step in the chunk is a dict from CompactDataset.__getitem__.
@@ -345,7 +345,17 @@ def session_collate_fn(chunk: list[dict], pad_token_id: int = 0) -> dict:
 
     Returns a dict where each value is a list of per-step tensors (for
     sequence-level processing in the training loop).
+
+    Note: When used with DataLoader(batch_size=1), the DataLoader wraps the
+    list-of-dicts from SessionChunkDataset.__getitem__ in another list,
+    so we may receive [[dict, dict, ...]]. We flatten one level if needed.
     """
+    # DataLoader with batch_size=1 wraps the list in another list
+    if len(batch) == 1 and isinstance(batch[0], list):
+        chunk = batch[0]
+    else:
+        chunk = batch
+
     max_len = max(item["input_ids"].shape[0] for item in chunk)
     max_action_len = max(item["action_input_ids"].shape[0] for item in chunk)
 
