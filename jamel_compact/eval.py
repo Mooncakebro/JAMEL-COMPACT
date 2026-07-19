@@ -136,16 +136,10 @@ class CompactAgent:
         """Build the canonical web prompt (same as original JAMEL eval)."""
         from jamel.train.memory.web_prompt import build_web_prompt, extract_axtree_from_observation_str
         from jamel.core.env.web.axtree_utils import prune_axtree
+        from jamel.core.env.web.observer import Observer
         import urllib.parse as _urlparse
 
-        obs_text = obs_dict.get("axtree_object", "") or obs_dict.get("observation", "")
-        if not obs_text and "dom_object" in obs_dict:
-            try:
-                from jamel.core.env.web import Observer
-                obs_text = Observer.get_observation(obs_dict)
-            except Exception:
-                obs_text = str(obs_dict)
-
+        obs_text = Observer.get_observation(obs_dict)
         axtree_raw = extract_axtree_from_observation_str(obs_text)
         pruned_axtree = prune_axtree(axtree_raw, max_chars=8000)
 
