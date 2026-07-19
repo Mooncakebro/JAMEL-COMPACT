@@ -367,12 +367,12 @@ def run_eval(
                     print(f"  [coverage] Save failed at step {global_step}: {e}")
                     return None
 
-            def _reset_with_timeout(rs_seed=None):
+            def _reset_with_timeout(seed=None):
                 _kt = threading.Timer(600, lambda: os.kill(os.getpid(), signal.SIGKILL))
                 _kt.daemon = True
                 _kt.start()
                 try:
-                    result = env.reset(seed=rs_seed)
+                    result = env.reset(seed=seed)
                 finally:
                     _kt.cancel()
                 return result
