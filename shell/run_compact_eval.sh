@@ -69,4 +69,5 @@ python -m jamel_compact.eval \
     --device "$DEVICE" \
     --temperature "$TEMPERATURE" \
     --top-p "$TOP_P" \
+    --gpu-ids "$GPU_IDS" \
     "$@"
