@@ -169,7 +169,7 @@ class BaselineAgent:
         open_urls = obs_dict.get("open_pages_urls", (start_url,))
 
         return build_web_prompt(
-            step_idx=self._session_step_idx,
+            step_idx=int(self._session_step_idx),
             target_app=target_app,
             start_url=start_url,
             open_urls=open_urls,
@@ -238,10 +238,12 @@ class BaselineAgent:
         finally:
             _kill_timer.cancel()
 
-        # Decode only the newly generated tokens
+        # Decode only the newly generated tokens — batch_decode matches original JAMEL eval
         input_len = inputs["input_ids"].shape[1]
-        new_tokens = generated_ids[0, input_len:]
-        raw_response = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
+        new_tokens = generated_ids[:, input_len:]
+        raw_response = self.processor.batch_decode(
+            new_tokens, skip_special_tokens=True, clean_up_tokenization_spaces=False,
+        )[0]
         action, think = parse_action(raw_response)
 
         self._session_step_idx += 1
@@ -386,6 +388,10 @@ def run_eval(
 
                     print(f"    think:  {think_str[:120]}{'...' if len(think_str) > 120 else ''}")
                     print(f"    action: {action_str}")
+
+                    if not action_str:
+                        print("    [WARN] Empty action, inserting noop()")
+                        action_str = "noop()"
 
                     # ── reset() action: browser reset ──
                     if action_str.strip() == "reset()":

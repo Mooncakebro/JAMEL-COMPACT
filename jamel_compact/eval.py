@@ -149,7 +149,7 @@ class CompactAgent:
         open_urls = obs_dict.get("open_pages_urls", (start_url,))
 
         return build_web_prompt(
-            step_idx=self._session_step_idx,
+            step_idx=int(self._session_step_idx),
             target_app=target_app,
             start_url=start_url,
             open_urls=open_urls,
@@ -238,9 +238,11 @@ class CompactAgent:
         self._memory_states = outputs["new_memory"]
         self._confidence_states = outputs["new_confidence"]
 
-        # Decode response
+        # Decode response — batch_decode matches original JAMEL eval exactly
         generated_ids = outputs["generated_ids"]
-        raw_response = self.tokenizer.decode(generated_ids[0], skip_special_tokens=True)
+        raw_response = self.processor.batch_decode(
+            generated_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False,
+        )[0]
         action, think = parse_action(raw_response)
 
         # Update state
@@ -389,6 +391,10 @@ def run_eval(
 
                     print(f"    think:  {think_str[:120]}{'...' if len(think_str) > 120 else ''}")
                     print(f"    action: {action_str}")
+
+                    if not action_str:
+                        print("    [WARN] Empty action, inserting noop()")
+                        action_str = "noop()"
 
                     # ── reset() action: browser reset, memory retained ──
                     if action_str.strip() == "reset()":
