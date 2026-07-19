@@ -186,16 +186,15 @@ class BaselineAgent:
         """
         prompt = self._build_prompt(obs_dict, target_url, start_url, max_steps)
 
-        # Process screenshot
+        # Process screenshot (required — same as original JAMEL eval)
         screenshot_arr = obs_dict.get("screenshot")
-        image = None
-        if screenshot_arr is not None:
-            image = Image.fromarray(screenshot_arr.astype(np.uint8))
-            if image.size != self.image_resize:
-                image = image.resize(self.image_resize, Image.BILINEAR)
+        if screenshot_arr is None:
+            raise RuntimeError("Web prompt requires a screenshot in obs_dict; got None.")
+        image = Image.fromarray(screenshot_arr.astype(np.uint8))
+        if image.size != self.image_resize:
+            image = image.resize(self.image_resize, Image.BILINEAR)
 
-        # Build messages
-        has_image = "<image>" in prompt
+        # Build messages — always use processor (same as original JAMEL eval)
         segments = prompt.split("<image>")
         content = []
         for idx, seg in enumerate(segments):
@@ -205,21 +204,12 @@ class BaselineAgent:
                 content.append({"type": "image"})
 
         messages = [{"role": "user", "content": content}]
-
-        # Tokenize
-        if self.processor is not None and has_image and image is not None:
-            prompt_text = self.processor.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True,
-            )
-            inputs = self.processor(
-                text=[prompt_text], images=[image], return_tensors="pt",
-            )
-        else:
-            prompt_text = self.tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True,
-            )
-            inputs = {"input_ids": self.tokenizer.encode(prompt_text, return_tensors="pt")}
-            inputs["attention_mask"] = torch.ones_like(inputs["input_ids"])
+        prompt_text = self.processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True,
+        )
+        inputs = self.processor(
+            text=[prompt_text], images=[image], return_tensors="pt",
+        )
 
         inputs = {k: v.to(self.device) for k, v in inputs.items() if isinstance(v, torch.Tensor)}
         inputs.pop("second_per_grid_ts", None)
