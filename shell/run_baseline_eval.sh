@@ -25,6 +25,7 @@ EVAL_OUTPUT=${EVAL_OUTPUT:-outputs/baseline_eval}
 DEVICE=${DEVICE:-cuda}
 TEMPERATURE=${TEMPERATURE:-0.8}
 TOP_P=${TOP_P:-0.9}
+GPU_IDS=${GPU_IDS:-}              # e.g. "0" or "1" (empty = all)
 
 if [[ ! -d "$CHECKPOINT" ]]; then
     echo "ERROR: Checkpoint not found: $CHECKPOINT" >&2
@@ -50,7 +51,13 @@ echo "  ScaleWoB:     $SCALEWOB_ROOT"
 echo "  Max steps:    $MAX_STEPS"
 echo "  Sessions:     $NUM_SESSIONS"
 echo "  Output:       $EVAL_OUTPUT"
+echo "  GPU:          ${GPU_IDS:-all}"
 echo ""
+
+# Set CUDA_VISIBLE_DEVICES in the shell BEFORE Python launches.
+if [[ -n "$GPU_IDS" ]]; then
+    export CUDA_VISIBLE_DEVICES="$GPU_IDS"
+fi
 
 python -m jamel_compact.baseline_eval \
     --checkpoint "$CHECKPOINT" \
