@@ -165,6 +165,14 @@ def train_one_epoch(
         loss = outputs.loss
         if loss.dim() > 0:
             loss = loss.mean()
+
+        # ── NaN guard: skip the batch if loss is NaN or Inf ──
+        # (e.g. all labels are −100 due to prompt-only truncation)
+        if torch.isnan(loss) or torch.isinf(loss):
+            print(f"  [WARN] step {step}: loss is {loss.item()}, skipping batch")
+            optimizer.zero_grad()
+            continue
+
         loss = loss / accum_steps
 
         # ── Backward ──

@@ -227,8 +227,12 @@ class CompactDataset(Dataset):
             attention_mask = attention_mask[:self.max_length]
 
         # ── Labels: mask prompt with -100 ──
+        # Clamp prompt_length to max_length - 1 so that at least 1 token
+        # has a valid label (otherwise all-−100 → CrossEntropyLoss returns
+        # NaN, which corrupts all model weights in one step).
+        effective_prompt_len = min(prompt_length, input_ids.shape[0] - 1)
         labels = input_ids.clone()
-        labels[:prompt_length] = -100
+        labels[:effective_prompt_len] = -100
 
         # ── Action embedding input ──
         action_tokens = self.tokenizer.encode(
