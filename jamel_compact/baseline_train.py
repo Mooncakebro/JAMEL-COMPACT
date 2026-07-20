@@ -104,6 +104,7 @@ def train_one_epoch(
     processor=None,
     best_val_loss_tracker=None,
     scheduler=None,
+    tokenizer=None,
 ):
     """Standard SFT training epoch — pure cross-entropy loss."""
     model.train()
@@ -211,7 +212,8 @@ def train_one_epoch(
             if config_save_steps > 0 and global_step % config_save_steps == 0:
                 ckpt_dir = Path(config_output_dir) / f"global_step_{global_step}"
                 raw_model.save_pretrained(ckpt_dir)
-                tokenizer.save_pretrained(ckpt_dir)
+                if tokenizer is not None:
+                    tokenizer.save_pretrained(ckpt_dir)
                 if processor is not None:
                     try:
                         processor.save_pretrained(ckpt_dir)
@@ -228,7 +230,8 @@ def train_one_epoch(
                     best_val_loss_tracker[0] = val_loss
                     best_dir = Path(config_output_dir) / "best"
                     raw_model.save_pretrained(best_dir)
-                    tokenizer.save_pretrained(best_dir)
+                    if tokenizer is not None:
+                        tokenizer.save_pretrained(best_dir)
                     if processor is not None:
                         try:
                             processor.save_pretrained(best_dir)
@@ -593,6 +596,7 @@ def main():
             processor=processor,
             best_val_loss_tracker=best_val_loss_tracker,
             scheduler=scheduler,
+            tokenizer=tokenizer,
         )
         # Sync back from the mutable tracker
         best_val_loss = best_val_loss_tracker[0]
