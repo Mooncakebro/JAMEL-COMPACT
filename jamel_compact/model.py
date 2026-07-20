@@ -818,8 +818,10 @@ class JAMELCompactWrapper(nn.Module):
                 sorted_indices_to_remove = cum_probs > top_p
                 sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
                 sorted_indices_to_remove[..., 0] = False
-                indices_to_remove = sorted_logits.scatter(1, sorted_indices, sorted_indices_to_remove)
-                logits = logits.masked_fill(indices_to_remove, float('-inf'))
+                # scatter into a float mask (same dtype as logits) to avoid dtype mismatch
+                remove_mask = torch.zeros_like(logits)
+                remove_mask.scatter_(1, sorted_indices, sorted_indices_to_remove.to(logits.dtype))
+                logits = logits.masked_fill(remove_mask.bool(), float('-inf'))
 
             probs = F.softmax(logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)  # [B, 1]
