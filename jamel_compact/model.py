@@ -745,16 +745,21 @@ class JAMELCompactWrapper(nn.Module):
         image_grid_thw: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> dict:
-        """Generate action tokens autoregressively with memory.
+        """Generate action tokens using the base LLM's built-in generate().
 
-        Images are processed once for the prompt. During generation, each new
-        token goes through all decoder layers (self-attn + FFN) and memory
-        is updated. Position embeddings use correct absolute positions.
+        The base Qwen3-VL model's ``generate()`` handles KV caching, causal
+        masks, and position IDs correctly — things that are extremely hard to
+        get right in a hand-rolled loop. We delegate to it for the actual
+        token generation.
+
+        Memory is updated once with a single forward pass through the compact
+        model on the full prompt sequence (same as during training). This gives
+        the FiLM-GRU the observation signal it needs for the next step.
         """
         B = input_ids.shape[0]
         device = input_ids.device
-        seq_len = input_ids.shape[1]
 
+        # ── 1. Memory update: one forward pass on the prompt ──
         action_embed = self.action_embed(action_embed_input)
         decoder_layers = self._get_decoder_layers()
         embed_layer = self._get_input_embeddings()
@@ -781,7 +786,7 @@ class JAMELCompactWrapper(nn.Module):
         for l, (layer, sm) in enumerate(zip(decoder_layers, self.side_memories)):
             m_hat, c_hat = sm.predict(memory_states[l], confidence_states[l], action_embed)
             layer_output = layer(h, attention_mask=attn_mask_4d,
-                                position_embeddings=position_embeddings, **kwargs)
+                                position_embeddings=position_embeddings)
             h_layer = layer_output[0] if isinstance(layer_output, tuple) else layer_output
 
             # DeepStack injection
@@ -800,76 +805,29 @@ class JAMELCompactWrapper(nn.Module):
             new_memory.append(m_new)
             new_confidence.append(c_new)
 
-        # ── Generate tokens one by one ──
-        generated_ids = []
-        cur_pos = seq_len  # absolute position for the next token
+        # ── 2. Token generation: delegate to the base LLM ──
+        # The base model's generate() handles KV cache, RoPE, causal masks,
+        # and sampling correctly. We pass pixel_values so the visual encoder
+        # runs inside the base model's forward (no DataParallel at eval time).
+        gen_kwargs = dict(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=max_new_tokens,
+            do_sample=temperature > 0,
+        )
+        if temperature > 0:
+            gen_kwargs["temperature"] = temperature
+            gen_kwargs["top_p"] = top_p
+        if pixel_values is not None:
+            gen_kwargs["pixel_values"] = pixel_values
+        if image_grid_thw is not None:
+            gen_kwargs["image_grid_thw"] = image_grid_thw
 
-        # Use the last position's hidden state (after memory injection) for logits
-        cur_h = h[:, -1:, :]  # [B, 1, d]
+        full_ids = self.llm.generate(**gen_kwargs)
 
-        for _ in range(max_new_tokens):
-            logits = self._get_lm_head()(cur_h)  # [B, 1, vocab]
-            logits = logits[:, -1, :] / max(temperature, 1e-8)
-
-            # Top-p sampling
-            if top_p < 1.0:
-                sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-                cum_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-                sorted_indices_to_remove = cum_probs > top_p
-                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-                sorted_indices_to_remove[..., 0] = False
-                # scatter into a float mask (same dtype as logits) to avoid dtype mismatch
-                remove_mask = torch.zeros_like(logits)
-                remove_mask.scatter_(1, sorted_indices, sorted_indices_to_remove.to(logits.dtype))
-                logits = logits.masked_fill(remove_mask.bool(), float('-inf'))
-
-            probs = F.softmax(logits, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1)  # [B, 1]
-            generated_ids.append(next_token)
-
-            # ── Feed next token through all layers with memory ──
-            next_h = embed_layer(next_token)  # [B, 1, d]
-
-            # Single-token causal mask (no padding possible for 1 token)
-            single_mask_4d = torch.zeros(
-                (B, 1, 1, 1), dtype=h.dtype, device=device,
-            )  # [B, 1, 1, 1] — attend to self
-
-            # Position embedding for this token at absolute position cur_pos
-            single_pos_ids = torch.tensor(
-                [[cur_pos]], dtype=torch.long, device=device,
-            )  # [B, 1]
-            rotary_emb = self._find_rotary_emb()
-            if rotary_emb is not None:
-                cos_single, sin_single = rotary_emb(next_h, single_pos_ids)
-                pos_emb_single = (cos_single.to(dtype=next_h.dtype),
-                                  sin_single.to(dtype=next_h.dtype))
-            else:
-                pos_emb_single = None
-
-            for l, (layer, sm) in enumerate(zip(decoder_layers, self.side_memories)):
-                layer_output = layer(next_h, attention_mask=single_mask_4d,
-                                    position_embeddings=pos_emb_single,
-                                    **kwargs)
-                next_h_layer = layer_output[0] if isinstance(layer_output, tuple) else layer_output
-                # Update memory with the new token's hidden state
-                z_t = sm.extract_observation(next_h_layer, self.num_act_tokens)
-                m_hat, c_hat = sm.predict(new_memory[l], new_confidence[l], action_embed)
-                m_new, c_new = sm.correct(m_hat, c_hat, z_t)
-                next_h = sm.inject(next_h_layer, m_new)
-                new_memory[l] = m_new
-                new_confidence[l] = c_new
-
-            cur_h = next_h  # [B, 1, d] — use injected output for next logits
-            cur_pos += 1
-
-            # Stop at EOS
-            if self.tokenizer.eos_token_id is not None and \
-               (next_token == self.tokenizer.eos_token_id).all():
-                break
-
-        generated_ids = torch.cat(generated_ids, dim=1) if generated_ids else \
-            torch.empty(B, 0, dtype=torch.long, device=device)
+        # Extract only the newly generated tokens
+        prompt_len = input_ids.shape[1]
+        generated_ids = full_ids[:, prompt_len:]
 
         return {
             "generated_ids": generated_ids,
