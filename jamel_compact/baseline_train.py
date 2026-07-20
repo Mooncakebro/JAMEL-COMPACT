@@ -132,8 +132,13 @@ def train_one_epoch(
         # ── Pre-compute visual features on raw model before DataParallel ──
         # Same trick as JAMEL-COMPACT: process images on the main device to
         # avoid visual encoder issues under DataParallel scatter.
+        # Qwen3-VL nests the visual tower under .model.visual, so check both.
         inputs_embeds = None
-        if pixel_values is not None and hasattr(raw_model, "visual"):
+        has_visual = (
+            hasattr(raw_model, "visual")
+            or (hasattr(raw_model, "model") and hasattr(raw_model.model, "visual"))
+        )
+        if pixel_values is not None and has_visual:
             embed_layer = raw_model.get_input_embeddings()
             h_embed = embed_layer(input_ids)
             inputs_embeds = _inject_visual_features(
@@ -254,7 +259,11 @@ def validate(model, dataloader, device, raw_model):
             image_grid_thw = image_grid_thw.to(device)
 
         inputs_embeds = None
-        if pixel_values is not None and hasattr(raw_model, "visual"):
+        has_visual = (
+            hasattr(raw_model, "visual")
+            or (hasattr(raw_model, "model") and hasattr(raw_model.model, "visual"))
+        )
+        if pixel_values is not None and has_visual:
             embed_layer = raw_model.get_input_embeddings()
             h_embed = embed_layer(input_ids)
             inputs_embeds = _inject_visual_features(
