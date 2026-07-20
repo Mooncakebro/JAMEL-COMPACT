@@ -22,6 +22,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import gc
 import io
 import json
 import os
@@ -131,6 +132,11 @@ class BaselineAgent:
 
         self.model = self.model.to(device)
         self.model.eval()
+
+        # Free CPU-side weight copies before the browser env starts (avoids OOM kill)
+        gc.collect()
+        torch.cuda.empty_cache()
+
         self.device = torch.device(device)
         self.tokenizer = AutoTokenizer.from_pretrained(checkpoint, trust_remote_code=True)
         try:

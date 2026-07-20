@@ -16,6 +16,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import gc
 import io
 import json
 import os
@@ -108,6 +109,23 @@ class CompactAgent:
         self.model = JAMELCompactWrapper.from_pretrained(checkpoint)
         self.model = self.model.to(device)
         self.model.eval()
+
+        # ── Override training-only settings that waste memory at inference ──
+        # The checkpoint config may have gradient_checkpointing=True / use_cache=False
+        # (saved during training).  These are harmful during eval:
+        #   - gradient_checkpointing recomputes activations, wasting GPU memory
+        #   - use_cache=False prevents KV-cache reuse, slowing generation
+        try:
+            self.model.llm.gradient_checkpointing_disable()
+        except Exception:
+            pass
+        if hasattr(self.model.llm, 'config'):
+            self.model.llm.config.use_cache = True
+
+        # Free CPU-side weight copies before the browser env starts (avoids OOM kill)
+        gc.collect()
+        torch.cuda.empty_cache()
+
         self.device = torch.device(device)
         self.tokenizer = self.model.tokenizer
         self.processor = self.model.processor
