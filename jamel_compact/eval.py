@@ -129,6 +129,17 @@ class CompactAgent:
         self.device = torch.device(device)
         self.tokenizer = self.model.tokenizer
         self.processor = self.model.processor
+
+        if self.processor is None:
+            raise RuntimeError(
+                "Processor failed to load from checkpoint. The processor files "
+                "(preprocessor_config.json etc.) are missing. Ensure the checkpoint "
+                f"was saved with processor files: {checkpoint}"
+            )
+        if self.tokenizer is None:
+            raise RuntimeError(
+                f"Tokenizer failed to load from checkpoint: {checkpoint}"
+            )
         self.temperature = temperature
         self.top_p = top_p
         self.max_new_tokens = max_new_tokens

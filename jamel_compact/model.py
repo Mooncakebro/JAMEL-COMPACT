@@ -246,9 +246,12 @@ class JAMELCompactWrapper(nn.Module):
                 torch_dtype=dtype,
                 trust_remote_code=True,
             )
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            config.base_model_name, trust_remote_code=True,
-        )
+        try:
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                config.base_model_name, trust_remote_code=True,
+            )
+        except Exception:
+            self.tokenizer = None
         try:
             self.processor = AutoProcessor.from_pretrained(
                 config.base_model_name, trust_remote_code=True,
@@ -946,6 +949,30 @@ class JAMELCompactWrapper(nn.Module):
 
         # Create model
         model = cls(config)
+
+        # ── Reload tokenizer/processor from the checkpoint top-level dir ──
+        # save_pretrained() saves tokenizer + processor to the top-level
+        # checkpoint dir, but __init__ loads them from config.base_model_name
+        # (which is checkpoint/base_model/ when the base LLM is saved there).
+        # That subdirectory only has model weights, not tokenizer/processor
+        # files, so the loads silently fail.  Retry from the top-level dir.
+        if model.tokenizer is None or model.processor is None:
+            try:
+                if model.tokenizer is None:
+                    model.tokenizer = AutoTokenizer.from_pretrained(
+                        str(load_path), trust_remote_code=True,
+                    )
+                    print(f"[load] Tokenizer loaded from {load_path}")
+            except Exception:
+                pass
+            try:
+                if model.processor is None:
+                    model.processor = AutoProcessor.from_pretrained(
+                        str(load_path), trust_remote_code=True,
+                    )
+                    print(f"[load] Processor loaded from {load_path}")
+            except Exception:
+                pass
 
         # Load side memory weights
         side_mem_dir = load_path / "side_memory"
