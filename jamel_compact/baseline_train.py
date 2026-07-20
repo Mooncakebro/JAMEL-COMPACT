@@ -97,6 +97,12 @@ def train_one_epoch(
     log_steps: int,
     max_grad_norm: float,
     raw_model,
+    config_save_steps: int = 0,
+    config_val_steps: int = 0,
+    config_output_dir: str = "",
+    dataloader_val=None,
+    processor=None,
+    best_val_loss_tracker=None,
 ):
     """Standard SFT training epoch — pure cross-entropy loss."""
     model.train()
@@ -112,6 +118,7 @@ def train_one_epoch(
         batch_start = time.time()
 
         # ── Move data to device ──
+        # NOTE: this block is identical to validate() — keep in sync.
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
         labels = batch["labels"].to(device)
@@ -166,6 +173,7 @@ def train_one_epoch(
             optimizer.step()
             optimizer.zero_grad()
             global_step += 1
+            scheduler.step()
 
             # ── Logging ──
             if global_step % log_steps == 0:
@@ -183,6 +191,35 @@ def train_one_epoch(
                     pbar.set_postfix({"loss": f"{avg_loss:.4f}", "lr": f"{lr:.2e}"})
                 else:
                     print(msg)
+
+            # ── Mid-epoch checkpoint save ──
+            if config_save_steps > 0 and global_step % config_save_steps == 0:
+                ckpt_dir = Path(config_output_dir) / f"global_step_{global_step}"
+                raw_model.save_pretrained(ckpt_dir)
+                tokenizer.save_pretrained(ckpt_dir)
+                if processor is not None:
+                    try:
+                        processor.save_pretrained(ckpt_dir)
+                    except Exception:
+                        pass
+                print(f"  [checkpoint] Saved to {ckpt_dir}")
+
+            # ── Mid-epoch validation ──
+            if config_val_steps > 0 and global_step % config_val_steps == 0:
+                val_loss = validate(model, dataloader_val, device, raw_model)
+                if _TB_AVAILABLE and writer is not None:
+                    writer.add_scalar("val/loss", val_loss, global_step)
+                if val_loss < best_val_loss_tracker[0]:
+                    best_val_loss_tracker[0] = val_loss
+                    best_dir = Path(config_output_dir) / "best"
+                    raw_model.save_pretrained(best_dir)
+                    tokenizer.save_pretrained(best_dir)
+                    if processor is not None:
+                        try:
+                            processor.save_pretrained(best_dir)
+                        except Exception:
+                            pass
+                    print(f"  [best] New best val loss: {val_loss:.4f}")
 
         # ── Periodic cache cleanup ──
         if step % 50 == 0:
@@ -424,6 +461,9 @@ def main():
     # Gradient checkpointing (saves memory)
     if not args.no_grad_checkpoint:
         model.gradient_checkpointing_enable()
+        # use_cache MUST be False when gradient checkpointing is enabled
+        if hasattr(model, 'config'):
+            model.config.use_cache = False
         print("[baseline] Gradient checkpointing enabled")
 
     model = model.to(device)
@@ -512,6 +552,8 @@ def main():
     # ── Training loop ──
     global_step = 0
     best_val_loss = float('inf')
+    # Mutable holder so train_one_epoch can update best_val_loss mid-epoch
+    best_val_loss_tracker = [best_val_loss]
 
     for epoch in range(args.max_epochs):
         print(f"\n{'='*60}")
@@ -525,10 +567,18 @@ def main():
             log_steps=args.log_steps,
             max_grad_norm=args.max_grad_norm,
             raw_model=raw_model,
+            config_save_steps=args.save_steps,
+            config_val_steps=args.val_steps,
+            config_output_dir=args.output_dir,
+            dataloader_val=val_loader,
+            processor=processor,
+            best_val_loss_tracker=best_val_loss_tracker,
         )
-        scheduler.step()
+        # Sync back from the mutable tracker
+        best_val_loss = best_val_loss_tracker[0]
+        # scheduler is stepped per optimizer-step inside train_one_epoch
 
-        # Validation
+        # Validation (end of epoch)
         val_loss = validate(model, val_loader, device, raw_model)
         if _TB_AVAILABLE and writer is not None:
             writer.add_scalar("val/loss", val_loss, global_step)
@@ -538,18 +588,33 @@ def main():
             best_dir = Path(args.output_dir) / "best"
             raw_model.save_pretrained(best_dir)
             tokenizer.save_pretrained(best_dir)
+            if processor is not None:
+                try:
+                    processor.save_pretrained(best_dir)
+                except Exception:
+                    pass
             print(f"  [best] New best val loss: {best_val_loss:.4f}")
 
         # Save checkpoint per epoch
         ckpt_dir = Path(args.output_dir) / f"epoch{epoch}"
         raw_model.save_pretrained(ckpt_dir)
         tokenizer.save_pretrained(ckpt_dir)
+        if processor is not None:
+            try:
+                processor.save_pretrained(ckpt_dir)
+            except Exception:
+                pass
         print(f"  [checkpoint] Saved to {ckpt_dir}")
 
     # ── Save final model ──
     final_dir = Path(args.output_dir) / "final"
     raw_model.save_pretrained(final_dir)
     tokenizer.save_pretrained(final_dir)
+    if processor is not None:
+        try:
+            processor.save_pretrained(final_dir)
+        except Exception:
+            pass
     print(f"\n[baseline] Final model saved to {final_dir}")
 
     if writer is not None:

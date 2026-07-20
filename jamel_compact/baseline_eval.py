@@ -133,6 +133,16 @@ class BaselineAgent:
         self.model = self.model.to(device)
         self.model.eval()
 
+        # ── Override training-only settings for inference ──
+        # Checkpoints saved during gradient-checkpointing training may have
+        # use_cache=False, which breaks generation and wastes memory.
+        try:
+            self.model.gradient_checkpointing_disable()
+        except Exception:
+            pass
+        if hasattr(self.model, 'config'):
+            self.model.config.use_cache = True
+
         # Free CPU-side weight copies before the browser env starts (avoids OOM kill)
         gc.collect()
         torch.cuda.empty_cache()
@@ -143,6 +153,8 @@ class BaselineAgent:
             self.processor = AutoProcessor.from_pretrained(checkpoint, trust_remote_code=True)
         except Exception:
             self.processor = None
+            print("[agent] WARNING: AutoProcessor failed to load from checkpoint. "
+                  "Image processing will not work correctly.")
 
         self.temperature = temperature
         self.top_p = top_p
