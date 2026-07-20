@@ -103,6 +103,7 @@ def train_one_epoch(
     dataloader_val=None,
     processor=None,
     best_val_loss_tracker=None,
+    scheduler=None,
 ):
     """Standard SFT training epoch — pure cross-entropy loss."""
     model.train()
@@ -178,7 +179,8 @@ def train_one_epoch(
             optimizer.step()
             optimizer.zero_grad()
             global_step += 1
-            scheduler.step()
+            if scheduler is not None:
+                scheduler.step()
 
             # ── Logging ──
             if global_step % log_steps == 0:
@@ -582,6 +584,7 @@ def main():
             dataloader_val=val_loader,
             processor=processor,
             best_val_loss_tracker=best_val_loss_tracker,
+            scheduler=scheduler,
         )
         # Sync back from the mutable tracker
         best_val_loss = best_val_loss_tracker[0]
