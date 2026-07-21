@@ -28,6 +28,7 @@ import json
 import os
 import re
 import signal
+import sys
 import threading
 import time
 from datetime import datetime
@@ -631,6 +632,12 @@ def main():
     # Resolve apps
     if args.apps:
         apps = [a.strip() for a in args.apps.split(",") if a.strip()]
+        # Guard against common mistake: using an apps-mode name as a literal app
+        _mode_names = {"test10", "train86", "all"}
+        if len(apps) == 1 and apps[0] in _mode_names:
+            print(f"[eval] ERROR: '{apps[0]}' is an apps-mode, not an app name.")
+            print(f"  Use: APPS_MODE={apps[0]}  (not APPS={apps[0]})")
+            sys.exit(2)
     else:
         repo_root = Path(__file__).resolve().parents[1]
         app_config = repo_root / "configs" / "benchmark_apps.json"

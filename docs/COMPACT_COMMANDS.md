@@ -363,6 +363,11 @@ EVAL_OUTPUT=outputs/baseline_eval_debug \
 bash shell/run_baseline_eval.sh
 ```
 
+> **Important:** `APPS` specifies literal app names (e.g. `weibo`, `alibaba`).
+> `APPS_MODE` specifies a split (e.g. `test10`, `train86`, `all`).
+> Do **not** use `APPS=test10` — that will try to load a non-existent app
+> called "test10" and produce 0 reward. Use `APPS_MODE=test10` instead.
+
 **Output:**
 ```
 outputs/compact_eval/
