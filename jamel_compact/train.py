@@ -218,6 +218,7 @@ def train_one_epoch(
     global_step: int,
     device: torch.device,
     epoch: int,
+    scheduler: Optional[torch.optim.lr_scheduler.LambdaLR] = None,
 ) -> int:
     """Train for one epoch. Returns updated global_step.
 
@@ -381,6 +382,10 @@ def train_one_epoch(
                     "lr": f"{optimizer.param_groups[0]['lr']:.2e}",
                     "step": global_step,
                 })
+
+            # ── LR scheduler step (per optimizer step, not per epoch) ──
+            if scheduler is not None:
+                scheduler.step()
 
             # ── Save checkpoint ──
             if global_step % config.save_steps == 0:
@@ -756,8 +761,8 @@ def main():
         global_step = train_one_epoch(
             model, train_loader, optimizer, config, writer,
             global_step, device, epoch,
+            scheduler=scheduler,
         )
-        scheduler.step()
 
         # Validation
         if (epoch + 1) * len(train_loader) // config.gradient_accumulation_steps >= config.val_steps:
