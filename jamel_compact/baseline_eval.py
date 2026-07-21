@@ -114,23 +114,34 @@ class BaselineAgent:
 
         from transformers import AutoModelForImageTextToText, AutoProcessor, AutoTokenizer
 
+        # ── Load model directly onto GPU to avoid CPU RAM doubling ──
+        # Loading to CPU then .to(device) temporarily holds 2× the weights
+        # in system RAM. On memory-constrained servers this causes OOM-kill
+        # when the browser environment (Chromium) starts afterwards.
+        # device_map={"": device} loads weights straight onto the target GPU.
+        _load_kwargs = dict(
+            torch_dtype=torch.bfloat16,
+            trust_remote_code=True,
+            low_cpu_mem_usage=True,
+        )
+        if device.startswith("cuda") and torch.cuda.is_available():
+            _load_kwargs["device_map"] = {"": device}
+
         try:
             self.model = AutoModelForImageTextToText.from_pretrained(
-                checkpoint,
-                torch_dtype=torch.bfloat16,
-                trust_remote_code=True,
+                checkpoint, **_load_kwargs,
             )
         except Exception as e:
             print(f"[agent] AutoModelForImageTextToText failed ({e}), "
                   f"trying AutoModelForCausalLM...")
             from transformers import AutoModelForCausalLM
             self.model = AutoModelForCausalLM.from_pretrained(
-                checkpoint,
-                torch_dtype=torch.bfloat16,
-                trust_remote_code=True,
+                checkpoint, **_load_kwargs,
             )
 
-        self.model = self.model.to(device)
+        # Only .to(device) if device_map wasn't used (CPU fallback path)
+        if "device_map" not in _load_kwargs:
+            self.model = self.model.to(device)
         self.model.eval()
 
         # ── Override training-only settings for inference ──
