@@ -1,6 +1,6 @@
 # JAMEL-COMPACT: Full Commands (Data Prep → Training → Eval)
 
-This document provides the complete commands to run the JAMEL-COMPACT pipeline end-to-end.
+This document provides the complete commands to run the JAMEL-COMPACT pipeline end-to-end, including both the **compact** model (with side memory) and the **baseline** (pure Qwen3-VL SFT, no side memory).
 
 ---
 
@@ -119,7 +119,7 @@ data/compact_sft_data/
 
 ---
 
-## Step 2: Training
+## Step 2: Training (Compact Model — with side memory)
 
 ### 2a. Train with Qwen3-VL-2B (default, single GPU)
 
@@ -223,9 +223,74 @@ outputs/compact_ckpt/
 
 ---
 
+## Step 2B: Training (Baseline — pure Qwen3-VL SFT, no side memory)
+
+The baseline trains the same pretrained Qwen3-VL model with standard SFT (plain next-token cross-entropy loss) on the same data as JAMEL-COMPACT. No memory modules, no chunking — this measures how much JAMEL-COMPACT's side memory contributes above and beyond simple SFT.
+
+### 2B-a. Train baseline with Qwen3-VL-2B (multi-GPU)
+
+```bash
+TRAIN_FILE=data/compact_sft_data/compact_train.parquet \
+VAL_FILE=data/compact_sft_data/compact_val.parquet \
+BASE_MODEL=/data2/songyuebing/JAMEL-DeltaState/LLMs/Qwen3-VL-2B-Instruct \
+OUTPUT_DIR=outputs/baseline_ckpt \
+TB_LOG_DIR=outputs/baseline_tb \
+GPU_IDS=6,7 \
+MAX_LENGTH=8192 \
+MAX_EPOCHS=20 \
+BATCH_SIZE=1 \
+GRAD_ACCUM=16 \
+LR=2e-5 \
+LOG_STEPS=10 \
+SAVE_STEPS=500 \
+VAL_STEPS=200 \
+bash shell/run_baseline_train.sh
+```
+
+### 2B-b. Train baseline with Qwen3-VL-8B
+
+```bash
+TRAIN_FILE=data/compact_sft_data/compact_train.parquet \
+VAL_FILE=data/compact_sft_data/compact_val.parquet \
+BASE_MODEL=Qwen/Qwen3-VL-8B-Instruct \
+OUTPUT_DIR=outputs/baseline_ckpt_8b \
+TB_LOG_DIR=outputs/baseline_tb_8b \
+GPU_IDS=0 \
+MAX_EPOCHS=3 \
+GRAD_ACCUM=32 \
+LR=1e-5 \
+bash shell/run_baseline_train.sh
+```
+
+### 2B-c. Monitor baseline training with TensorBoard
+
+```bash
+tensorboard --logdir outputs/baseline_tb --port 6007
+# Open http://localhost:6007 in browser
+```
+
+**Logged metrics:**
+- `train/loss` — cross-entropy loss
+- `train/lr` — learning rate
+- `val/loss` — validation cross-entropy loss
+
+**Output:**
+```
+outputs/baseline_ckpt/
+├── global_step_500/       # mid-epoch checkpoint
+├── best/                  # best validation loss checkpoint
+├── epoch0/                # per-epoch checkpoint
+├── epoch1/
+└── final/                 # final model
+```
+
+> **Note**: Each checkpoint directory contains model weights + tokenizer + processor files (saved together so eval can load everything from one path).
+
+---
+
 ## Step 3: Evaluation
 
-### 3a. Evaluate on test10 apps (paper setting)
+### 3a. Evaluate compact model on test10 apps (paper setting)
 
 ```bash
 CHECKPOINT=outputs/compact_ckpt/final \
@@ -273,6 +338,31 @@ EVAL_OUTPUT=outputs/compact_eval_custom \
 bash shell/run_compact_eval.sh
 ```
 
+### 3e. Evaluate baseline model on test10 apps
+
+```bash
+CHECKPOINT=outputs/baseline_ckpt/final \
+APPS_MODE=test10 \
+MAX_STEPS=50 \
+NUM_SESSIONS=3 \
+EVAL_OUTPUT=outputs/baseline_eval \
+DEVICE=cuda \
+TEMPERATURE=0.8 \
+TOP_P=0.9 \
+bash shell/run_baseline_eval.sh
+```
+
+### 3f. Baseline single-app debug
+
+```bash
+CHECKPOINT=outputs/baseline_ckpt/final \
+APPS=weibo \
+MAX_STEPS=20 \
+NUM_SESSIONS=1 \
+EVAL_OUTPUT=outputs/baseline_eval_debug \
+bash shell/run_baseline_eval.sh
+```
+
 **Output:**
 ```
 outputs/compact_eval/
@@ -284,6 +374,47 @@ outputs/compact_eval/
 └── eval_summary.json
 ```
 
+Each session directory also contains per-step screenshots:
+```
+outputs/compact_eval_debug/weibo/session0/
+├── step_001_before.png
+├── step_001_after.png
+├── step_002_before.png
+├── step_002_after.png
+├── ...
+├── step_050_after.png
+├── coverage/
+└── trajectory_weibo_*.parquet
+```
+
+### 3g. Convert eval screenshots to MP4 video
+
+After evaluation, convert the per-step `before`/`after` screenshots into a video for visualization:
+
+```bash
+# Sequential before→after per step, 2 fps (default):
+python scripts/snapshots_to_mp4.py outputs/compact_eval_debug/weibo/session0/
+
+# Side-by-side before|after, 4 fps, custom output:
+python scripts/snapshots_to_mp4.py outputs/compact_eval_debug/weibo/session0/ \
+    --mode side_by_side --fps 4 -o weibo_eval.mp4
+
+# Only "after" screenshots:
+python scripts/snapshots_to_mp4.py outputs/compact_eval_debug/weibo/session0/ \
+    --mode after_only --fps 2
+```
+
+**Modes:**
+
+| Mode | Description |
+|------|-------------|
+| `sequential` (default) | Each step produces 2 frames: before, then after |
+| `side_by_side` | Each step is 1 frame with before \| after horizontally |
+| `before_only` | Only before screenshots |
+| `after_only` | Only after screenshots |
+
+**Requirements:** `pip install opencv-python numpy`
+
 ---
 
 ## Full Pipeline (All-in-One)
@@ -294,7 +425,7 @@ INPUT=/home/spc/JAMEL-DeltaState/data/ExplorerSFT-ReAct_Dataset/data \
 OUTPUT_DIR=data/compact_sft_data_all \
 bash shell/run_compact_prepare_data.sh
 
-# ── 2. Train ──
+# ── 2a. Train compact model (with side memory) ──
 TRAIN_FILE=data/compact_sft_data/compact_train.parquet \
 VAL_FILE=data/compact_sft_data/compact_val.parquet \
 BASE_MODEL=Qwen/Qwen3-VL-2B-Instruct \
@@ -303,11 +434,31 @@ TB_LOG_DIR=outputs/compact_tb \
 GPU_IDS=0 \
 bash shell/run_compact_train.sh
 
-# ── 3. Eval ──
+# ── 2b. Train baseline (pure Qwen3-VL SFT, no side memory) ──
+TRAIN_FILE=data/compact_sft_data/compact_train.parquet \
+VAL_FILE=data/compact_sft_data/compact_val.parquet \
+BASE_MODEL=Qwen/Qwen3-VL-2B-Instruct \
+OUTPUT_DIR=outputs/baseline_ckpt \
+TB_LOG_DIR=outputs/baseline_tb \
+GPU_IDS=6,7 \
+MAX_EPOCHS=20 \
+bash shell/run_baseline_train.sh
+
+# ── 3a. Eval compact model ──
 CHECKPOINT=outputs/compact_ckpt/final \
 APPS_MODE=test10 \
 EVAL_OUTPUT=outputs/compact_eval \
 bash shell/run_compact_eval.sh
+
+# ── 3b. Eval baseline ──
+CHECKPOINT=outputs/baseline_ckpt/final \
+APPS_MODE=test10 \
+EVAL_OUTPUT=outputs/baseline_eval \
+bash shell/run_baseline_eval.sh
+
+# ── 4. Visualize eval trajectory as video ──
+python scripts/snapshots_to_mp4.py outputs/compact_eval/weibo/session0/ \
+    --mode side_by_side --fps 4 -o weibo_compact.mp4
 ```
 
 ---
@@ -359,6 +510,52 @@ bash shell/run_compact_eval.sh
 | `DEVICE` | `cuda` | Device for inference |
 | `TEMPERATURE` | `0.8` | Sampling temperature |
 | `TOP_P` | `0.9` | Top-p sampling |
+| `GPU_IDS` | (empty = all) | GPU ID(s) for eval (e.g. `0` or `0,1`) |
+
+### Baseline Training (`run_baseline_train.sh`)
+
+| Variable | Default | Description |
+|---|---|---|
+| `TRAIN_FILE` | `data/compact_sft_data/compact_train.parquet` | Train parquet file |
+| `VAL_FILE` | `data/compact_sft_data/compact_val.parquet` | Val parquet file |
+| `BASE_MODEL` | `Qwen/Qwen3-VL-2B-Instruct` | Pretrained base model name or path |
+| `OUTPUT_DIR` | `outputs/baseline_ckpt` | Checkpoint output directory |
+| `TB_LOG_DIR` | `outputs/baseline_tb` | TensorBoard log directory |
+| `GPU_IDS` | (empty = all) | Comma-separated GPU IDs (e.g. `6,7`) |
+| `MAX_LENGTH` | `8192` | Max token length |
+| `MAX_EPOCHS` | `2` | Number of training epochs |
+| `BATCH_SIZE` | `1` | Per-device batch size |
+| `GRAD_ACCUM` | `16` | Gradient accumulation steps |
+| `LR` | `2e-5` | Learning rate |
+| `LOG_STEPS` | `10` | TensorBoard logging frequency |
+| `SAVE_STEPS` | `500` | Checkpoint save frequency |
+| `VAL_STEPS` | `200` | Validation frequency |
+
+### Baseline Evaluation (`run_baseline_eval.sh`)
+
+| Variable | Default | Description |
+|---|---|---|
+| `CHECKPOINT` | `outputs/baseline_ckpt/final` | Model checkpoint directory |
+| `APPS_MODE` | `test10` | App split: `test10`, `train86`, or `all` |
+| `APPS` | (empty) | Explicit app list (overrides `APPS_MODE`) |
+| `SCALEWOB_ROOT` | `env/browser_env/scalewob-env` | ScaleWoB static files directory |
+| `MAX_STEPS` | `50` | Steps per session |
+| `NUM_SESSIONS` | `3` | Sessions per app |
+| `EVAL_OUTPUT` | `outputs/baseline_eval` | Evaluation output directory |
+| `DEVICE` | `cuda` | Device for inference |
+| `TEMPERATURE` | `0.8` | Sampling temperature |
+| `TOP_P` | `0.9` | Top-p sampling |
+| `GPU_IDS` | (empty = all) | GPU ID(s) for eval |
+
+### Video Generation (`scripts/snapshots_to_mp4.py`)
+
+| Argument | Default | Description |
+|---|---|---|
+| `session_dir` | (required) | Directory containing `step_XXX_before.png` / `step_XXX_after.png` |
+| `-o` / `--output` | `<session_dir>/eval_video.mp4` | Output MP4 path |
+| `--mode` | `sequential` | Frame arrangement: `sequential`, `side_by_side`, `before_only`, `after_only` |
+| `--fps` | `2.0` | Frames per second |
+| `--codec` | `mp4v` | FourCC codec |
 
 ---
 
