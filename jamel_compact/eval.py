@@ -37,6 +37,16 @@ from PIL import Image
 from .config import CompactConfig
 from .model import JAMELCompactWrapper
 
+# F8: Linear probe for memory diagnostics
+import sys as _sys
+_repo_root = Path(__file__).resolve().parents[1]
+if str(_repo_root) not in _sys.path:
+    _sys.path.insert(0, str(_repo_root))
+try:
+    from scripts.probe_memory import LinearProbeMemory
+except ImportError:
+    LinearProbeMemory = None
+
 # ── Coverage imports (same modules as original JAMEL eval) ──
 from jamel.core.env.web.coverage import start_coverage, save_coverage
 from jamel.core.reward.web.utils import compute_monocart_coverage_reward_details
@@ -149,7 +159,7 @@ class CompactAgent:
 
         # Session state
         self._memory_states = None
-        self._confidence_states = None
+        self._variance_states = None
         self._e_prev_list = None  # v2: surprise from previous step
         self._session_step_idx = 0
         self._last_action = "noop()"
@@ -157,7 +167,7 @@ class CompactAgent:
 
     def reset_session(self):
         """Full reset — start of a new session."""
-        self._memory_states, self._confidence_states = self.model.init_memory(
+        self._memory_states, self._variance_states = self.model.init_memory(
             batch_size=1, device=self.device,
         )
         self._e_prev_list = None
@@ -257,7 +267,7 @@ class CompactAgent:
                 attention_mask=inputs.get("attention_mask"),
                 action_embed_input=action_embed_input,
                 memory_states=self._memory_states,
-                confidence_states=self._confidence_states,
+                variance_states=self._variance_states,
                 max_new_tokens=self.max_new_tokens,
                 temperature=self.temperature,
                 top_p=self.top_p,
@@ -271,7 +281,7 @@ class CompactAgent:
 
         # Update memory states
         self._memory_states = outputs["new_memory"]
-        self._confidence_states = outputs["new_confidence"]
+        self._variance_states = outputs["new_variance"]
         self._e_prev_list = outputs.get("e_list")
 
         # Decode response — batch_decode matches original JAMEL eval exactly
@@ -291,6 +301,10 @@ class CompactAgent:
             "raw_response": raw_response,
             "prompt": prompt,
         }
+
+    def get_memory_snapshot(self) -> list:
+        """Return current memory states for F8 linear probe."""
+        return self._memory_states
 
 
 # ── Evaluation loop ──
@@ -335,6 +349,24 @@ def run_eval(
     agent._freeze_memory = freeze_memory_init
     if freeze_memory_init:
         print("[eval] WARNING: --freeze-memory-init is active. Memory will NOT update during eval.")
+
+    # F8: Initialize linear probe for memory diagnostics
+    probe = None
+    if LinearProbeMemory is not None:
+        probe = LinearProbeMemory(
+            num_layers=agent.model.num_layers,
+            mem_dim=agent.model.mem_dim,
+            num_mem=agent.model.num_mem,
+            num_apps=len(apps),
+            max_steps=max_steps,
+        )
+        print(f"[eval] F8 linear probe initialized: {agent.model.num_layers} layers, "
+              f"d_mem={agent.model.mem_dim}, N_m={agent.model.num_mem}")
+    else:
+        print("[eval] F8 linear probe not available (scripts.probe_memory import failed)")
+
+    # Map app names to integer IDs for the probe
+    app_id_map = {app: i for i, app in enumerate(apps)}
 
     all_results = []
 
@@ -428,6 +460,14 @@ def run_eval(
                     think_str = result["think"]
                     raw_resp = result["raw_response"]
                     prompt_str = result["prompt"]
+
+                    # F8: Collect memory snapshot for linear probe
+                    if probe is not None:
+                        probe.add_snapshot(
+                            agent.get_memory_snapshot(),
+                            app_id=app_id_map[app],
+                            step_idx=step_idx_in_session,
+                        )
 
                     print(f"    think:  {think_str[:120]}{'...' if len(think_str) > 120 else ''}")
                     print(f"    action: {action_str}")
@@ -613,6 +653,17 @@ def run_eval(
     for result in all_results:
         print(f"  {result['app']:<20s} session {result['session_idx']}: "
               f"reward={result['total_reward']:.4f}  steps={result['num_steps']}")
+
+    # F8: Train and evaluate linear probes on collected memory snapshots
+    if probe is not None:
+        probe_results = probe.train_and_eval()
+        probe.print_results(probe_results)
+        # Save probe results
+        probe_path = output_path / "linear_probe_results.json"
+        probe_path.write_text(json.dumps(
+            {str(k): v for k, v in probe_results.items()}, indent=2,
+        ))
+        print(f"\n[eval] Linear probe results saved to {probe_path}")
 
 
 def main():

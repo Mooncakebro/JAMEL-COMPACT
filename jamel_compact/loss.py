@@ -27,7 +27,7 @@ def compute_compact_loss(
     logits: torch.Tensor,
     labels: torch.Tensor,
     memory_states: List[torch.Tensor],
-    confidence_states: List[torch.Tensor],
+    variance_states: List[torch.Tensor],
     config: Optional[CompactConfig] = None,
     loss_obs: Optional[torch.Tensor] = None,
     loss_nll: Optional[torch.Tensor] = None,
@@ -42,7 +42,7 @@ def compute_compact_loss(
         logits:            [B, N, vocab_size] — model output logits
         labels:            [B, N] — token labels (-100 for ignore)
         memory_states:     List of [B, N_m, d_mem] — updated memory per layer
-        confidence_states: List of [B, N_m] — variance states (v2: P, not C)
+        variance_states: List of [B, N_m] — variance P per layer
         config:            CompactConfig with loss weights
         loss_obs:          scalar — per-layer averaged observation MSE (from forward)
         loss_nll:          scalar — per-layer averaged Gaussian NLL (from forward)
@@ -104,10 +104,16 @@ def compute_compact_loss(
     loss_nll = loss_nll.to(device=device, dtype=dtype)
 
     # ── 4. L_mem: L2 regularization on memory states ──
+    # L_mem = (1/L) Σ_l ||M_l||²_2  — per-layer L2 norm (sum, not mean)
+    # Using sum instead of mean makes the regularizer batch-size independent:
+    # the L2 norm of the memory state scales with B, so ||M||² scales with B,
+    # but when multiplied by lambda_mem and combined with L_act (which is also
+    # ~per-sample), the relative weight stays consistent.
+    # For B=1 this is identical to the mean-based version.
     loss_mem = torch.tensor(0.0, device=device, dtype=dtype)
     L = len(memory_states)
     for M in memory_states:
-        loss_mem = loss_mem + M.pow(2).mean()
+        loss_mem = loss_mem + M.pow(2).sum()
     loss_mem = loss_mem / L
 
     # ── Total ──

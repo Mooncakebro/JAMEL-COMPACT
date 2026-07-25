@@ -122,7 +122,7 @@ def _process_chunk_step(
     device: torch.device,
     step_data: dict,
     memory_states: list,
-    confidence_states: list,
+    variance_states: list,
     e_prev_list: list = None,
 ) -> tuple:
     """Process a single step within a session chunk.
@@ -139,11 +139,11 @@ def _process_chunk_step(
                          action_input_ids, pixel_values, image_grid_thw,
                          sample_weights (optional)
         memory_states:   list of [B, N_m, d_mem] — carried from previous step
-        confidence_states: list of [B, N_m] — variance, carried from previous step
+        variance_states: list of [B, N_m] — variance P, carried from previous step
         e_prev_list:     list of [B] or None — surprise from previous step per layer
 
     Returns:
-        (loss, loss_dict, new_memory, new_confidence, e_list)
+        (loss, loss_dict, new_memory, new_variance, e_list)
     """
     input_ids = step_data["input_ids"].to(device)
     attention_mask = step_data["attention_mask"].to(device)
@@ -171,24 +171,27 @@ def _process_chunk_step(
                 h_embed, input_ids, pixel_values, image_grid_thw,
             )
 
-    # ── Detach memory states from the computation graph before passing to
-    # the model forward. This prevents BPTT (backprop through time) which
-    # would require retaining all intermediate steps' graphs and cause OOM.
-    # Instead, the FiLM-GRU learns from the per-step loss signal only —
-    # memory carries forward VALUES but not GRADIENTS.
+    # ── TBPTT-1: Detach memory states from the computation graph before
+    # passing to the model forward. This prevents full BPTT (backprop
+    # through time) which would retain all intermediate steps' graphs and
+    # cause OOM. Instead, the FiLM-GRU learns from the per-step loss signal
+    # only — memory carries forward VALUES but not GRADIENTS.
     #
-    # This is equivalent to truncated BPTT (TBPTT) with truncation length 1:
-    # each step's loss backprops only through that step's forward pass,
-    # but the memory VALUES (not gradients) carry forward across steps.
-    # This still trains the recurrent dynamics because each step sees a
-    # non-trivial memory state (not the zero-initialized state), so the
-    # inject/correct modules learn to use evolved memory.
-    mem_input = [m.detach() if isinstance(m, torch.Tensor) else m
+    # This is truncated BPTT (TBPTT) with truncation length 1: each step's
+    # loss backprops only through that step's forward pass, but the memory
+    # VALUES (not gradients) carry forward across steps. This still trains
+    # the recurrent dynamics because each step sees a non-trivial memory
+    # state (not the zero-initialized state), so the inject/correct modules
+    # learn to use evolved memory.
+    #
+    # When config.tbptt_detach=False, states are NOT detached — enabling
+    # full BPTT for ablation experiments (much higher memory cost).
+    detach = config.tbptt_detach
+    mem_input = [m.detach() if detach and isinstance(m, torch.Tensor) else m
                  for m in memory_states]
-    conf_input = [c.detach() if isinstance(c, torch.Tensor) else c
-                  for c in confidence_states]
-    # Detach e_prev (surprise values carry forward, not gradients)
-    e_prev_input = [e.detach() if isinstance(e, torch.Tensor) else e
+    var_input = [c.detach() if detach and isinstance(c, torch.Tensor) else c
+                 for c in variance_states]
+    e_prev_input = [e.detach() if detach and isinstance(e, torch.Tensor) else e
                     for e in (e_prev_list or [None] * len(memory_states))]
 
     # Get sample weights (F7: coverage-weighted SFT)
@@ -202,7 +205,7 @@ def _process_chunk_step(
         attention_mask=attention_mask,
         action_embed_input=action_embed_input,
         memory_states=mem_input,
-        confidence_states=conf_input,
+        variance_states=var_input,
         labels=labels,
         pixel_values=None,
         image_grid_thw=None,
@@ -224,15 +227,14 @@ def _process_chunk_step(
     loss_dict = {k: _to_scalar(v) for k, v in outputs["loss_dict"].items()}
 
     # Detach new memory before returning — values carry forward, not gradients
-    new_mem = [m.detach() if isinstance(m, torch.Tensor) else m
+    new_mem = [m.detach() if detach and isinstance(m, torch.Tensor) else m
                for m in outputs["new_memory"]]
-    new_conf = [c.detach() if isinstance(c, torch.Tensor) else c
-                for c in outputs["new_confidence"]]
-    # Detach e_list (surprise) for next step's predict
-    new_e_list = [e.detach() if isinstance(e, torch.Tensor) else e
+    new_var = [c.detach() if detach and isinstance(c, torch.Tensor) else c
+               for c in outputs["new_variance"]]
+    new_e_list = [e.detach() if detach and isinstance(e, torch.Tensor) else e
                   for e in outputs.get("e_list", [None] * len(new_mem))]
 
-    return loss, loss_dict, new_mem, new_conf, new_e_list
+    return loss, loss_dict, new_mem, new_var, new_e_list
 
 
 def train_one_epoch(
@@ -277,7 +279,7 @@ def train_one_epoch(
             chunk_size = batch["chunk_size"]
 
             # Initialize memory and e_prev at the start of each chunk
-            memory_states, confidence_states = raw_model.init_memory(1, device)
+            memory_states, variance_states = raw_model.init_memory(1, device)
             e_prev_list = None  # None for first step in chunk
 
             total_chunk_loss = torch.tensor(0.0, device=device, requires_grad=False)
@@ -302,10 +304,10 @@ def train_one_epoch(
                     "sample_weights": sw,
                 }
 
-                loss, loss_dict, memory_states, confidence_states, e_list = \
+                loss, loss_dict, memory_states, variance_states, e_list = \
                     _process_chunk_step(
                         model, raw_model, config, device,
-                        step_data, memory_states, confidence_states,
+                        step_data, memory_states, variance_states,
                         e_prev_list=e_prev_list,
                     )
 
@@ -340,7 +342,7 @@ def train_one_epoch(
 
             action_embed_input = get_action_embedding(action_input_ids, model, device)
             B = input_ids.shape[0]
-            memory_states, confidence_states = raw_model.init_memory(B, device)
+            memory_states, variance_states = raw_model.init_memory(B, device)
 
             # Get sample weights (F7)
             sample_weights = batch.get("sample_weights")
@@ -364,7 +366,7 @@ def train_one_epoch(
                 attention_mask=attention_mask,
                 action_embed_input=action_embed_input,
                 memory_states=memory_states,
-                confidence_states=confidence_states,
+                variance_states=variance_states,
                 labels=labels,
                 pixel_values=None,
                 image_grid_thw=None,
@@ -487,7 +489,7 @@ def validate(
             if use_chunking:
                 # ── Session-chunked validation ──
                 chunk_size = batch["chunk_size"]
-                memory_states, confidence_states = raw_model.init_memory(1, device)
+                memory_states, variance_states = raw_model.init_memory(1, device)
 
                 chunk_loss = 0.0
                 chunk_action = 0.0
@@ -507,10 +509,10 @@ def validate(
                         "sample_weights": batch.get("sample_weights", [None] * chunk_size)[s],
                     }
 
-                    loss, loss_dict, memory_states, confidence_states, e_list = \
+                    loss, loss_dict, memory_states, variance_states, e_list = \
                         _process_chunk_step(
                             model, raw_model, config, device,
-                            step_data, memory_states, confidence_states,
+                            step_data, memory_states, variance_states,
                             e_prev_list=e_prev_list,
                         )
                     e_prev_list = e_list
@@ -547,7 +549,7 @@ def validate(
 
                 action_embed_input = get_action_embedding(action_input_ids, model, device)
                 B = input_ids.shape[0]
-                memory_states, confidence_states = raw_model.init_memory(B, device)
+                memory_states, variance_states = raw_model.init_memory(B, device)
 
                 # Get sample weights (F7)
                 sample_weights = batch.get("sample_weights")
@@ -570,7 +572,7 @@ def validate(
                     attention_mask=attention_mask,
                     action_embed_input=action_embed_input,
                     memory_states=memory_states,
-                    confidence_states=confidence_states,
+                    variance_states=variance_states,
                     labels=labels,
                     pixel_values=None,
                     image_grid_thw=None,

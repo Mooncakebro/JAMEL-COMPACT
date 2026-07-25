@@ -684,7 +684,7 @@ class JAMELCompactWrapper(nn.Module):
     def init_memory(self, batch_size: int, device: torch.device):
         """Initialize memory states and variance for t=0.
 
-        v2: Returns (memory_states, variance_states) instead of (memory_states, confidence_states).
+        v2: Returns (memory_states, variance_states) — variance P, not confidence C.
         Variance P_0 = 0.5 per slot.
         Also initializes e_prev (surprise) to None for each layer.
         """
@@ -707,7 +707,7 @@ class JAMELCompactWrapper(nn.Module):
         attention_mask: torch.Tensor,
         action_embed_input: torch.Tensor,
         memory_states: List[torch.Tensor],
-        confidence_states: List[torch.Tensor],
+        variance_states: List[torch.Tensor],
         labels: Optional[torch.Tensor] = None,
         pixel_values: Optional[torch.Tensor] = None,
         image_grid_thw: Optional[torch.Tensor] = None,
@@ -732,7 +732,7 @@ class JAMELCompactWrapper(nn.Module):
             attention_mask:     [B, N]
             action_embed_input: [B, d] — raw action embedding (control variable)
             memory_states:      List of [B, N_m, d_mem]
-            confidence_states:  List of [B, N_m] — variance states (v2: renamed but same API)
+            variance_states:   List of [B, N_m] — variance P per layer
             labels:             [B, N] — token labels for loss (optional)
             pixel_values:       [B, C, H, W] — processed image tensor (optional)
             image_grid_thw:     [B, 3] — image grid dimensions (optional)
@@ -744,7 +744,7 @@ class JAMELCompactWrapper(nn.Module):
             sample_weights:     [B] — per-sample loss weights (F7)
 
         Returns:
-            dict with: logits, new_memory, new_confidence, loss (if labels),
+            dict with: logits, new_memory, new_variance, loss (if labels),
                        loss_dict, e_list (surprise for next step)
         """
         B = input_ids.shape[0]
@@ -791,7 +791,7 @@ class JAMELCompactWrapper(nn.Module):
             e_prev_list = [None] * len(self.side_memories)
 
         # ── Process through each layer ──
-        new_memory, new_confidence = [], []
+        new_memory, new_variance = [], []
         e_list = []  # surprise per layer for next step
         loss_obs_total = torch.tensor(0.0, device=device, dtype=h.dtype)
         loss_nll_total = torch.tensor(0.0, device=device, dtype=h.dtype)
@@ -800,7 +800,7 @@ class JAMELCompactWrapper(nn.Module):
         for l, (layer, sm) in enumerate(zip(decoder_layers, self.side_memories)):
             # 4a. Memory Predict (FiLM-GRU + variance predict)
             m_hat, p_hat = sm.predict(
-                memory_states[l], confidence_states[l], action_embed,
+                memory_states[l], variance_states[l], action_embed,
                 e_prev=e_prev_list[l],
             )
 
@@ -840,7 +840,7 @@ class JAMELCompactWrapper(nn.Module):
             h = sm.inject(h_layer, m_new)
 
             new_memory.append(m_new)
-            new_confidence.append(p_new)
+            new_variance.append(p_new)
             e_list.append(e)
             loss_obs_total = loss_obs_total + loss_obs_l
             loss_nll_total = loss_nll_total + loss_nll_l
@@ -854,7 +854,7 @@ class JAMELCompactWrapper(nn.Module):
         result = {
             "logits": logits,
             "new_memory": new_memory,
-            "new_confidence": new_confidence,
+            "new_variance": new_variance,
             "e_list": e_list,  # surprise for next step
         }
 
@@ -865,7 +865,7 @@ class JAMELCompactWrapper(nn.Module):
                 logits=logits,
                 labels=labels,
                 memory_states=new_memory,
-                confidence_states=new_confidence,
+                variance_states=new_variance,
                 config=self.config,
                 loss_obs=loss_obs_total,
                 loss_nll=loss_nll_total,
@@ -885,7 +885,7 @@ class JAMELCompactWrapper(nn.Module):
         attention_mask: torch.Tensor,
         action_embed_input: torch.Tensor,
         memory_states: List[torch.Tensor],
-        confidence_states: List[torch.Tensor],
+        variance_states: List[torch.Tensor],
         max_new_tokens: int = 256,
         temperature: float = 0.8,
         top_p: float = 0.9,
@@ -912,6 +912,11 @@ class JAMELCompactWrapper(nn.Module):
         device = input_ids.device
 
         # ── 1. Memory update: one forward pass on the prompt ──
+        # We use a DynamicCache so the prompt's K/V states are captured
+        # for incremental generation in step 2.
+        from transformers import DynamicCache
+        cache = DynamicCache()
+
         action_embed = self.action_embed(action_embed_input)
         decoder_layers = self._get_decoder_layers()
         embed_layer = self._get_input_embeddings()
@@ -938,13 +943,16 @@ class JAMELCompactWrapper(nn.Module):
             e_prev_list = [None] * len(self.side_memories)
 
         # ── Process prompt through all layers with memory ──
-        new_memory, new_confidence = [], []
+        # Each layer receives the memory-injected h from the previous layer
+        # and populates the DynamicCache with its K/V projections.
+        new_memory, new_variance = [], []
         e_list = []
         for l, (layer, sm) in enumerate(zip(decoder_layers, self.side_memories)):
-            m_hat, p_hat = sm.predict(memory_states[l], confidence_states[l], action_embed,
+            m_hat, p_hat = sm.predict(memory_states[l], variance_states[l], action_embed,
                                       e_prev=e_prev_list[l])
             layer_output = layer(h, attention_mask=attn_mask_4d,
-                                position_embeddings=position_embeddings)
+                                position_embeddings=position_embeddings,
+                                past_key_values=cache, use_cache=True)
             h_layer = layer_output[0] if isinstance(layer_output, tuple) else layer_output
 
             # DeepStack injection
@@ -961,31 +969,28 @@ class JAMELCompactWrapper(nn.Module):
             m_new, p_new, e, _, _ = sm.correct(m_hat, p_hat, z_down)
             h = sm.inject(h_layer, m_new)
             new_memory.append(m_new)
-            new_confidence.append(p_new)
+            new_variance.append(p_new)
             e_list.append(e)
 
         # If freeze_memory (F5 ablation), don't write back new memory
         if freeze_memory:
             new_memory = memory_states
-            new_confidence = confidence_states
+            new_variance = variance_states
 
         # ── 2. Token generation ──
-        # F5: If memory_conditioned_generate is enabled, use the memory-injected
-        # hidden states h for a greedy/sampling loop. This is the fallback
-        # approach (slower but correct) — we compute logits from h and sample
-        # token-by-token, which ensures generation sees memory-injected states.
+        # F5: If memory_conditioned_generate is enabled, we use the
+        # memory-injected hidden states h from the prompt pass to get the
+        # first-token logits, then generate subsequent tokens with a
+        # DynamicCache that accumulates KV states across steps.
         #
-        # The KV-cache prefill approach requires assembling a DynamicCache from
-        # per-layer (key, value) tuples, which is architecture-specific and
-        # fragile across transformers versions. The per-token loop is correct
-        # and only slightly slower for 256 tokens.
+        # During the prompt pass above, each decoder layer processed the
+        # full prompt h. We capture a DynamicCache from that pass so that
+        # each subsequently generated token attends to ALL preceding tokens
+        # (prompt + previously generated) — not just itself.
         if self.config.memory_conditioned_generate:
-            # F5: Greedy/sampling loop using the wrapper's own forward logic
-            # The memory-injected hidden states h from the prompt pass are
-            # the starting point. We sample one token at a time.
             generated_ids = self._generate_from_hidden_states(
                 h, attention_mask, max_new_tokens, temperature, top_p,
-                position_embeddings, attn_mask_4d,
+                position_embeddings, attn_mask_4d, cache,
             )
         else:
             # Fallback: v1 approach — base llm.generate() on raw prompt
@@ -1010,7 +1015,7 @@ class JAMELCompactWrapper(nn.Module):
         return {
             "generated_ids": generated_ids,
             "new_memory": new_memory,
-            "new_confidence": new_confidence,
+            "new_variance": new_variance,
             "e_list": e_list,
         }
 
@@ -1024,71 +1029,73 @@ class JAMELCompactWrapper(nn.Module):
         top_p: float,
         position_embeddings: Optional[Tuple],
         attn_mask_4d: torch.Tensor,
+        cache=None,
     ) -> torch.Tensor:
-        """F5: Generate tokens starting from memory-injected hidden states.
+        """F5: Generate tokens using the KV-cache from the prompt pass.
 
-        Uses the LM head to get logits from h, samples the next token,
-        appends it, and re-runs the decoder layers for the new token.
-        This is a simple greedy/sampling autoregressive loop that
-        preserves memory influence on generation.
+        The prompt pass in generate() already ran h through all decoder
+        layers WITH memory injection AND populated a DynamicCache. We use
+        the last position's logits from the memory-injected h to sample
+        the first token, then generate subsequent tokens one at a time,
+        each attending to the full accumulated context via the cache.
+
+        Args:
+            h:                  [B, prompt_len, d] — memory-injected final hidden states
+            attention_mask:     [B, prompt_len] — prompt padding mask
+            max_new_tokens:     max tokens to generate
+            temperature:        sampling temperature (0 = greedy)
+            top_p:              nucleus sampling threshold
+            position_embeddings: (cos, sin) for the prompt positions
+            attn_mask_4d:       [B, 1, prompt_len, prompt_len] — prompt causal mask
+            cache:              DynamicCache populated during the prompt pass
         """
         B = h.shape[0]
         device = h.device
         llm_dtype = h.dtype
+        prompt_len = h.shape[1]
         generated = []
+        decoder_layers = self._get_decoder_layers()
+        embed_layer = self._get_input_embeddings()
+        lm_head = self._get_lm_head()
+        rotary_emb = self._find_rotary_emb()
 
-        # Current sequence length
-        cur_len = h.shape[1]
-
-        # Get the last token's hidden state for first prediction
-        logits = self._get_lm_head()(h[:, -1:, :])  # [B, 1, vocab]
-        next_token = self._sample_token(logits[:, -1, :], temperature, top_p)  # [B]
+        # ── Step 1: First token from memory-injected h ──
+        logits = lm_head(h[:, -1:, :])  # [B, 1, vocab]
+        next_token = self._sample_token(logits[:, -1, :], temperature, top_p)
         generated.append(next_token)
 
-        decoder_layers = self._get_decoder_layers()
+        # ── Step 2: Generate remaining tokens using the cache ──
+        cur_len = prompt_len
 
         for _ in range(max_new_tokens - 1):
             # Embed the new token
-            embed_layer = self._get_input_embeddings()
             new_embed = embed_layer(next_token.unsqueeze(-1))  # [B, 1, d]
 
-            # Extend attention mask
-            new_attn_mask = torch.cat([
-                attention_mask,
-                torch.ones(B, 1, device=device, dtype=attention_mask.dtype),
-            ], dim=1)
-            new_attn_mask_4d = self._build_causal_attention_mask(
-                new_attn_mask, llm_dtype,
-            )
+            # Position embeddings for the new position
+            new_pos_emb = None
+            if position_embeddings is not None and rotary_emb is not None:
+                pos_ids = torch.tensor([[cur_len]], device=device, dtype=torch.long)
+                pos_ids = pos_ids.expand(B, -1)
+                cos_new, sin_new = rotary_emb(new_embed, pos_ids)
+                new_pos_emb = (cos_new.to(llm_dtype), sin_new.to(llm_dtype))
 
-            # Extend position embeddings for the new position
-            new_pos_id = cur_len
-            if position_embeddings is not None:
-                rotary_emb = self._find_rotary_emb()
-                if rotary_emb is not None:
-                    pos_ids = torch.tensor([[new_pos_id]], device=device, dtype=torch.long)
-                    pos_ids = pos_ids.expand(B, -1)
-                    cos_new, sin_new = rotary_emb(new_embed, pos_ids)
-                    new_pos_emb = (cos_new.to(llm_dtype), sin_new.to(llm_dtype))
-                else:
-                    new_pos_emb = None
-            else:
-                new_pos_emb = None
-
-            # Run new token through all decoder layers (NO memory update during generation)
+            # Run new token through all layers with cache (no memory update
+            # during generation — memory was already updated in the prompt pass)
             h_new = new_embed
-            for l, layer in enumerate(decoder_layers):
+            for layer in decoder_layers:
                 layer_output = layer(
                     h_new,
-                    attention_mask=new_attn_mask_4d[:, :, -1:, :].expand(B, 1, -1, cur_len + 1) if new_attn_mask_4d.dim() == 4 else new_attn_mask_4d,
+                    attention_mask=None,  # single token, cache handles history
                     position_embeddings=new_pos_emb,
+                    past_key_values=cache,
+                    use_cache=True,
                 )
                 h_new = layer_output[0] if isinstance(layer_output, tuple) else layer_output
 
             cur_len += 1
 
             # Get logits and sample
-            logits = self._get_lm_head()(h_new[:, -1:, :])  # [B, 1, vocab]
+            logits = lm_head(h_new[:, -1:, :])  # [B, 1, vocab]
             next_token = self._sample_token(logits[:, -1, :], temperature, top_p)
             generated.append(next_token)
 
