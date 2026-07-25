@@ -20,6 +20,9 @@ class CompactConfig:
     freeze_base: bool = False         # freeze pretrained LLM weights
     num_act_tokens: int = 1           # action tokens in input sequence
 
+    # ── Model version (for checkpoint compatibility) ──
+    model_version: int = 2            # v1=1, v2=2 (U1/U2 change side_memories.pt keys)
+
     # ── Hierarchical hyperparameters ──
     lambda_shallow: float = 0.70
     lambda_mid: float = 0.85
@@ -27,7 +30,21 @@ class CompactConfig:
     inject_shallow: float = 0.8
     inject_mid: float = 0.5
     inject_deep: float = 0.3
-    alpha_confidence: float = 0.1     # learning rate for confidence update
+    alpha_confidence: float = 0.1     # learning rate for confidence update (v1 only)
+
+    # ── v2: observation / Kalman / injection ──
+    num_obs_tokens: int = 4           # k learned latent queries for observation pooling (U1)
+    gamma_e: float = 1.0              # surprise inflation factor for variance predict (U2)
+    lambda_obs: float = 0.1           # weight for observation-prediction loss L_obs (U3)
+    lambda_nll: float = 0.1           # weight for Gaussian NLL loss L_nll (U2; replaces lambda_uncert)
+    obs_loss: str = "mse"             # "mse" or "infonce" for L_obs variant (U3)
+    memory_conditioned_generate: bool = True  # F5: use KV-cache prefill for generation
+
+    # ── v2: U4 experiment flags (all default off) ──
+    shared_memory: bool = False       # U4a: single shared memory across layers
+    slow_memory: bool = False         # U4b: two-timescale EMA track
+    slow_memory_eta: float = 0.05     # U4b: EMA update rate
+    sparse_write_k: int = 0           # U4c: top-k sparse writes (0 = off)
 
     # ── Training ──
     output_dir: str = "outputs/compact_ckpt"
@@ -44,11 +61,13 @@ class CompactConfig:
     log_steps: int = 10
     save_steps: int = 500
     val_steps: int = 200
+    tbptt_detach: bool = True         # F6: detach memory between steps (TBPTT-1)
+    coverage_weight_eta: float = 0.0  # F7: 0 = off; >0 weights high-novelty samples
 
     # ── Loss weights ──
     lambda_mem: float = 0.001        # memory regularization weight
-    lambda_uncert: float = 0.1       # uncertainty calibration weight
-    beta_entropy: float = 0.01        # entropy regularization in mem loss
+    lambda_uncert: float = 0.1       # uncertainty calibration weight (v1: MSE; v2: NLL)
+    beta_entropy: float = 0.01        # entropy regularization in mem loss (v1 only)
 
     # ── Data ──
     max_length: int = 8192
@@ -56,7 +75,7 @@ class CompactConfig:
     val_file: str = ""
     val_ratio: float = 0.05
     image_resize: tuple = (640, 360)  # WEB_MODEL_IMAGE_SIZE
-    chunk_size: int = 1  # session-chunked training: 1 = single-step (original), >1 = multi-step
+    chunk_size: int = 8  # F6: session-chunked training default (was 1 in v1)
 
     # ── Eval ──
     eval_output: str = "outputs/compact_eval"
@@ -66,6 +85,7 @@ class CompactConfig:
     top_p: float = 0.9
     scalewob_root: str = "env/browser_env/scalewob-env"
     apps_mode: str = "test10"
+    freeze_memory_init: bool = False  # F5 ablation: never write new_memory back to session state
 
     # ── TensorBoard ──
     tb_log_dir: str = "outputs/compact_tb"

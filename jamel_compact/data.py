@@ -86,6 +86,7 @@ class CompactDataset(Dataset):
         response_key: str = "response",
         image_key: str = "before_screenshot",  # matches ExplorerSFT-ReAct parquet
         action_key: str = "action",
+        coverage_weight_eta: float = 0.0,
     ):
         if not isinstance(parquet_files, list):
             parquet_files = [parquet_files]
@@ -99,6 +100,7 @@ class CompactDataset(Dataset):
         self.response_key = response_key
         self.image_key = image_key
         self.action_key = action_key
+        self._coverage_weight_eta = coverage_weight_eta  # F7: coverage-weighted SFT
 
         self._read_files()
         self._validate_and_filter()
@@ -106,7 +108,8 @@ class CompactDataset(Dataset):
     def _read_files(self):
         # Only load columns needed for training to save memory
         needed_cols = [self.prompt_key, self.response_key, self.image_key,
-                      self.action_key, "session_id", "step_idx", "target_app"]
+                      self.action_key, "session_id", "step_idx", "target_app",
+                      "coverage_delta_score"]
         frames = []
         for p in self.parquet_files:
             try:
@@ -121,6 +124,7 @@ class CompactDataset(Dataset):
 
         Uses fast char-based estimation (chars/3 ≈ tokens for English) instead
         of tokenizing every row, which would be very slow for large datasets.
+        Also reads coverage_delta_score for F7 coverage-weighted SFT.
         """
         total = len(self.dataframe)
         valid_indices = []
@@ -129,6 +133,9 @@ class CompactDataset(Dataset):
         # Image tokens: ~1175 for Qwen2.5-VL at 640×360
         CHAT_TEMPLATE_OVERHEAD = 200
         IMAGE_TOKEN_OVERHEAD = 1175
+
+        # Check if coverage_delta_score column exists (F7)
+        self._has_coverage = "coverage_delta_score" in self.dataframe.columns
 
         for i in range(total):
             row = self.dataframe.iloc[i]
@@ -222,17 +229,37 @@ class CompactDataset(Dataset):
         prompt_length = prompt_inputs["input_ids"].shape[-1]
 
         # ── Truncate if needed ──
-        if input_ids.shape[0] > self.max_length:
-            input_ids = input_ids[:self.max_length]
-            attention_mask = attention_mask[:self.max_length]
+        # F2: Left-truncate the PROMPT (keep the full response), matching
+        # eval.py which also truncates from the left.  Right-truncation
+        # (v1) can cut the response — the supervised signal — losing labels.
+        full_len = input_ids.shape[0]
+        if full_len > self.max_length:
+            excess = full_len - self.max_length
+            # Only truncate from the prompt portion; if the response alone
+            # exceeds max_length, the sample should be dropped.
+            if excess >= prompt_length:
+                # Response alone doesn't fit — mark for dropping
+                return None
+            # Left-truncate prompt by `excess` tokens, keep all response tokens
+            input_ids = input_ids[excess:]
+            attention_mask = attention_mask[excess:]
+            prompt_length = prompt_length - excess
+            # F2: If the surviving prompt is shorter than 64 tokens, drop
+            # the sample — too little context for meaningful memory updates.
+            if prompt_length < 64:
+                return None
 
         # ── Labels: mask prompt with -100 ──
         # Clamp prompt_length to max_length - 1 so that at least 1 token
         # has a valid label (otherwise all-−100 → CrossEntropyLoss returns
         # NaN, which corrupts all model weights in one step).
         effective_prompt_len = min(prompt_length, input_ids.shape[0] - 1)
+        # F2: Assert at least one non-(-100) label exists
         labels = input_ids.clone()
         labels[:effective_prompt_len] = -100
+        assert (labels != -100).any(), \
+            f"All labels are -100 after truncation (prompt_len={prompt_length}, " \
+            f"seq_len={input_ids.shape[0]})"
 
         # ── Action embedding input ──
         action_tokens = self.tokenizer.encode(
@@ -260,6 +287,12 @@ class CompactDataset(Dataset):
             if image_grid_thw.dim() == 3 and image_grid_thw.shape[0] == 1:
                 image_grid_thw = image_grid_thw.squeeze(0)
 
+        # ── F7: Coverage-weighted sample weight ──
+        sample_weight = 1.0
+        if self._has_coverage:
+            cov_delta = float(row.get("coverage_delta_score", 0) or 0)
+            sample_weight = 1.0 + self._coverage_weight_eta * max(cov_delta, 0.0)
+
         return {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
@@ -270,11 +303,27 @@ class CompactDataset(Dataset):
             "session_id": str(row.get("session_id", "")),
             "step_idx": int(row.get("step_idx", 0)),
             "target_app": str(row.get("target_app", "")),
+            "sample_weight": sample_weight,
         }
 
 
 def collate_fn(batch: list[dict], pad_token_id: int = 0) -> dict:
-    """Collate function for CompactDataset. Pads sequences to max length in batch."""
+    """Collate function for CompactDataset. Pads sequences to max length in batch.
+
+    F2: Filters out None samples (dropped during truncation) and logs drop count.
+    F7: Carries sample_weight for coverage-weighted SFT.
+    """
+    # F2: Filter out None samples (response didn't fit in max_length)
+    valid_batch = [item for item in batch if item is not None]
+    dropped = len(batch) - len(valid_batch)
+    if dropped > 0:
+        # Don't print here (would spam logs); caller can check batch size
+        pass
+    if not valid_batch:
+        # Return an empty batch marker — caller should skip
+        return None
+    batch = valid_batch
+
     max_len = max(item["input_ids"].shape[0] for item in batch)
     max_action_len = max(item["action_input_ids"].shape[0] for item in batch)
 
@@ -282,6 +331,7 @@ def collate_fn(batch: list[dict], pad_token_id: int = 0) -> dict:
     attention_masks = []
     labels = []
     action_inputs = []
+    sample_weights = []
 
     for item in batch:
         seq_len = item["input_ids"].shape[0]
@@ -306,12 +356,14 @@ def collate_fn(batch: list[dict], pad_token_id: int = 0) -> dict:
             item["action_input_ids"],
             torch.full((act_pad,), pad_token_id, dtype=torch.long),
         ]))
+        sample_weights.append(item.get("sample_weight", 1.0))
 
     result = {
         "input_ids": torch.stack(input_ids),
         "attention_mask": torch.stack(attention_masks),
         "labels": torch.stack(labels),
         "action_input_ids": torch.stack(action_inputs),
+        "sample_weights": torch.tensor(sample_weights, dtype=torch.float32),
         "session_ids": [item["session_id"] for item in batch],
         "step_indices": [item["step_idx"] for item in batch],
     }
@@ -360,6 +412,11 @@ def session_collate_fn(batch, pad_token_id: int = 0) -> dict:
     else:
         chunk = batch
 
+    # F2: Filter out None samples (dropped during truncation)
+    chunk = [item for item in chunk if item is not None]
+    if not chunk:
+        return None
+
     max_len = max(item["input_ids"].shape[0] for item in chunk)
     max_action_len = max(item["action_input_ids"].shape[0] for item in chunk)
 
@@ -369,6 +426,7 @@ def session_collate_fn(batch, pad_token_id: int = 0) -> dict:
     action_inputs_list = []
     pixel_values_list = []
     grid_thws_list = []
+    sample_weights_list = []
 
     for item in chunk:
         seq_len = item["input_ids"].shape[0]
@@ -398,6 +456,7 @@ def session_collate_fn(batch, pad_token_id: int = 0) -> dict:
         pixel_values_list.append(pv)
         gt = item.get("image_grid_thw")
         grid_thws_list.append(gt)
+        sample_weights_list.append(item.get("sample_weight", 1.0))
 
     # Stack per-step tensors: each becomes [1, N] (single sample per step)
     # so the training loop can process one step at a time with B=1
@@ -408,6 +467,7 @@ def session_collate_fn(batch, pad_token_id: int = 0) -> dict:
         "action_input_ids": [ai.unsqueeze(0) for ai in action_inputs_list],
         "pixel_values": pixel_values_list,  # list of [num_patches, dim] or None
         "image_grid_thw": grid_thws_list,    # list of [num_images, 3] or None
+        "sample_weights": torch.tensor(sample_weights_list, dtype=torch.float32),
         "session_ids": [item["session_id"] for item in chunk],
         "step_indices": [item["step_idx"] for item in chunk],
         "chunk_size": len(chunk),
@@ -440,6 +500,7 @@ class SessionChunkDataset(Dataset):
         response_key: str = "response",
         image_key: str = "before_screenshot",
         action_key: str = "action",
+        coverage_weight_eta: float = 0.0,
     ):
         self.chunk_size = chunk_size
         self.prompt_key = prompt_key
@@ -471,6 +532,8 @@ class SessionChunkDataset(Dataset):
                 image_key=image_key,
                 action_key=action_key,
             )
+        # F7: propagate coverage weight eta to the base dataset
+        self._base._coverage_weight_eta = coverage_weight_eta
         self.dataframe = self._base.dataframe
         self._build_chunks()
 

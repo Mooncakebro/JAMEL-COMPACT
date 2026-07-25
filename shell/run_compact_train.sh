@@ -40,7 +40,7 @@ LOG_STEPS=${LOG_STEPS:-10}
 SAVE_STEPS=${SAVE_STEPS:-500}
 VAL_STEPS=${VAL_STEPS:-200}
 GPU_IDS=${GPU_IDS:-}              # e.g. "0" or "0,1,2" or "" (all)
-CHUNK_SIZE=${CHUNK_SIZE:-1}         # 1 = single-step, >1 = session-chunked
+CHUNK_SIZE=${CHUNK_SIZE:-8}          # 1 = single-step, >1 = session-chunked (v2 default: 8)
 
 if [[ ! -f "$TRAIN_FILE" ]]; then
     echo "ERROR: TRAIN_FILE not found: $TRAIN_FILE" >&2

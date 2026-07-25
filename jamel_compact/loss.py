@@ -1,10 +1,17 @@
 """
-Loss functions for JAMEL-COMPACT.
+Loss functions for JAMEL-COMPACT v2.
 
-Three-term loss:
-  1. Action loss (Cross-Entropy) — teach the agent to predict correct actions
-  2. Memory regularization — prevent memory explosion and confidence saturation
-  3. Uncertainty calibration — make confidence reflect actual match quality
+Four-term loss:
+  1. L_act  — Coverage-weighted Cross-Entropy (F7: sample_weights from coverage delta)
+  2. L_obs  — Observation prediction MSE (U3: obs_model predicts z_target)
+  3. L_nll  — Gaussian NLL for variance calibration (U2: calibrates R_psi)
+  4. L_mem  — L2 regularization on memory states
+
+Changes from v1:
+  - Removed: Bernoulli entropy (was for pinned confidence C, not applicable to variance P)
+  - Removed: Uncertainty calibration MSE (replaced by L_nll which calibrates R directly)
+  - Added:   Coverage-weighted CE (F7) — per-sample weights from coverage delta
+  - Added:   L_obs and L_nll collected per-layer from forward (U2/U3)
 """
 from __future__ import annotations
 
@@ -22,20 +29,24 @@ def compute_compact_loss(
     memory_states: List[torch.Tensor],
     confidence_states: List[torch.Tensor],
     config: Optional[CompactConfig] = None,
-    predicted_memory: Optional[List[torch.Tensor]] = None,
-    observation_feat: Optional[List[torch.Tensor]] = None,
+    loss_obs: Optional[torch.Tensor] = None,
+    loss_nll: Optional[torch.Tensor] = None,
+    sample_weights: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, dict]:
     """
-    Compute the JAMEL-COMPACT total loss.
+    Compute the JAMEL-COMPACT v2 total loss.
+
+    L_total = L_act + lambda_obs * L_obs + lambda_nll * L_nll + lambda_mem * L_mem
 
     Args:
         logits:            [B, N, vocab_size] — model output logits
         labels:            [B, N] — token labels (-100 for ignore)
         memory_states:     List of [B, N_m, d_mem] — updated memory per layer
-        confidence_states: List of [B, N_m] — updated confidence per layer
+        confidence_states: List of [B, N_m] — variance states (v2: P, not C)
         config:            CompactConfig with loss weights
-        predicted_memory:  List of [B, N_m, d_mem] — M_hat before KF (optional)
-        observation_feat:  List of [B, d] — Z_t per layer (optional)
+        loss_obs:          scalar — per-layer averaged observation MSE (from forward)
+        loss_nll:          scalar — per-layer averaged Gaussian NLL (from forward)
+        sample_weights:    [B] — per-sample loss weights (F7: 1 + eta * max(cov_delta, 0))
 
     Returns:
         (total_loss, loss_dict)
@@ -43,77 +54,77 @@ def compute_compact_loss(
     if config is None:
         config = CompactConfig()
 
-    # ── 1. Action loss (Cross-Entropy) ──
+    device = logits.device
+    dtype = logits.dtype
+
+    # ── 1. L_act: Coverage-weighted Cross-Entropy (F7) ──
     # Shift labels: predict token t+1 from token t
     shift_logits = logits[:, :-1, :].contiguous()
     shift_labels = labels[:, 1:].contiguous()
-    loss_action = F.cross_entropy(
-        shift_logits.view(-1, shift_logits.size(-1)),
-        shift_labels.view(-1),
-        ignore_index=-100,
-    )
 
-    # ── 2. Memory regularization ──
-    loss_mem_l2 = 0.0
-    loss_mem_entropy = 0.0
-    eps = 1e-8
+    if sample_weights is not None:
+        # F7: Per-sample weighted CE
+        # Compute per-sample CE (reduction='none', then mean over valid tokens)
+        ce_per_token = F.cross_entropy(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1),
+            ignore_index=-100,
+            reduction='none',
+        ).view(shift_labels.shape)  # [B, N-1]
+
+        # Mask: valid labels (not -100)
+        valid_mask = (shift_labels != -100).float()  # [B, N-1]
+        # Per-sample sum / count
+        ce_sum = ce_per_token.sum(dim=1)  # [B]
+        valid_count = valid_mask.sum(dim=1).clamp(min=1)  # [B]
+        ce_per_sample = ce_sum / valid_count  # [B]
+
+        # F7: Unweighted CE (for logging — compare against weighted)
+        loss_action_unweighted = ce_per_sample.mean()
+
+        # Apply sample weights
+        weights = sample_weights.to(device=device, dtype=dtype)
+        loss_action = (ce_per_sample * weights).sum() / weights.sum().clamp(min=1)
+    else:
+        loss_action = F.cross_entropy(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1),
+            ignore_index=-100,
+        )
+        loss_action_unweighted = loss_action.detach()
+
+    # ── 2. L_obs: Observation prediction MSE (U3) ──
+    if loss_obs is None:
+        loss_obs = torch.tensor(0.0, device=device, dtype=dtype)
+    loss_obs = loss_obs.to(device=device, dtype=dtype)
+
+    # ── 3. L_nll: Gaussian NLL for variance calibration (U2) ──
+    if loss_nll is None:
+        loss_nll = torch.tensor(0.0, device=device, dtype=dtype)
+    loss_nll = loss_nll.to(device=device, dtype=dtype)
+
+    # ── 4. L_mem: L2 regularization on memory states ──
+    loss_mem = torch.tensor(0.0, device=device, dtype=dtype)
     L = len(memory_states)
-
-    for M, C in zip(memory_states, confidence_states):
-        # L2: prevent memory values from exploding
-        loss_mem_l2 += M.pow(2).mean()
-        # Bernoulli Entropy: prevent C from saturating at 0 or 1
-        entropy = -(C * torch.log(C + eps) + (1 - C) * torch.log(1 - C + eps))
-        loss_mem_entropy += entropy.mean()
-
-    loss_mem_l2 = loss_mem_l2 / L
-    loss_mem_entropy = loss_mem_entropy / L
-    loss_mem = loss_mem_l2 + config.beta_entropy * loss_mem_entropy
-
-    # ── 3. Uncertainty calibration ──
-    # If predicted_memory and observation_feat are available, compute per-token
-    # MSE between confidence C and actual observation-to-prediction match.
-    loss_uncert = torch.tensor(0.0, device=logits.device, dtype=logits.dtype)
-    if predicted_memory is not None and observation_feat is not None:
-        uncert_count = 0
-        for l_idx, (C, M_hat, Z) in enumerate(
-            zip(confidence_states, predicted_memory, observation_feat)
-        ):
-            # Z: [B, d], M_hat: [B, N_m, d_mem]
-            # Dimensions may differ (d vs d_mem) — use mean-pooled M_hat
-            # to match Z's dimension for cosine similarity
-            m_hat_pooled = M_hat.mean(dim=1)  # [B, d_mem]
-
-            # If dimensions don't match, truncate or pad to min dim
-            min_dim = min(Z.shape[-1], m_hat_pooled.shape[-1])
-            z_proj = Z[..., :min_dim]
-            m_proj = m_hat_pooled[..., :min_dim]
-
-            z_norm = F.normalize(z_proj, dim=-1)
-            m_norm = F.normalize(m_proj, dim=-1)
-            match = (z_norm * m_norm).sum(dim=-1).clamp(0, 1)  # [B]
-
-            # C is [B, N_m] — mean over N_m to get [B]
-            c_mean = C.mean(dim=-1)  # [B]
-            loss_uncert = loss_uncert + F.mse_loss(c_mean, match.detach())
-            uncert_count += 1
-
-        if uncert_count > 0:
-            loss_uncert = loss_uncert / uncert_count
+    for M in memory_states:
+        loss_mem = loss_mem + M.pow(2).mean()
+    loss_mem = loss_mem / L
 
     # ── Total ──
     loss_total = (
         loss_action
+        + config.lambda_obs * loss_obs
+        + config.lambda_nll * loss_nll
         + config.lambda_mem * loss_mem
-        + config.lambda_uncert * loss_uncert
     )
 
     loss_dict = {
         "total": loss_total.detach(),
         "action": loss_action.detach(),
-        "mem_l2": loss_mem_l2.detach() if isinstance(loss_mem_l2, torch.Tensor) else torch.tensor(float(loss_mem_l2), device=logits.device, dtype=logits.dtype),
-        "mem_entropy": loss_mem_entropy.detach() if isinstance(loss_mem_entropy, torch.Tensor) else torch.tensor(float(loss_mem_entropy), device=logits.device, dtype=logits.dtype),
-        "uncert": loss_uncert.detach(),
+        "action_unweighted": loss_action_unweighted.detach(),
+        "obs": loss_obs.detach(),
+        "nll": loss_nll.detach(),
+        "mem_l2": loss_mem.detach(),
     }
 
     return loss_total, loss_dict

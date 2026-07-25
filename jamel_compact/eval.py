@@ -150,14 +150,17 @@ class CompactAgent:
         # Session state
         self._memory_states = None
         self._confidence_states = None
+        self._e_prev_list = None  # v2: surprise from previous step
         self._session_step_idx = 0
         self._last_action = "noop()"
+        self._freeze_memory = False  # set by --freeze-memory-init flag
 
     def reset_session(self):
         """Full reset — start of a new session."""
         self._memory_states, self._confidence_states = self.model.init_memory(
             batch_size=1, device=self.device,
         )
+        self._e_prev_list = None
         self._session_step_idx = 0
         self._last_action = "noop()"
 
@@ -260,6 +263,8 @@ class CompactAgent:
                 top_p=self.top_p,
                 pixel_values=inputs.get("pixel_values"),
                 image_grid_thw=inputs.get("image_grid_thw"),
+                e_prev_list=self._e_prev_list,
+                freeze_memory=self._freeze_memory,
             )
         finally:
             _kill_timer.cancel()
@@ -267,6 +272,7 @@ class CompactAgent:
         # Update memory states
         self._memory_states = outputs["new_memory"]
         self._confidence_states = outputs["new_confidence"]
+        self._e_prev_list = outputs.get("e_list")
 
         # Decode response — batch_decode matches original JAMEL eval exactly
         generated_ids = outputs["generated_ids"]
@@ -302,6 +308,7 @@ def run_eval(
     headless: bool = True,
     port: int = 8790,
     seed: int = 42,
+    freeze_memory_init: bool = False,
 ):
     """
     Run JAMEL-COMPACT evaluation on ScaleWoB apps.
@@ -325,6 +332,9 @@ def run_eval(
         temperature=temperature,
         top_p=top_p,
     )
+    agent._freeze_memory = freeze_memory_init
+    if freeze_memory_init:
+        print("[eval] WARNING: --freeze-memory-init is active. Memory will NOT update during eval.")
 
     all_results = []
 
@@ -626,6 +636,9 @@ def main():
     parser.add_argument("--seed", type=int, default=42, help="Random seed for env.reset()")
     parser.add_argument("--no-headless", action="store_true")
     parser.add_argument("--gpu-ids", default="", help="Comma-separated GPU IDs (e.g. '0' or '0,1')")
+    parser.add_argument("--freeze-memory-init", action="store_true",
+                        help="Freeze memory at initial state (ablation: tests "
+                             "whether memory writes improve generation)")
     args = parser.parse_args()
 
     # Set GPU visibility
@@ -674,6 +687,7 @@ def main():
         headless=not args.no_headless,
         port=args.port,
         seed=args.seed,
+        freeze_memory_init=args.freeze_memory_init,
     )
 
 

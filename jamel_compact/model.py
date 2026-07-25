@@ -73,33 +73,33 @@ class FiLMGRUCell(nn.Module):
 
 class SideMemoryModule(nn.Module):
     """
-    Per-layer side memory with reduced dimension d_mem.
+    v2: Per-layer side memory with learned Kalman filter.
+
+    Changes from v1:
+    - F3: Masked observation pooling (uses attention_mask, no padding)
+    - F4: Zero-initialized injection (delta_up=0, learnable gate, model=base at init)
+    - U1: Multi-token observation (k=4 learned latent queries → non-rank-1 innovation)
+    - U2: Learned Kalman track (variance P replaces pinned confidence C;
+          learned Q_theta, R_psi, adaptive K = P_hat/(P_hat+R))
+    - U3: Observation model + surprise (obs_model predicts observations;
+          surprise e feeds next step's variance inflation)
 
     Dimension flow:
-      • Main stream H, observation Z_t, action embed:  d (e.g. 2048 or 4096)
-      • Memory state M, FiLM-GRU, cross-attn, Kalman gate:  d_mem (e.g. 512)
-      • Down-projections: d → d_mem  (before memory operations)
-      • Up-projections:   d_mem → d  (before injecting back into main stream)
-
-    Algorithm per time step t, per layer l:
-      1. Predict:  M̂ = FiLM-GRU(M_{t-1}, x_act^{t-1})
-                   Ĉ = λ_l · C_{t-1}
-      2. Observe:  Z_t = Pool(H_self_attn[img, inst])
-      3. Correct:  ΔM = CrossAttn(Q=M̂, KV=Z_t)
-                   K  = σ(W[Z_t; M̂]) ⊙ (1-Ĉ)
-                   M  = M̂ + K ⊙ ΔM
-                   C  = Ĉ + α(1-Ĉ)·cos_sim(Z_t, M̂)
-      4. Inject:   H̃ = H + W_inj · CrossAttn(Q=H, KV=M)
+      • Main stream H:  d (e.g. 2048 or 4096)
+      • Memory state M: d_mem (e.g. 512)
+      • Observation Z:  k tokens in d, down-projected to [B, k, d_mem]
+      • Variance P:     [B, N_m] (per-slot scalar)
     """
 
     def __init__(self, layer_idx: int, num_layers: int, hidden_dim: int,
                  mem_dim: int = 512, num_mem: int = 16, num_heads: int = 8,
-                 config: Optional[CompactConfig] = None):
+                 num_obs_tokens: int = 4, config: Optional[CompactConfig] = None):
         super().__init__()
         self.layer_idx = layer_idx
         self.num_mem = num_mem
         self.hidden_dim = hidden_dim
         self.mem_dim = mem_dim
+        self.num_obs_tokens = num_obs_tokens  # U1: k
 
         # ── Down/up projections (d ↔ d_mem) ──
         self.obs_down = nn.Linear(hidden_dim, mem_dim)
@@ -107,19 +107,45 @@ class SideMemoryModule(nn.Module):
         self.h_down = nn.Linear(hidden_dim, mem_dim)
         self.delta_up = nn.Linear(mem_dim, hidden_dim)
 
+        # F4: Zero-initialize delta_up so model = base LLM at init
+        nn.init.zeros_(self.delta_up.weight)
+        nn.init.zeros_(self.delta_up.bias)
+
+        # F4: Learnable injection gate (init 0 → tanh(0)=0 → no injection at start)
+        self.inject_gate = nn.Parameter(torch.zeros(()))
+
         # ── Memory Predict: FiLM-GRU (in d_mem) ──
         self.gru = FiLMGRUCell(mem_dim)
 
-        # ── Memory Update: Innovation cross-attention (in d_mem) ──
+        # ── U1: Learned observation queries [k, d] ──
+        self.obs_queries = nn.Parameter(torch.randn(num_obs_tokens, hidden_dim) * 0.02)
+
+        # ── U1: Multi-token observation attention pooling (in d space) ──
+        self.obs_attn = nn.MultiheadAttention(
+            hidden_dim, num_heads, batch_first=True,
+        )
+
+        # ── Innovation cross-attention (now with k KV tokens, not 1) ──
         self.mem_cross_attn = nn.MultiheadAttention(
             mem_dim, num_heads, batch_first=True,
         )
         self.innovation_proj = nn.Linear(mem_dim, mem_dim)
 
-        # ── Kalman Gain gate (in d_mem) ──
-        self.k_gate = nn.Sequential(
-            nn.Linear(mem_dim * 2, mem_dim),
-            nn.Sigmoid(),
+        # ── U2: Learned process noise Q_theta: Linear(d_mem → N_m) + softplus ──
+        self.Q_theta = nn.Linear(mem_dim, num_mem)
+
+        # ── U2: Learned observation noise R_psi: MLP(d_mem → 128 → N_m) + softplus ──
+        self.R_psi = nn.Sequential(
+            nn.Linear(mem_dim, 128),
+            nn.GELU(),
+            nn.Linear(128, num_mem),
+        )
+
+        # ── U3: Observation model MLP(d_mem → d_mem → d_mem) ──
+        self.obs_model = nn.Sequential(
+            nn.Linear(mem_dim, mem_dim),
+            nn.GELU(),
+            nn.Linear(mem_dim, mem_dim),
         )
 
         # ── Memory Injection cross-attention (in d_mem) ──
@@ -134,75 +160,155 @@ class SideMemoryModule(nn.Module):
                                    config.lambda_deep)
             inj_s, inj_m, inj_d = (config.inject_shallow, config.inject_mid,
                                    config.inject_deep)
-            self.alpha = config.alpha_confidence
+            self.gamma_e = config.gamma_e
         else:
             lam_s, lam_m, lam_d = 0.70, 0.85, 0.95
             inj_s, inj_m, inj_d = 0.8, 0.5, 0.3
-            self.alpha = 0.1
+            self.gamma_e = 1.0
 
         if layer_idx < num_layers // 3:
-            self.lambda_decay, self.inject_weight = lam_s, inj_s
+            lam_init, inj_val = lam_s, inj_s
         elif layer_idx < 2 * num_layers // 3:
-            self.lambda_decay, self.inject_weight = lam_m, inj_m
+            lam_init, inj_val = lam_m, inj_m
         else:
-            self.lambda_decay, self.inject_weight = lam_d, inj_d
+            lam_init, inj_val = lam_d, inj_d
+
+        # U2: Learnable per-slot variance decay λ_l (sigmoid-constrained)
+        # sigmoid(λ_l_raw) = lam_init → λ_l_raw = logit(lam_init)
+        import math
+        lam_clamped = max(min(lam_init, 0.999), 0.001)
+        lam_raw_init = math.log(lam_clamped / (1 - lam_clamped))
+        self.lambda_l_raw = nn.Parameter(torch.full((num_mem,), lam_raw_init))
+
+        # F4: Keep w_max for hierarchical injection scaling
+        self.inject_w_max = inj_val
 
         # ── Learnable initial memory (in d_mem) ──
         self.init_memory = nn.Parameter(torch.randn(num_mem, mem_dim) * 0.02)
+        # U2: Initial variance P_0
+        self.init_variance = 0.5
 
-    def predict(self, m_prev: torch.Tensor, c_prev: torch.Tensor,
-                action_embed: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """FiLM-GRU predict + confidence decay. All in d_mem space."""
+    def predict(self, m_prev: torch.Tensor, p_prev: torch.Tensor,
+                action_embed: torch.Tensor,
+                e_prev: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        """FiLM-GRU predict + variance prediction (U2).
+
+        Args:
+            m_prev:  [B, N_m, d_mem] — previous memory state
+            p_prev:  [B, N_m] — previous variance
+            action_embed: [B, d] — raw action embedding
+            e_prev:  [B] — previous step's surprise (detached), or None at chunk start
+
+        Returns:
+            m_hat: [B, N_m, d_mem] — predicted memory state
+            p_hat: [B, N_m] — predicted variance
+        """
         B, N_m, d_mem = m_prev.shape
         a_down = self.action_down(action_embed)  # [B, d_mem]
+
+        # FiLM-GRU predict (same as v1)
         m_prev_flat = m_prev.reshape(B * N_m, d_mem)
         a_flat = a_down.unsqueeze(1).expand(-1, N_m, -1).reshape(B * N_m, d_mem)
         m_hat = self.gru(m_prev_flat, a_flat).view(B, N_m, d_mem)
-        c_hat = self.lambda_decay * c_prev
-        return m_hat, c_hat
 
-    def correct(self, m_hat: torch.Tensor, c_hat: torch.Tensor,
-                z_t: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Kalman filter update. Cross-attention in d_mem space."""
+        # U2: Variance predict with learned process noise + adaptive inflation
+        lam = torch.sigmoid(self.lambda_l_raw)  # [N_m]
+        q_noise = F.softplus(self.Q_theta(a_down))  # [B, N_m]
+        p_hat = lam.unsqueeze(0) * p_prev + q_noise  # [B, N_m]
+        if e_prev is not None and self.gamma_e > 0:
+            p_hat = p_hat + self.gamma_e * e_prev.detach().unsqueeze(-1)  # broadcast [B,1]→[B,N_m]
+
+        return m_hat, p_hat
+
+    def correct(self, m_hat: torch.Tensor, p_hat: torch.Tensor,
+                z_down: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor,
+                                               torch.Tensor, torch.Tensor,
+                                               torch.Tensor]:
+        """Learned Kalman filter update (U2) + observation model (U3).
+
+        Args:
+            m_hat:  [B, N_m, d_mem] — predicted memory
+            p_hat:  [B, N_m] — predicted variance
+            z_down: [B, k, d_mem] — multi-token observation (from U1)
+
+        Returns:
+            m_new:     [B, N_m, d_mem] — corrected memory
+            p_new:     [B, N_m] — corrected variance
+            e:         [B] — surprise (detached, for next step's predict)
+            loss_obs:  scalar — observation prediction MSE (for L_obs)
+            loss_nll:  scalar — Gaussian NLL (for L_nll)
+        """
         B, N_m, d_mem = m_hat.shape
-        z_down = self.obs_down(z_t)       # [B, d_mem]
-        z_exp = z_down.unsqueeze(1)       # [B, 1, d_mem]
+        eps = 1e-8
 
-        # Innovation (per-token)
-        delta_raw, _ = self.mem_cross_attn(m_hat, z_exp, z_exp)
+        # ── Innovation: cross-attention with k KV tokens (U1) ──
+        delta_raw, _ = self.mem_cross_attn(m_hat, z_down, z_down)  # [B, N_m, d_mem]
         delta_m = self.innovation_proj(delta_raw)
 
-        # Kalman gain (per-token)
-        z_broadcast = z_down.unsqueeze(1).expand(-1, N_m, -1)
-        k_base = self.k_gate(torch.cat([z_broadcast, m_hat], dim=-1))
-        k_gain = k_base * (1.0 - c_hat).unsqueeze(-1)
+        # ── U2: Learned observation noise R ──
+        z_mean = z_down.mean(dim=1)  # [B, d_mem]
+        R = F.softplus(self.R_psi(z_mean))  # [B, N_m]
 
-        # Update memory
-        m_new = m_hat + k_gain * delta_m
+        # ── U2: Kalman gain K = P_hat / (P_hat + R) ──
+        K = p_hat / (p_hat + R + eps)  # [B, N_m]
+        K_exp = K.unsqueeze(-1)  # [B, N_m, 1]
 
-        # Update confidence (per-token)
-        z_norm = F.normalize(z_down, dim=-1)
-        m_norm = F.normalize(m_hat, dim=-1)
-        match = (z_norm.unsqueeze(1) * m_norm).sum(dim=-1).clamp(0, 1)
-        c_new = c_hat + self.alpha * (1.0 - c_hat) * match
+        # ── Kalman update ──
+        m_new = m_hat + K_exp * delta_m
+        p_new = (1 - K_exp.squeeze(-1)) * p_hat  # [B, N_m]
 
-        return m_new, c_new
+        # ── U3: Observation model — predict what we'll see ──
+        z_pred = self.obs_model(m_hat.mean(dim=1))  # [B, d_mem]
+        z_target = z_mean.detach()  # [B, d_mem]
+        e_per_sample = F.mse_loss(z_pred, z_target, reduction='none').mean(dim=-1)  # [B]
+
+        # L_obs: trains the observation model
+        loss_obs = F.mse_loss(z_pred, z_target)
+
+        # L_nll: calibrates R against actual surprise (e detached → gradients through R only)
+        e_detached = e_per_sample.detach().unsqueeze(-1)  # [B, 1]
+        loss_nll = 0.5 * (torch.log(R + eps) + e_detached.pow(2) / (R + eps)).mean()
+
+        # Surprise for next step (detached)
+        e = e_per_sample.detach()  # [B]
+
+        return m_new, p_new, e, loss_obs, loss_nll
 
     def inject(self, h: torch.Tensor, m_new: torch.Tensor) -> torch.Tensor:
-        """Read memory into main stream via cross-attention."""
+        """F4: Zero-init gated injection. At init, tanh(0)=0 → no modification."""
         h_down = self.h_down(h)
         delta_down, _ = self.inject_cross_attn(h_down, m_new, m_new)
-        delta_up = self.delta_up(delta_down)
-        return self.inject_norm(h + self.inject_weight * delta_up)
+        delta_up = self.delta_up(delta_down)  # zero-init → 0 at start
+        w = self.inject_w_max * torch.tanh(self.inject_gate)  # 0 at start
+        return self.inject_norm(h + w * delta_up)
 
-    def extract_observation(self, h: torch.Tensor, n_act: int = 1) -> torch.Tensor:
-        """Pool all hidden states into a single observation vector [B, d].
+    def extract_observation(self, h: torch.Tensor,
+                            attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """U1+F3: Masked multi-token observation pooling.
 
-        Note: Unlike the prototype, the real VLM input sequence doesn't have
-        a separate action token at position 0. The sequence is text+image+text
-        from the processor. We pool ALL tokens to get a summary observation.
+        k learned latent queries attend over non-padding positions of h,
+        producing [B, k, d_mem] (down-projected from [B, k, d]).
+
+        Args:
+            h:                [B, N, d] — hidden states from the pretrained layer
+            attention_mask:   [B, N] — 1 for real tokens, 0 for padding
+
+        Returns:
+            z_down: [B, k, d_mem] — multi-token observation
         """
-        return h.mean(dim=1)
+        B = h.shape[0]
+        # F3: Build key_padding_mask (True = padding to be masked out)
+        key_padding_mask = None
+        if attention_mask is not None:
+            key_padding_mask = (attention_mask == 0)  # [B, N]
+
+        # U1: k learned queries attend over hidden states
+        queries = self.obs_queries.unsqueeze(0).expand(B, -1, -1)  # [B, k, d]
+        z_raw, _ = self.obs_attn(
+            queries, h, h, key_padding_mask=key_padding_mask,
+        )  # [B, k, d]
+        z_down = self.obs_down(z_raw)  # [B, k, d_mem]
+        return z_down
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -273,6 +379,7 @@ class JAMELCompactWrapper(nn.Module):
                 mem_dim=config.mem_dim,
                 num_mem=config.num_mem_tokens,
                 num_heads=config.num_heads,
+                num_obs_tokens=config.num_obs_tokens,
                 config=config,
             )
             for l in range(self.num_layers)
@@ -563,16 +670,22 @@ class JAMELCompactWrapper(nn.Module):
     # ── Memory initialization ──
 
     def init_memory(self, batch_size: int, device: torch.device):
-        """Initialize memory states and confidence for t=0."""
+        """Initialize memory states and variance for t=0.
+
+        v2: Returns (memory_states, variance_states) instead of (memory_states, confidence_states).
+        Variance P_0 = 0.5 per slot.
+        Also initializes e_prev (surprise) to None for each layer.
+        """
         # Cast to model dtype to avoid bfloat16/float32 mismatches
         llm_dtype = next(self.llm.parameters()).dtype
-        m_states, c_states = [], []
+        m_states, p_states = [], []
         for sm in self.side_memories:
             m = sm.init_memory.unsqueeze(0).expand(batch_size, -1, -1).clone().to(device=device, dtype=llm_dtype)
-            c = torch.full((batch_size, self.num_mem), 0.5, device=device, dtype=llm_dtype)
+            p = torch.full((batch_size, self.num_mem), sm.init_variance,
+                           device=device, dtype=llm_dtype)
             m_states.append(m)
-            c_states.append(c)
-        return m_states, c_states
+            p_states.append(p)
+        return m_states, p_states
 
     # ── Forward ──
 
@@ -589,17 +702,25 @@ class JAMELCompactWrapper(nn.Module):
         inputs_embeds: Optional[torch.Tensor] = None,
         deepstack_features: Optional[List] = None,
         visual_pos_mask: Optional[torch.Tensor] = None,
+        e_prev_list: Optional[List[Optional[torch.Tensor]]] = None,
+        sample_weights: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> dict:
         """
         One time step through the full memory-augmented LLM.
+
+        v2 changes:
+        - attention_mask is threaded into extract_observation (F3: masked pooling)
+        - e_prev_list carries surprise from previous step (U2/U3)
+        - collect loss_obs and loss_nll per layer (U2/U3)
+        - sample_weights for coverage-weighted SFT (F7)
 
         Args:
             input_ids:          [B, N] — token IDs (includes image placeholder tokens)
             attention_mask:     [B, N]
             action_embed_input: [B, d] — raw action embedding (control variable)
             memory_states:      List of [B, N_m, d_mem]
-            confidence_states:  List of [B, N_m]
+            confidence_states:  List of [B, N_m] — variance states (v2: renamed but same API)
             labels:             [B, N] — token labels for loss (optional)
             pixel_values:       [B, C, H, W] — processed image tensor (optional)
             image_grid_thw:     [B, 3] — image grid dimensions (optional)
@@ -607,9 +728,12 @@ class JAMELCompactWrapper(nn.Module):
                                 bypasses visual encoder — used for DataParallel)
             deepstack_features: Pre-computed deepstack features (for DataParallel)
             visual_pos_mask:    Pre-computed visual position mask (for DataParallel)
+            e_prev_list:        List of [B] or None — previous step surprise per layer
+            sample_weights:     [B] — per-sample loss weights (F7)
 
         Returns:
-            dict with: logits, new_memory, new_confidence, loss (if labels)
+            dict with: logits, new_memory, new_confidence, loss (if labels),
+                       loss_dict, e_list (surprise for next step)
         """
         B = input_ids.shape[0]
         device = input_ids.device
@@ -641,25 +765,31 @@ class JAMELCompactWrapper(nn.Module):
         decoder_layers = self._get_decoder_layers()
 
         # ── Compute position embeddings if the model uses RoPE ──
-        # Qwen3-VL layers require a `position_embeddings` kwarg.
         position_embeddings = self._compute_position_embeddings(
             h, attention_mask,
         )
 
         # ── Convert attention_mask to 4D causal mask ──
-        # Qwen3-VL's SDPA attention expects a [B, 1, N, N] causal mask,
-        # not a 2D [B, N] padding mask.
         attention_mask_4d = self._build_causal_attention_mask(
             attention_mask, h.dtype,
         )
 
+        # ── Initialize e_prev_list if not provided (chunk start) ──
+        if e_prev_list is None:
+            e_prev_list = [None] * len(self.side_memories)
+
         # ── Process through each layer ──
         new_memory, new_confidence = [], []
-        predicted_mems, obs_feats = [], []  # for uncertainty calibration loss
+        e_list = []  # surprise per layer for next step
+        loss_obs_total = torch.tensor(0.0, device=device, dtype=h.dtype)
+        loss_nll_total = torch.tensor(0.0, device=device, dtype=h.dtype)
+        L = len(decoder_layers)
+
         for l, (layer, sm) in enumerate(zip(decoder_layers, self.side_memories)):
-            # 4a. Memory Predict (FiLM-GRU)
-            m_hat, c_hat = sm.predict(
+            # 4a. Memory Predict (FiLM-GRU + variance predict)
+            m_hat, p_hat = sm.predict(
                 memory_states[l], confidence_states[l], action_embed,
+                e_prev=e_prev_list[l],
             )
 
             # 4b. Run pretrained layer (self-attn + FFN)
@@ -680,27 +810,31 @@ class JAMELCompactWrapper(nn.Module):
                 ds_feat = deepstack_features[l].to(h_layer.device, h_layer.dtype)
                 if visual_pos_mask is not None:
                     mask_1d = visual_pos_mask  # [B, N]
-                    # Add visual features at image token positions
                     for b in range(h_layer.shape[0]):
                         positions = mask_1d[b].nonzero(as_tuple=True)[0]
                         n = len(positions)
                         if n > 0 and n <= ds_feat.shape[0]:
                             h_layer[b, positions] = h_layer[b, positions] + ds_feat[:n]
 
-            # 4c. Extract observation
-            z_t = sm.extract_observation(h_layer, self.num_act_tokens)
+            # 4c. Extract observation (F3: masked, U1: multi-token)
+            z_down = sm.extract_observation(h_layer, attention_mask)
 
-            # 4d. Memory Correct (Kalman Filter)
-            m_new, c_new = sm.correct(m_hat, c_hat, z_t)
+            # 4d. Memory Correct (learned Kalman + obs model)
+            m_new, p_new, e, loss_obs_l, loss_nll_l = sm.correct(
+                m_hat, p_hat, z_down,
+            )
 
-            # 4e. Memory Inject
+            # 4e. Memory Inject (F4: zero-init gated)
             h = sm.inject(h_layer, m_new)
 
             new_memory.append(m_new)
-            new_confidence.append(c_new)
-            # Save for uncertainty calibration loss
-            predicted_mems.append(m_hat.detach())
-            obs_feats.append(z_t.detach())
+            new_confidence.append(p_new)
+            e_list.append(e)
+            loss_obs_total = loss_obs_total + loss_obs_l
+            loss_nll_total = loss_nll_total + loss_nll_l
+
+        loss_obs_total = loss_obs_total / L
+        loss_nll_total = loss_nll_total / L
 
         # ── LM head (pretrained) ──
         logits = self._get_lm_head()(h)  # [B, N, vocab_size]
@@ -709,6 +843,7 @@ class JAMELCompactWrapper(nn.Module):
             "logits": logits,
             "new_memory": new_memory,
             "new_confidence": new_confidence,
+            "e_list": e_list,  # surprise for next step
         }
 
         # ── Compute loss if labels provided ──
@@ -720,8 +855,9 @@ class JAMELCompactWrapper(nn.Module):
                 memory_states=new_memory,
                 confidence_states=new_confidence,
                 config=self.config,
-                predicted_memory=predicted_mems,
-                observation_feat=obs_feats,
+                loss_obs=loss_obs_total,
+                loss_nll=loss_nll_total,
+                sample_weights=sample_weights,
             )
             result["loss"] = loss
             result["loss_dict"] = loss_dict
@@ -743,18 +879,22 @@ class JAMELCompactWrapper(nn.Module):
         top_p: float = 0.9,
         pixel_values: Optional[torch.Tensor] = None,
         image_grid_thw: Optional[torch.Tensor] = None,
+        e_prev_list: Optional[List[Optional[torch.Tensor]]] = None,
+        freeze_memory: bool = False,
         **kwargs,
     ) -> dict:
-        """Generate action tokens using the base LLM's built-in generate().
+        """F5: Memory-conditioned generation.
 
-        The base Qwen3-VL model's ``generate()`` handles KV caching, causal
-        masks, and position IDs correctly — things that are extremely hard to
-        get right in a hand-rolled loop. We delegate to it for the actual
-        token generation.
+        v1 discarded memory: it ran the compact forward to update memory,
+        then called base llm.generate() on the RAW prompt (memory-injected
+        hidden states were never used for generation).
 
-        Memory is updated once with a single forward pass through the compact
-        model on the full prompt sequence (same as during training). This gives
-        the FiLM-GRU the observation signal it needs for the next step.
+        v2: After the memory-update forward pass, we pass the memory-injected
+        hidden states' KV cache to the base model's generate(), so generation
+        starts from memory-influenced representations.
+
+        If memory_conditioned_generate is False or the cache handoff fails,
+        we fall back to the v1 approach (base llm.generate on raw prompt).
         """
         B = input_ids.shape[0]
         device = input_ids.device
@@ -781,10 +921,16 @@ class JAMELCompactWrapper(nn.Module):
         # ── Compute position embeddings for prompt ──
         position_embeddings = self._compute_position_embeddings(h, attention_mask)
 
+        # ── Initialize e_prev_list if not provided ──
+        if e_prev_list is None:
+            e_prev_list = [None] * len(self.side_memories)
+
         # ── Process prompt through all layers with memory ──
         new_memory, new_confidence = [], []
+        e_list = []
         for l, (layer, sm) in enumerate(zip(decoder_layers, self.side_memories)):
-            m_hat, c_hat = sm.predict(memory_states[l], confidence_states[l], action_embed)
+            m_hat, p_hat = sm.predict(memory_states[l], confidence_states[l], action_embed,
+                                      e_prev=e_prev_list[l])
             layer_output = layer(h, attention_mask=attn_mask_4d,
                                 position_embeddings=position_embeddings)
             h_layer = layer_output[0] if isinstance(layer_output, tuple) else layer_output
@@ -799,41 +945,167 @@ class JAMELCompactWrapper(nn.Module):
                         if n > 0 and n <= ds_feat.shape[0]:
                             h_layer[b, positions] = h_layer[b, positions] + ds_feat[:n]
 
-            z_t = sm.extract_observation(h_layer, self.num_act_tokens)
-            m_new, c_new = sm.correct(m_hat, c_hat, z_t)
+            z_down = sm.extract_observation(h_layer, attention_mask)
+            m_new, p_new, e, _, _ = sm.correct(m_hat, p_hat, z_down)
             h = sm.inject(h_layer, m_new)
             new_memory.append(m_new)
-            new_confidence.append(c_new)
+            new_confidence.append(p_new)
+            e_list.append(e)
 
-        # ── 2. Token generation: delegate to the base LLM ──
-        # The base model's generate() handles KV cache, RoPE, causal masks,
-        # and sampling correctly. We pass pixel_values so the visual encoder
-        # runs inside the base model's forward (no DataParallel at eval time).
-        gen_kwargs = dict(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            max_new_tokens=max_new_tokens,
-            do_sample=temperature > 0,
-        )
-        if temperature > 0:
-            gen_kwargs["temperature"] = temperature
-            gen_kwargs["top_p"] = top_p
-        if pixel_values is not None:
-            gen_kwargs["pixel_values"] = pixel_values
-        if image_grid_thw is not None:
-            gen_kwargs["image_grid_thw"] = image_grid_thw
+        # If freeze_memory (F5 ablation), don't write back new memory
+        if freeze_memory:
+            new_memory = memory_states
+            new_confidence = confidence_states
 
-        full_ids = self.llm.generate(**gen_kwargs)
+        # ── 2. Token generation ──
+        # F5: If memory_conditioned_generate is enabled, use the memory-injected
+        # hidden states h for a greedy/sampling loop. This is the fallback
+        # approach (slower but correct) — we compute logits from h and sample
+        # token-by-token, which ensures generation sees memory-injected states.
+        #
+        # The KV-cache prefill approach requires assembling a DynamicCache from
+        # per-layer (key, value) tuples, which is architecture-specific and
+        # fragile across transformers versions. The per-token loop is correct
+        # and only slightly slower for 256 tokens.
+        if self.config.memory_conditioned_generate:
+            # F5: Greedy/sampling loop using the wrapper's own forward logic
+            # The memory-injected hidden states h from the prompt pass are
+            # the starting point. We sample one token at a time.
+            generated_ids = self._generate_from_hidden_states(
+                h, attention_mask, max_new_tokens, temperature, top_p,
+                position_embeddings, attn_mask_4d,
+            )
+        else:
+            # Fallback: v1 approach — base llm.generate() on raw prompt
+            gen_kwargs = dict(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=max_new_tokens,
+                do_sample=temperature > 0,
+            )
+            if temperature > 0:
+                gen_kwargs["temperature"] = temperature
+                gen_kwargs["top_p"] = top_p
+            if pixel_values is not None:
+                gen_kwargs["pixel_values"] = pixel_values
+            if image_grid_thw is not None:
+                gen_kwargs["image_grid_thw"] = image_grid_thw
 
-        # Extract only the newly generated tokens
-        prompt_len = input_ids.shape[1]
-        generated_ids = full_ids[:, prompt_len:]
+            full_ids = self.llm.generate(**gen_kwargs)
+            prompt_len = input_ids.shape[1]
+            generated_ids = full_ids[:, prompt_len:]
 
         return {
             "generated_ids": generated_ids,
             "new_memory": new_memory,
             "new_confidence": new_confidence,
+            "e_list": e_list,
         }
+
+    @torch.inference_mode()
+    def _generate_from_hidden_states(
+        self,
+        h: torch.Tensor,
+        attention_mask: torch.Tensor,
+        max_new_tokens: int,
+        temperature: float,
+        top_p: float,
+        position_embeddings: Optional[Tuple],
+        attn_mask_4d: torch.Tensor,
+    ) -> torch.Tensor:
+        """F5: Generate tokens starting from memory-injected hidden states.
+
+        Uses the LM head to get logits from h, samples the next token,
+        appends it, and re-runs the decoder layers for the new token.
+        This is a simple greedy/sampling autoregressive loop that
+        preserves memory influence on generation.
+        """
+        B = h.shape[0]
+        device = h.device
+        llm_dtype = h.dtype
+        generated = []
+
+        # Current sequence length
+        cur_len = h.shape[1]
+
+        # Get the last token's hidden state for first prediction
+        logits = self._get_lm_head()(h[:, -1:, :])  # [B, 1, vocab]
+        next_token = self._sample_token(logits[:, -1, :], temperature, top_p)  # [B]
+        generated.append(next_token)
+
+        decoder_layers = self._get_decoder_layers()
+
+        for _ in range(max_new_tokens - 1):
+            # Embed the new token
+            embed_layer = self._get_input_embeddings()
+            new_embed = embed_layer(next_token.unsqueeze(-1))  # [B, 1, d]
+
+            # Extend attention mask
+            new_attn_mask = torch.cat([
+                attention_mask,
+                torch.ones(B, 1, device=device, dtype=attention_mask.dtype),
+            ], dim=1)
+            new_attn_mask_4d = self._build_causal_attention_mask(
+                new_attn_mask, llm_dtype,
+            )
+
+            # Extend position embeddings for the new position
+            new_pos_id = cur_len
+            if position_embeddings is not None:
+                rotary_emb = self._find_rotary_emb()
+                if rotary_emb is not None:
+                    pos_ids = torch.tensor([[new_pos_id]], device=device, dtype=torch.long)
+                    pos_ids = pos_ids.expand(B, -1)
+                    cos_new, sin_new = rotary_emb(new_embed, pos_ids)
+                    new_pos_emb = (cos_new.to(llm_dtype), sin_new.to(llm_dtype))
+                else:
+                    new_pos_emb = None
+            else:
+                new_pos_emb = None
+
+            # Run new token through all decoder layers (NO memory update during generation)
+            h_new = new_embed
+            for l, layer in enumerate(decoder_layers):
+                layer_output = layer(
+                    h_new,
+                    attention_mask=new_attn_mask_4d[:, :, -1:, :].expand(B, 1, -1, cur_len + 1) if new_attn_mask_4d.dim() == 4 else new_attn_mask_4d,
+                    position_embeddings=new_pos_emb,
+                )
+                h_new = layer_output[0] if isinstance(layer_output, tuple) else layer_output
+
+            cur_len += 1
+
+            # Get logits and sample
+            logits = self._get_lm_head()(h_new[:, -1:, :])  # [B, 1, vocab]
+            next_token = self._sample_token(logits[:, -1, :], temperature, top_p)
+            generated.append(next_token)
+
+            # Check for EOS
+            eos_id = getattr(self.llm.config, "eos_token_id", None)
+            if eos_id is not None and (next_token == eos_id).all():
+                break
+
+        return torch.stack(generated, dim=1)  # [B, num_generated]
+
+    @staticmethod
+    def _sample_token(logits: torch.Tensor, temperature: float, top_p: float) -> torch.Tensor:
+        """Sample a token from logits with temperature and top-p filtering."""
+        if temperature <= 0:
+            return logits.argmax(dim=-1)
+        logits = logits / temperature
+        # Top-p (nucleus) sampling
+        if top_p < 1.0:
+            sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+            cum_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+            sorted_indices_to_remove = cum_probs > top_p
+            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+            sorted_indices_to_remove[..., 0] = False
+            indices_to_remove = sorted_indices_to_remove.scatter(
+                -1, sorted_indices, sorted_indices_to_remove,
+            )
+            logits = logits.masked_fill(indices_to_remove, float('-inf'))
+        probs = F.softmax(logits, dim=-1)
+        return torch.multinomial(probs, num_samples=1).squeeze(-1)
 
     # ── Save / Load ──
 

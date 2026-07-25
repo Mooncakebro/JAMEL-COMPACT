@@ -69,6 +69,16 @@ from .model import JAMELCompactWrapper
 from .data import CompactDataset, collate_fn, SessionChunkDataset, session_collate_fn
 from .loss import compute_compact_loss
 
+# F8: Optional memory diagnostics
+try:
+    import importlib.util
+    if importlib.util.find_spec("scripts.probe_memory"):
+        from scripts.probe_memory import log_memory_stats as _log_mem_stats
+    else:
+        _log_mem_stats = None
+except ImportError:
+    _log_mem_stats = None
+
 
 def set_seed(seed: int):
     random.seed(seed)
@@ -113,6 +123,7 @@ def _process_chunk_step(
     step_data: dict,
     memory_states: list,
     confidence_states: list,
+    e_prev_list: list = None,
 ) -> tuple:
     """Process a single step within a session chunk.
 
@@ -125,12 +136,14 @@ def _process_chunk_step(
         config:          training config
         device:          cuda device
         step_data:       dict with input_ids, attention_mask, labels,
-                         action_input_ids, pixel_values, image_grid_thw
+                         action_input_ids, pixel_values, image_grid_thw,
+                         sample_weights (optional)
         memory_states:   list of [B, N_m, d_mem] — carried from previous step
-        confidence_states: list of [B, N_m] — carried from previous step
+        confidence_states: list of [B, N_m] — variance, carried from previous step
+        e_prev_list:     list of [B] or None — surprise from previous step per layer
 
     Returns:
-        (loss, loss_dict, new_memory, new_confidence)
+        (loss, loss_dict, new_memory, new_confidence, e_list)
     """
     input_ids = step_data["input_ids"].to(device)
     attention_mask = step_data["attention_mask"].to(device)
@@ -174,6 +187,14 @@ def _process_chunk_step(
                  for m in memory_states]
     conf_input = [c.detach() if isinstance(c, torch.Tensor) else c
                   for c in confidence_states]
+    # Detach e_prev (surprise values carry forward, not gradients)
+    e_prev_input = [e.detach() if isinstance(e, torch.Tensor) else e
+                    for e in (e_prev_list or [None] * len(memory_states))]
+
+    # Get sample weights (F7: coverage-weighted SFT)
+    sample_weights = step_data.get("sample_weights")
+    if sample_weights is not None and isinstance(sample_weights, torch.Tensor):
+        sample_weights = sample_weights.to(device)
 
     # Forward pass
     outputs = model(
@@ -188,6 +209,8 @@ def _process_chunk_step(
         inputs_embeds=inputs_embeds,
         deepstack_features=deepstack_features,
         visual_pos_mask=visual_pos_mask,
+        e_prev_list=e_prev_input,
+        sample_weights=sample_weights,
     )
 
     loss = outputs["loss"]
@@ -205,8 +228,11 @@ def _process_chunk_step(
                for m in outputs["new_memory"]]
     new_conf = [c.detach() if isinstance(c, torch.Tensor) else c
                 for c in outputs["new_confidence"]]
+    # Detach e_list (surprise) for next step's predict
+    new_e_list = [e.detach() if isinstance(e, torch.Tensor) else e
+                  for e in outputs.get("e_list", [None] * len(new_mem))]
 
-    return loss, loss_dict, new_mem, new_conf
+    return loss, loss_dict, new_mem, new_conf, new_e_list
 
 
 def train_one_epoch(
@@ -250,8 +276,9 @@ def train_one_epoch(
             # batch is a dict of lists (one entry per step in the chunk)
             chunk_size = batch["chunk_size"]
 
-            # Initialize memory at the start of each chunk
+            # Initialize memory and e_prev at the start of each chunk
             memory_states, confidence_states = raw_model.init_memory(1, device)
+            e_prev_list = None  # None for first step in chunk
 
             total_chunk_loss = torch.tensor(0.0, device=device, requires_grad=False)
             last_loss_dict = {}
@@ -265,13 +292,18 @@ def train_one_epoch(
                     "action_input_ids": batch["action_input_ids"][s],
                     "pixel_values": batch["pixel_values"][s],
                     "image_grid_thw": batch["image_grid_thw"][s],
+                    "sample_weights": batch.get("sample_weights", [None] * chunk_size)[s],
                 }
 
-                loss, loss_dict, memory_states, confidence_states = \
+                loss, loss_dict, memory_states, confidence_states, e_list = \
                     _process_chunk_step(
                         model, raw_model, config, device,
                         step_data, memory_states, confidence_states,
+                        e_prev_list=e_prev_list,
                     )
+
+                # Carry e_list forward as next step's e_prev_list
+                e_prev_list = e_list
 
                 # Accumulate loss across steps in the chunk
                 # Weight each step equally
@@ -303,6 +335,11 @@ def train_one_epoch(
             B = input_ids.shape[0]
             memory_states, confidence_states = raw_model.init_memory(B, device)
 
+            # Get sample weights (F7)
+            sample_weights = batch.get("sample_weights")
+            if sample_weights is not None and isinstance(sample_weights, torch.Tensor):
+                sample_weights = sample_weights.to(device)
+
             # Pre-compute visual features on the raw model before DataParallel
             inputs_embeds = None
             deepstack_features = None
@@ -327,6 +364,7 @@ def train_one_epoch(
                 inputs_embeds=inputs_embeds,
                 deepstack_features=deepstack_features,
                 visual_pos_mask=visual_pos_mask,
+                sample_weights=sample_weights,
             )
 
             loss = outputs["loss"]
@@ -358,18 +396,27 @@ def train_one_epoch(
                 if writer is not None:
                     writer.add_scalar("train/loss_total", loss_dict["total"], global_step)
                     writer.add_scalar("train/loss_action", loss_dict["action"], global_step)
+                    writer.add_scalar("train/loss_action_unweighted", loss_dict.get("action_unweighted", loss_dict["action"]), global_step)
                     writer.add_scalar("train/loss_mem_l2", loss_dict["mem_l2"], global_step)
-                    writer.add_scalar("train/loss_mem_entropy", loss_dict["mem_entropy"], global_step)
-                    writer.add_scalar("train/loss_uncert", loss_dict["uncert"], global_step)
+                    writer.add_scalar("train/loss_obs", loss_dict.get("obs", 0.0), global_step)
+                    writer.add_scalar("train/loss_nll", loss_dict.get("nll", 0.0), global_step)
                     writer.add_scalar("train/learning_rate", lr, global_step)
                     writer.add_scalar("train/step_time_s", elapsed, global_step)
+
+                    # F8: Memory diagnostics (every 100 steps to avoid overhead)
+                    if global_step % 100 == 0 and _log_mem_stats is not None:
+                        try:
+                            _log_mem_stats(raw_model, writer, global_step)
+                        except Exception:
+                            pass  # don't crash training on diagnostics
 
                 print(
                     f"  [epoch {epoch} step {global_step}] "
                     f"loss={loss_dict['total']:.4f} "
                     f"action={loss_dict['action']:.4f} "
                     f"mem_l2={loss_dict['mem_l2']:.6f} "
-                    f"uncert={loss_dict['uncert']:.4f} "
+                    f"obs={loss_dict.get('obs', 0.0):.4f} "
+                    f"nll={loss_dict.get('nll', 0.0):.4f} "
                     f"lr={lr:.2e} "
                     f"time={elapsed:.2f}s"
                 )
@@ -418,7 +465,8 @@ def validate(
     total_loss = 0.0
     total_action_loss = 0.0
     total_mem_loss = 0.0
-    total_uncert_loss = 0.0
+    total_obs_loss = 0.0
+    total_nll_loss = 0.0
     num_batches = 0
 
     with torch.no_grad():
@@ -437,7 +485,9 @@ def validate(
                 chunk_loss = 0.0
                 chunk_action = 0.0
                 chunk_mem = 0.0
-                chunk_uncert = 0.0
+                chunk_obs = 0.0
+                chunk_nll = 0.0
+                e_prev_list = None
 
                 for s in range(chunk_size):
                     step_data = {
@@ -447,24 +497,29 @@ def validate(
                         "action_input_ids": batch["action_input_ids"][s],
                         "pixel_values": batch["pixel_values"][s],
                         "image_grid_thw": batch["image_grid_thw"][s],
+                        "sample_weights": batch.get("sample_weights", [None] * chunk_size)[s],
                     }
 
-                    loss, loss_dict, memory_states, confidence_states = \
+                    loss, loss_dict, memory_states, confidence_states, e_list = \
                         _process_chunk_step(
                             model, raw_model, config, device,
                             step_data, memory_states, confidence_states,
+                            e_prev_list=e_prev_list,
                         )
+                    e_prev_list = e_list
 
                     chunk_loss += loss_dict["total"]
                     chunk_action += loss_dict["action"]
                     chunk_mem += loss_dict["mem_l2"]
-                    chunk_uncert += loss_dict["uncert"]
+                    chunk_obs += loss_dict.get("obs", 0.0)
+                    chunk_nll += loss_dict.get("nll", 0.0)
 
                 # Average over steps in chunk
                 total_loss += chunk_loss / chunk_size
                 total_action_loss += chunk_action / chunk_size
                 total_mem_loss += chunk_mem / chunk_size
-                total_uncert_loss += chunk_uncert / chunk_size
+                total_obs_loss += chunk_obs / chunk_size
+                total_nll_loss += chunk_nll / chunk_size
                 num_batches += 1
 
                 if _TQDM_AVAILABLE:
@@ -486,6 +541,11 @@ def validate(
                 action_embed_input = get_action_embedding(action_input_ids, model, device)
                 B = input_ids.shape[0]
                 memory_states, confidence_states = raw_model.init_memory(B, device)
+
+                # Get sample weights (F7)
+                sample_weights = batch.get("sample_weights")
+                if sample_weights is not None and isinstance(sample_weights, torch.Tensor):
+                    sample_weights = sample_weights.to(device)
 
                 inputs_embeds = None
                 deepstack_features = None
@@ -510,13 +570,15 @@ def validate(
                     inputs_embeds=inputs_embeds,
                     deepstack_features=deepstack_features,
                     visual_pos_mask=visual_pos_mask,
+                    sample_weights=sample_weights,
                 )
 
                 ld = outputs["loss_dict"]
                 total_loss += _scalar(ld["total"])
                 total_action_loss += _scalar(ld["action"])
                 total_mem_loss += _scalar(ld["mem_l2"])
-                total_uncert_loss += _scalar(ld["uncert"])
+                total_obs_loss += _scalar(ld.get("obs", 0.0))
+                total_nll_loss += _scalar(ld.get("nll", 0.0))
                 num_batches += 1
 
                 if _TQDM_AVAILABLE:
@@ -528,20 +590,23 @@ def validate(
     avg_loss = total_loss / max(num_batches, 1)
     avg_action = total_action_loss / max(num_batches, 1)
     avg_mem = total_mem_loss / max(num_batches, 1)
-    avg_uncert = total_uncert_loss / max(num_batches, 1)
+    avg_obs = total_obs_loss / max(num_batches, 1)
+    avg_nll = total_nll_loss / max(num_batches, 1)
 
     if writer is not None:
         writer.add_scalar("val/loss_total", avg_loss, global_step)
         writer.add_scalar("val/loss_action", avg_action, global_step)
         writer.add_scalar("val/loss_mem_l2", avg_mem, global_step)
-        writer.add_scalar("val/loss_uncert", avg_uncert, global_step)
+        writer.add_scalar("val/loss_obs", avg_obs, global_step)
+        writer.add_scalar("val/loss_nll", avg_nll, global_step)
 
     print(
         f"  [val step {global_step}] "
         f"loss={avg_loss:.4f} "
         f"action={avg_action:.4f} "
         f"mem_l2={avg_mem:.6f} "
-        f"uncert={avg_uncert:.4f}"
+        f"obs={avg_obs:.4f} "
+        f"nll={avg_nll:.4f}"
     )
 
     model.train()
@@ -583,6 +648,9 @@ def main():
                              "steps per chunk. 1 = single-step (original). "
                              ">1 = multi-step, carries memory forward across "
                              "steps to train FiLM-GRU recurrent dynamics.")
+    parser.add_argument("--coverage-weight-eta", type=float, default=0.0,
+                        help="F7: Coverage-weighted SFT. 0 = off; >0 upweights "
+                             "samples with high coverage delta (novelty).")
     args = parser.parse_args()
 
     # ── GPU selection ──
@@ -633,6 +701,7 @@ def main():
         bf16=args.bf16,
         seed=args.seed,
         chunk_size=args.chunk_size,
+        coverage_weight_eta=args.coverage_weight_eta,
     )
 
     # ── Build model ──
@@ -664,6 +733,7 @@ def main():
         processor=raw_model.processor,
         max_length=config.max_length,
         image_resize=config.image_resize,
+        coverage_weight_eta=config.coverage_weight_eta,
     )
     val_dataset = CompactDataset(
         parquet_files=args.val_file,
@@ -671,12 +741,15 @@ def main():
         processor=raw_model.processor,
         max_length=config.max_length,
         image_resize=config.image_resize,
+        coverage_weight_eta=config.coverage_weight_eta,
     )
 
     if use_chunking:
         # Wrap with SessionChunkDataset for multi-step training
-        train_dataset = SessionChunkDataset(train_dataset, chunk_size=config.chunk_size)
-        val_dataset = SessionChunkDataset(val_dataset, chunk_size=config.chunk_size)
+        train_dataset = SessionChunkDataset(train_dataset, chunk_size=config.chunk_size,
+                                             coverage_weight_eta=config.coverage_weight_eta)
+        val_dataset = SessionChunkDataset(val_dataset, chunk_size=config.chunk_size,
+                                           coverage_weight_eta=config.coverage_weight_eta)
         # In chunked mode, each "batch" is one chunk (B=1, multiple steps)
         # batch_size=1 because each chunk already contains chunk_size steps
         chunk_batch_size = config.per_device_batch_size
