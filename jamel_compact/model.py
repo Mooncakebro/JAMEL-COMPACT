@@ -102,6 +102,9 @@ class SideMemoryModule(nn.Module):
         self.num_obs_tokens = num_obs_tokens  # U1: k
 
         # ── Down/up projections (d ↔ d_mem) ──
+        # obs_down projects h to d_mem BEFORE observation attention, so the
+        # attention operates in the compressed d_mem space (not hidden_dim).
+        # This keeps parameter count proportional to d_mem, not d.
         self.obs_down = nn.Linear(hidden_dim, mem_dim)
         self.action_down = nn.Linear(hidden_dim, mem_dim)
         self.h_down = nn.Linear(hidden_dim, mem_dim)
@@ -117,12 +120,18 @@ class SideMemoryModule(nn.Module):
         # ── Memory Predict: FiLM-GRU (in d_mem) ──
         self.gru = FiLMGRUCell(mem_dim)
 
-        # ── U1: Learned observation queries [k, d] ──
-        self.obs_queries = nn.Parameter(torch.randn(num_obs_tokens, hidden_dim) * 0.02)
+        # ── U1: Learned observation queries [k, d_mem] ──
+        # (in d_mem space — attention operates in compressed space)
+        self.obs_queries = nn.Parameter(torch.randn(num_obs_tokens, mem_dim) * 0.02)
 
-        # ── U1: Multi-token observation attention pooling (in d space) ──
+        # ── U1: Multi-token observation attention pooling (in d_mem space) ──
+        # Use valid number of heads for d_mem (must divide evenly)
+        obs_heads = min(num_heads, mem_dim)
+        while obs_heads > 0 and mem_dim % obs_heads != 0:
+            obs_heads -= 1
+        obs_heads = max(obs_heads, 1)
         self.obs_attn = nn.MultiheadAttention(
-            hidden_dim, num_heads, batch_first=True,
+            mem_dim, obs_heads, batch_first=True,
         )
 
         # ── Innovation cross-attention (now with k KV tokens, not 1) ──
@@ -286,8 +295,9 @@ class SideMemoryModule(nn.Module):
                             attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """U1+F3: Masked multi-token observation pooling.
 
-        k learned latent queries attend over non-padding positions of h,
-        producing [B, k, d_mem] (down-projected from [B, k, d]).
+        Projects h down to d_mem FIRST, then k learned latent queries attend
+        over non-padding positions in the compressed d_mem space, producing
+        [B, k, d_mem]. This keeps the attention O(d_mem²) instead of O(d²).
 
         Args:
             h:                [B, N, d] — hidden states from the pretrained layer
@@ -302,12 +312,14 @@ class SideMemoryModule(nn.Module):
         if attention_mask is not None:
             key_padding_mask = (attention_mask == 0)  # [B, N]
 
-        # U1: k learned queries attend over hidden states
-        queries = self.obs_queries.unsqueeze(0).expand(B, -1, -1)  # [B, k, d]
-        z_raw, _ = self.obs_attn(
-            queries, h, h, key_padding_mask=key_padding_mask,
-        )  # [B, k, d]
-        z_down = self.obs_down(z_raw)  # [B, k, d_mem]
+        # Project h to d_mem BEFORE attention (compresses the key/value space)
+        h_down = self.obs_down(h)  # [B, N, d_mem]
+
+        # U1: k learned queries attend over compressed hidden states
+        queries = self.obs_queries.unsqueeze(0).expand(B, -1, -1)  # [B, k, d_mem]
+        z_down, _ = self.obs_attn(
+            queries, h_down, h_down, key_padding_mask=key_padding_mask,
+        )  # [B, k, d_mem]
         return z_down
 
 
