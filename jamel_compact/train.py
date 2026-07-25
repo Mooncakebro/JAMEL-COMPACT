@@ -285,6 +285,13 @@ def train_one_epoch(
             all_loss_dicts = []
 
             for s in range(chunk_size):
+                # sample_weights[s] indexes a 1-d tensor → produces a 0-d
+                # scalar. DataParallel.scatter cannot chunk 0-d tensors, so
+                # unsqueeze to [1] (B=1) to keep it 1-dimensional.
+                sw = batch.get("sample_weights", [None] * chunk_size)[s]
+                if isinstance(sw, torch.Tensor) and sw.dim() == 0:
+                    sw = sw.unsqueeze(0)  # scalar → [1]
+
                 step_data = {
                     "input_ids": batch["input_ids"][s],
                     "attention_mask": batch["attention_mask"][s],
@@ -292,7 +299,7 @@ def train_one_epoch(
                     "action_input_ids": batch["action_input_ids"][s],
                     "pixel_values": batch["pixel_values"][s],
                     "image_grid_thw": batch["image_grid_thw"][s],
-                    "sample_weights": batch.get("sample_weights", [None] * chunk_size)[s],
+                    "sample_weights": sw,
                 }
 
                 loss, loss_dict, memory_states, confidence_states, e_list = \
