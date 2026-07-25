@@ -1,6 +1,8 @@
-# JAMEL-COMPACT: Full Commands (Data Prep → Training → Eval)
+# JAMEL-COMPACT v2: Full Commands (Data Prep → Training → Eval)
 
-This document provides the complete commands to run the JAMEL-COMPACT pipeline end-to-end, including both the **compact** model (with side memory) and the **baseline** (pure Qwen3-VL SFT, no side memory).
+This document provides the complete commands to run the JAMEL-COMPACT v2 pipeline end-to-end, including both the **compact** model (with learned Kalman side memory) and the **baseline** (pure Qwen3-VL SFT, no side memory).
+
+> **v2 changes**: Learned Kalman filter (variance P replaces pinned confidence C), multi-token observation (k=4 latent queries), zero-init injection, session-chunked training (chunk_size=8), coverage-weighted SFT, memory-conditioned generation. Old v1 checkpoints are **not compatible** (`model_version: 2`). See [COMPACT_V2_METHOD.md](COMPACT_V2_METHOD.md) for the full math.
 
 ---
 
@@ -119,9 +121,37 @@ data/compact_sft_data/
 
 ---
 
-## Step 2: Training (Compact Model — with side memory)
+## Step 2: Training (Compact Model v2 — with learned Kalman side memory)
 
-### 2a. Train with Qwen3-VL-2B (default, single GPU)
+> **Data**: v1-prepared data (e.g. `data/compact_sft_data/compact_train.parquet`) is **fully reusable** for v2 — all required columns (`coverage_delta_score`, `session_id`, `step_idx`, `target_app`) are already present. The v2 changes are in how data is *processed* (left-truncation, coverage weights, session chunking), not the data format. No need to re-run data prep.
+
+> **v2 defaults**: `CHUNK_SIZE=8` (session-chunked training), `COVERAGE_WEIGHT_ETA=0.0` (off by default). These are passed automatically by the shell script.
+
+### 2a. Train v2 on GPUs 6,7 (★ recommended)
+
+```bash
+TRAIN_FILE=data/compact_sft_data/compact_train.parquet \
+VAL_FILE=data/compact_sft_data/compact_val.parquet \
+BASE_MODEL=Qwen/Qwen3-VL-2B-Instruct \
+OUTPUT_DIR=outputs/compact_ckpt_v2 \
+TB_LOG_DIR=outputs/compact_tb_v2 \
+GPU_IDS=6,7 \
+MEM_DIM=512 \
+NUM_MEM=16 \
+MAX_LENGTH=8192 \
+MAX_EPOCHS=3 \
+BATCH_SIZE=1 \
+GRAD_ACCUM=16 \
+LR=2e-5 \
+CHUNK_SIZE=8 \
+COVERAGE_WEIGHT_ETA=0.0 \
+LOG_STEPS=10 \
+SAVE_STEPS=500 \
+VAL_STEPS=200 \
+bash shell/run_compact_train.sh
+```
+
+### 2b. Train with Qwen3-VL-2B (single GPU)
 
 ```bash
 TRAIN_FILE=data/compact_sft_data_all/compact_train.parquet \
@@ -137,9 +167,48 @@ MAX_EPOCHS=3 \
 BATCH_SIZE=1 \
 GRAD_ACCUM=16 \
 LR=2e-5 \
+CHUNK_SIZE=8 \
+COVERAGE_WEIGHT_ETA=0.0 \
 LOG_STEPS=10 \
 SAVE_STEPS=500 \
 VAL_STEPS=200 \
+bash shell/run_compact_train.sh
+```
+
+### 2c. Train with Qwen3-VL-8B (single GPU)
+
+```bash
+TRAIN_FILE=data/compact_sft_data_all/compact_train.parquet \
+VAL_FILE=data/compact_sft_data_all/compact_val.parquet \
+BASE_MODEL=Qwen/Qwen3-VL-8B-Instruct \
+OUTPUT_DIR=outputs/compact_ckpt_8b \
+TB_LOG_DIR=outputs/compact_tb_8b \
+GPU_IDS=0 \
+MEM_DIM=512 \
+NUM_MEM=16 \
+MAX_LENGTH=8192 \
+MAX_EPOCHS=3 \
+BATCH_SIZE=1 \
+GRAD_ACCUM=32 \
+LR=1e-5 \
+CHUNK_SIZE=8 \
+LOG_STEPS=10 \
+SAVE_STEPS=500 \
+VAL_STEPS=200 \
+bash shell/run_compact_train.sh
+```
+
+### 2d. Train with coverage-weighted SFT (F7: upweight high-novelty samples)
+
+```bash
+TRAIN_FILE=data/compact_sft_data/compact_train.parquet \
+VAL_FILE=data/compact_sft_data/compact_val.parquet \
+BASE_MODEL=Qwen/Qwen3-VL-2B-Instruct \
+OUTPUT_DIR=outputs/compact_ckpt_cw \
+TB_LOG_DIR=outputs/compact_tb_cw \
+GPU_IDS=6,7 \
+CHUNK_SIZE=8 \
+COVERAGE_WEIGHT_ETA=1.0 \
 bash shell/run_compact_train.sh
 ```
 
@@ -165,7 +234,7 @@ VAL_STEPS=200 \
 bash shell/run_compact_train.sh
 ```
 
-### 2c. Train on multiple GPUs
+### 2e. Train on multiple GPUs
 
 ```bash
 # Use GPUs 0, 1, 2
@@ -175,10 +244,11 @@ BASE_MODEL=Qwen/Qwen3-VL-2B-Instruct \
 OUTPUT_DIR=outputs/compact_ckpt \
 TB_LOG_DIR=outputs/compact_tb \
 GPU_IDS=0,1,2 \
+CHUNK_SIZE=8 \
 bash shell/run_compact_train.sh
 ```
 
-### 2d. Freeze base model (train only side memory)
+### 2f. Freeze base model (train only side memory)
 
 ```bash
 TRAIN_FILE=data/compact_sft_data/compact_train.parquet \
@@ -188,23 +258,26 @@ OUTPUT_DIR=outputs/compact_ckpt_frozen \
 TB_LOG_DIR=outputs/compact_tb_frozen \
 GPU_IDS=0 \
 FREEZE_BASE=1 \
+CHUNK_SIZE=8 \
 bash shell/run_compact_train.sh --freeze-base
 ```
 
-### 2e. Monitor training with TensorBoard
+### 2g. Monitor training with TensorBoard
 
 Open a separate terminal:
 
 ```bash
-tensorboard --logdir outputs/compact_tb --port 6006
+tensorboard --logdir outputs/compact_tb_v2 --port 6006
 # Open http://localhost:6006 in browser
 ```
 
-**Logged metrics:**
-- `train/loss_total`, `train/loss_action`, `train/loss_mem_l2`, `train/loss_mem_entropy`, `train/loss_uncert`
-- `memory/layer{l}_mem_mean`, `memory/layer{l}_mem_std`, `memory/layer{l}_conf_mean`, `memory/layer{l}_conf_std`
-- `train/grad_norm`, `train/learning_rate`, `train/step_time_s`
-- `val/loss_total`, `val/loss_action`, `val/loss_mem_l2`, `val/loss_uncert`
+**Logged metrics (v2):**
+- `train/loss_total`, `train/loss_action`, `train/loss_action_unweighted`, `train/loss_obs`, `train/loss_nll`, `train/loss_mem_l2`
+- `memory/layer{l}_gate`, `memory/layer{l}_lambda_mean`, `memory/layer{l}_Q_mean`, `memory/layer{l}_R_mean`, `memory/layer{l}_init_mem_norm`
+- `train/learning_rate`, `train/step_time_s`
+- `val/loss_total`, `val/loss_action`, `val/loss_obs`, `val/loss_nll`
+
+> **v2 loss keys**: `loss_obs` (observation prediction MSE), `loss_nll` (Gaussian NLL for Kalman variance calibration), `loss_action_unweighted` (unweighted CE for comparison against coverage-weighted `loss_action`).
 
 **Output:**
 ```
@@ -293,22 +366,34 @@ outputs/baseline_ckpt/
 ### 3a. Evaluate compact model on test10 apps (paper setting)
 
 ```bash
-CHECKPOINT=outputs/compact_ckpt/final \
+CHECKPOINT=outputs/compact_ckpt_v2/final \
 APPS_MODE=test10 \
 SCALEWOB_ROOT=env/browser_env/scalewob-env \
 MAX_STEPS=50 \
 NUM_SESSIONS=3 \
-EVAL_OUTPUT=outputs/compact_eval \
+EVAL_OUTPUT=outputs/compact_eval_v2 \
 DEVICE=cuda \
 TEMPERATURE=0.8 \
 TOP_P=0.9 \
 bash shell/run_compact_eval.sh
 ```
 
+### 3a-bis. Evaluate with frozen memory (F5 ablation: --freeze-memory-init)
+
+```bash
+CHECKPOINT=outputs/compact_ckpt_v2/final \
+APPS_MODE=test10 \
+MAX_STEPS=50 \
+NUM_SESSIONS=3 \
+EVAL_OUTPUT=outputs/compact_eval_freeze \
+FREEZE_MEMORY_INIT=1 \
+bash shell/run_compact_eval.sh
+```
+
 ### 3b. Evaluate on train86 apps (sanity check)
 
 ```bash
-CHECKPOINT=outputs/compact_ckpt/final \
+CHECKPOINT=outputs/compact_ckpt_v2/final \
 APPS_MODE=train86 \
 MAX_STEPS=50 \
 NUM_SESSIONS=3 \
@@ -319,7 +404,7 @@ bash shell/run_compact_eval.sh
 ### 3c. Single-app debug
 
 ```bash
-CHECKPOINT=outputs/compact_ckpt/final \
+CHECKPOINT=outputs/compact_ckpt_v2/final \
 APPS=weibo \
 MAX_STEPS=20 \
 NUM_SESSIONS=1 \
@@ -330,7 +415,7 @@ bash shell/run_compact_eval.sh
 ### 3d. Custom app list
 
 ```bash
-CHECKPOINT=outputs/compact_ckpt/final \
+CHECKPOINT=outputs/compact_ckpt_v2/final \
 APPS="alibaba jd taobao" \
 MAX_STEPS=50 \
 NUM_SESSIONS=3 \
@@ -430,13 +515,14 @@ INPUT=/home/spc/JAMEL-DeltaState/data/ExplorerSFT-ReAct_Dataset/data \
 OUTPUT_DIR=data/compact_sft_data_all \
 bash shell/run_compact_prepare_data.sh
 
-# ── 2a. Train compact model (with side memory) ──
+# ── 2a. Train compact model v2 (with learned Kalman side memory) ──
 TRAIN_FILE=data/compact_sft_data/compact_train.parquet \
 VAL_FILE=data/compact_sft_data/compact_val.parquet \
 BASE_MODEL=Qwen/Qwen3-VL-2B-Instruct \
-OUTPUT_DIR=outputs/compact_ckpt \
-TB_LOG_DIR=outputs/compact_tb \
-GPU_IDS=0 \
+OUTPUT_DIR=outputs/compact_ckpt_v2 \
+TB_LOG_DIR=outputs/compact_tb_v2 \
+GPU_IDS=6,7 \
+CHUNK_SIZE=8 \
 bash shell/run_compact_train.sh
 
 # ── 2b. Train baseline (pure Qwen3-VL SFT, no side memory) ──
@@ -449,10 +535,10 @@ GPU_IDS=6,7 \
 MAX_EPOCHS=20 \
 bash shell/run_baseline_train.sh
 
-# ── 3a. Eval compact model ──
-CHECKPOINT=outputs/compact_ckpt/final \
+# ── 3a. Eval compact model v2 ──
+CHECKPOINT=outputs/compact_ckpt_v2/final \
 APPS_MODE=test10 \
-EVAL_OUTPUT=outputs/compact_eval \
+EVAL_OUTPUT=outputs/compact_eval_v2 \
 bash shell/run_compact_eval.sh
 
 # ── 3b. Eval baseline ──
@@ -500,6 +586,8 @@ python scripts/snapshots_to_mp4.py outputs/compact_eval/weibo/session0/ \
 | `LOG_STEPS` | `10` | TensorBoard logging frequency |
 | `SAVE_STEPS` | `500` | Checkpoint save frequency |
 | `VAL_STEPS` | `200` | Validation frequency |
+| `CHUNK_SIZE` | `8` | v2: session-chunked training (1 = single-step, >1 = multi-step with memory carry-forward) |
+| `COVERAGE_WEIGHT_ETA` | `0.0` | v2 F7: 0 = off; >0 upweights high-novelty samples by `1 + eta * max(coverage_delta, 0)` |
 
 ### Evaluation (`run_compact_eval.sh`)
 
@@ -516,6 +604,7 @@ python scripts/snapshots_to_mp4.py outputs/compact_eval/weibo/session0/ \
 | `TEMPERATURE` | `0.8` | Sampling temperature |
 | `TOP_P` | `0.9` | Top-p sampling |
 | `GPU_IDS` | (empty = all) | GPU ID(s) for eval (e.g. `0` or `0,1`) |
+| `FREEZE_MEMORY_INIT` | `0` | v2 F5 ablation: `1` = never write new memory back to session state (tests if memory influences outputs) |
 
 ### Baseline Training (`run_baseline_train.sh`)
 

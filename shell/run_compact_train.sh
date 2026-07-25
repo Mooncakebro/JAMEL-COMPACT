@@ -41,6 +41,7 @@ SAVE_STEPS=${SAVE_STEPS:-500}
 VAL_STEPS=${VAL_STEPS:-200}
 GPU_IDS=${GPU_IDS:-}              # e.g. "0" or "0,1,2" or "" (all)
 CHUNK_SIZE=${CHUNK_SIZE:-8}          # 1 = single-step, >1 = session-chunked (v2 default: 8)
+COVERAGE_WEIGHT_ETA=${COVERAGE_WEIGHT_ETA:-0.0}  # F7: 0=off, >0 upweights high-novelty samples
 
 if [[ ! -f "$TRAIN_FILE" ]]; then
     echo "ERROR: TRAIN_FILE not found: $TRAIN_FILE" >&2
@@ -77,8 +78,7 @@ echo "  Epochs:       $MAX_EPOCHS"
 echo "  Batch:        $BATCH_SIZE × $GRAD_ACCUM (accum)"
 echo "  Chunk size:   $CHUNK_SIZE"
 echo "  LR:           $LR"
-echo ""
-
+  echo "  Cov weight:   $COVERAGE_WEIGHT_ETA"
 exec python -m jamel_compact.train \
     --train-file "$TRAIN_FILE" \
     --val-file "$VAL_FILE" \
@@ -96,5 +96,6 @@ exec python -m jamel_compact.train \
     --save-steps "$SAVE_STEPS" \
     --val-steps "$VAL_STEPS" \
     --chunk-size "$CHUNK_SIZE" \
+    --coverage-weight-eta "$COVERAGE_WEIGHT_ETA" \
     $GPU_ARG \
     "$@"

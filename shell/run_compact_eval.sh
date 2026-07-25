@@ -26,6 +26,7 @@ DEVICE=${DEVICE:-cuda}
 TEMPERATURE=${TEMPERATURE:-0.8}
 TOP_P=${TOP_P:-0.9}
 GPU_IDS=${GPU_IDS:-}              # e.g. "0" or "1" (empty = all)
+FREEZE_MEMORY_INIT=${FREEZE_MEMORY_INIT:-0}  # F5 ablation: 1=never write memory back
 
 if [[ ! -d "$CHECKPOINT" ]]; then
     echo "ERROR: Checkpoint not found: $CHECKPOINT" >&2
@@ -52,7 +53,7 @@ echo "  Max steps:    $MAX_STEPS"
 echo "  Sessions:     $NUM_SESSIONS"
 echo "  Output:       $EVAL_OUTPUT"
 echo "  GPU:          ${GPU_IDS:-all}"
-echo ""
+  echo "  Freeze mem:   ${FREEZE_MEMORY_INIT}"
 
 # Set CUDA_VISIBLE_DEVICES in the shell BEFORE Python launches.
 if [[ -n "$GPU_IDS" ]]; then
@@ -70,4 +71,5 @@ python -m jamel_compact.eval \
     --temperature "$TEMPERATURE" \
     --top-p "$TOP_P" \
     --gpu-ids "$GPU_IDS" \
+    $([[ "$FREEZE_MEMORY_INIT" == "1" ]] && echo "--freeze-memory-init") \
     "$@"
