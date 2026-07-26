@@ -120,6 +120,13 @@ def _scalar(v):
     return float(v)
 
 
+def _ensure_batch_dim(value):
+    """Keep scalar tensors scatterable by ``DataParallel``."""
+    if isinstance(value, torch.Tensor) and value.dim() == 0:
+        return value.unsqueeze(0)
+    return value
+
+
 def _process_chunk_step(
     model,
     raw_model: JAMELCompactWrapper,
@@ -305,8 +312,7 @@ def train_one_epoch(
                 # scalar. DataParallel.scatter cannot chunk 0-d tensors, so
                 # unsqueeze to [1] (B=1) to keep it 1-dimensional.
                 sw = batch.get("sample_weights", [None] * chunk_size)[s]
-                if isinstance(sw, torch.Tensor) and sw.dim() == 0:
-                    sw = sw.unsqueeze(0)  # scalar → [1]
+                sw = _ensure_batch_dim(sw)
 
                 step_data = {
                     "input_ids": batch["input_ids"][s],
@@ -539,7 +545,9 @@ def validate(
                         "action_attention_mask": batch["action_attention_mask"][s],
                         "pixel_values": batch["pixel_values"][s],
                         "image_grid_thw": batch["image_grid_thw"][s],
-                        "sample_weights": batch.get("sample_weights", [None] * chunk_size)[s],
+                        "sample_weights": _ensure_batch_dim(
+                            batch.get("sample_weights", [None] * chunk_size)[s]
+                        ),
                     }
 
                     loss, loss_dict, memory_states, variance_states, e_list = \
