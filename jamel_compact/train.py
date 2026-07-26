@@ -2,9 +2,9 @@
 Training script for JAMEL-COMPACT.
 
 Trains the model end-to-end with:
-  - Action loss (Cross-Entropy)
-  - Memory regularization (L2 + entropy)
-  - Uncertainty calibration (MSE)
+  - Action loss (coverage-weighted Cross-Entropy)
+  - Observation prediction MSE and Gaussian NLL auxiliary losses
+  - Memory L2 regularization
   - TensorBoard logging for all loss components and memory statistics
 
 Usage:
@@ -88,8 +88,12 @@ def set_seed(seed: int):
         torch.cuda.manual_seed_all(seed)
 
 
-def get_action_embedding(action_input_ids: torch.Tensor, model,
-                          device: torch.device) -> torch.Tensor:
+def get_action_embedding(
+    action_input_ids: torch.Tensor,
+    action_attention_mask: torch.Tensor,
+    model,
+    device: torch.device,
+) -> torch.Tensor:
     """
     Convert action token IDs into a fixed-size embedding for FiLM-GRU.
     Uses the pretrained token embedding layer + mean pooling.
@@ -97,10 +101,11 @@ def get_action_embedding(action_input_ids: torch.Tensor, model,
     """
     raw = model.module if isinstance(model, torch.nn.DataParallel) else model
     action_input_ids = action_input_ids.to(device)
+    action_attention_mask = action_attention_mask.to(device)
     embed_layer = raw._get_input_embeddings()
     action_embeds = embed_layer(action_input_ids)  # [B, L_act, d]
-    # Mean pool over action tokens
-    return action_embeds.mean(dim=1)  # [B, d]
+    mask = action_attention_mask.unsqueeze(-1).to(action_embeds.dtype)
+    return (action_embeds * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
 
 
 def _unwrap(m):
@@ -147,8 +152,13 @@ def _process_chunk_step(
     """
     input_ids = step_data["input_ids"].to(device)
     attention_mask = step_data["attention_mask"].to(device)
+    observation_mask = step_data["observation_mask"].to(device)
+    mm_token_type_ids = step_data.get("mm_token_type_ids")
+    if mm_token_type_ids is not None:
+        mm_token_type_ids = mm_token_type_ids.to(device)
     labels = step_data["labels"].to(device)
     action_input_ids = step_data["action_input_ids"].to(device)
+    action_attention_mask = step_data["action_attention_mask"].to(device)
     pixel_values = step_data.get("pixel_values")
     if pixel_values is not None and isinstance(pixel_values, torch.Tensor):
         pixel_values = pixel_values.to(device)
@@ -157,7 +167,9 @@ def _process_chunk_step(
         image_grid_thw = image_grid_thw.to(device)
 
     # Get action embedding (previous action → FiLM-GRU input)
-    action_embed_input = get_action_embedding(action_input_ids, model, device)
+    action_embed_input = get_action_embedding(
+        action_input_ids, action_attention_mask, model, device,
+    )
 
     # Pre-compute visual features on the raw model before DataParallel scatter
     inputs_embeds = None
@@ -203,12 +215,14 @@ def _process_chunk_step(
     outputs = model(
         input_ids=input_ids,
         attention_mask=attention_mask,
+        observation_mask=observation_mask,
+        mm_token_type_ids=mm_token_type_ids,
         action_embed_input=action_embed_input,
         memory_states=mem_input,
         variance_states=var_input,
         labels=labels,
         pixel_values=None,
-        image_grid_thw=None,
+        image_grid_thw=image_grid_thw,
         inputs_embeds=inputs_embeds,
         deepstack_features=deepstack_features,
         visual_pos_mask=visual_pos_mask,
@@ -297,8 +311,13 @@ def train_one_epoch(
                 step_data = {
                     "input_ids": batch["input_ids"][s],
                     "attention_mask": batch["attention_mask"][s],
+                    "observation_mask": batch["observation_mask"][s],
+                    "mm_token_type_ids": batch.get(
+                        "mm_token_type_ids", [None] * chunk_size,
+                    )[s],
                     "labels": batch["labels"][s],
                     "action_input_ids": batch["action_input_ids"][s],
+                    "action_attention_mask": batch["action_attention_mask"][s],
                     "pixel_values": batch["pixel_values"][s],
                     "image_grid_thw": batch["image_grid_thw"][s],
                     "sample_weights": sw,
@@ -331,8 +350,13 @@ def train_one_epoch(
             # ── Single-step training (original path) ──
             input_ids = batch["input_ids"].to(device)
             attention_mask = batch["attention_mask"].to(device)
+            observation_mask = batch["observation_mask"].to(device)
+            mm_token_type_ids = batch.get("mm_token_type_ids")
+            if mm_token_type_ids is not None:
+                mm_token_type_ids = mm_token_type_ids.to(device)
             labels = batch["labels"].to(device)
             action_input_ids = batch["action_input_ids"].to(device)
+            action_attention_mask = batch["action_attention_mask"].to(device)
             pixel_values = batch.get("pixel_values")
             if pixel_values is not None and isinstance(pixel_values, torch.Tensor):
                 pixel_values = pixel_values.to(device)
@@ -340,7 +364,9 @@ def train_one_epoch(
             if image_grid_thw is not None and isinstance(image_grid_thw, torch.Tensor):
                 image_grid_thw = image_grid_thw.to(device)
 
-            action_embed_input = get_action_embedding(action_input_ids, model, device)
+            action_embed_input = get_action_embedding(
+                action_input_ids, action_attention_mask, model, device,
+            )
             B = input_ids.shape[0]
             memory_states, variance_states = raw_model.init_memory(B, device)
 
@@ -364,12 +390,14 @@ def train_one_epoch(
             outputs = model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
+                observation_mask=observation_mask,
+                mm_token_type_ids=mm_token_type_ids,
                 action_embed_input=action_embed_input,
                 memory_states=memory_states,
                 variance_states=variance_states,
                 labels=labels,
                 pixel_values=None,
-                image_grid_thw=None,
+                image_grid_thw=image_grid_thw,
                 inputs_embeds=inputs_embeds,
                 deepstack_features=deepstack_features,
                 visual_pos_mask=visual_pos_mask,
@@ -502,8 +530,13 @@ def validate(
                     step_data = {
                         "input_ids": batch["input_ids"][s],
                         "attention_mask": batch["attention_mask"][s],
+                        "observation_mask": batch["observation_mask"][s],
+                        "mm_token_type_ids": batch.get(
+                            "mm_token_type_ids", [None] * chunk_size,
+                        )[s],
                         "labels": batch["labels"][s],
                         "action_input_ids": batch["action_input_ids"][s],
+                        "action_attention_mask": batch["action_attention_mask"][s],
                         "pixel_values": batch["pixel_values"][s],
                         "image_grid_thw": batch["image_grid_thw"][s],
                         "sample_weights": batch.get("sample_weights", [None] * chunk_size)[s],
@@ -538,8 +571,13 @@ def validate(
                 # ── Single-step validation ──
                 input_ids = batch["input_ids"].to(device)
                 attention_mask = batch["attention_mask"].to(device)
+                observation_mask = batch["observation_mask"].to(device)
+                mm_token_type_ids = batch.get("mm_token_type_ids")
+                if mm_token_type_ids is not None:
+                    mm_token_type_ids = mm_token_type_ids.to(device)
                 labels = batch["labels"].to(device)
                 action_input_ids = batch["action_input_ids"].to(device)
+                action_attention_mask = batch["action_attention_mask"].to(device)
                 pixel_values = batch.get("pixel_values")
                 if pixel_values is not None and isinstance(pixel_values, torch.Tensor):
                     pixel_values = pixel_values.to(device)
@@ -547,7 +585,9 @@ def validate(
                 if image_grid_thw is not None and isinstance(image_grid_thw, torch.Tensor):
                     image_grid_thw = image_grid_thw.to(device)
 
-                action_embed_input = get_action_embedding(action_input_ids, model, device)
+                action_embed_input = get_action_embedding(
+                    action_input_ids, action_attention_mask, model, device,
+                )
                 B = input_ids.shape[0]
                 memory_states, variance_states = raw_model.init_memory(B, device)
 
@@ -570,12 +610,14 @@ def validate(
                 outputs = model(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
+                    observation_mask=observation_mask,
+                    mm_token_type_ids=mm_token_type_ids,
                     action_embed_input=action_embed_input,
                     memory_states=memory_states,
                     variance_states=variance_states,
                     labels=labels,
                     pixel_values=None,
-                    image_grid_thw=None,
+                    image_grid_thw=image_grid_thw,
                     inputs_embeds=inputs_embeds,
                     deepstack_features=deepstack_features,
                     visual_pos_mask=visual_pos_mask,

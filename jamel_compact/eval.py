@@ -273,6 +273,7 @@ class CompactAgent:
                 top_p=self.top_p,
                 pixel_values=inputs.get("pixel_values"),
                 image_grid_thw=inputs.get("image_grid_thw"),
+                mm_token_type_ids=inputs.get("mm_token_type_ids"),
                 e_prev_list=self._e_prev_list,
                 freeze_memory=self._freeze_memory,
             )

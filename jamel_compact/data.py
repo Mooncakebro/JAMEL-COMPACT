@@ -108,8 +108,8 @@ class CompactDataset(Dataset):
     def _read_files(self):
         # Only load columns needed for training to save memory
         needed_cols = [self.prompt_key, self.response_key, self.image_key,
-                      self.action_key, "session_id", "step_idx", "target_app",
-                      "coverage_delta_score"]
+                      self.action_key, "session_id", "episode_idx", "step_idx",
+                      "session_step_idx", "target_app", "coverage_delta_score"]
         frames = []
         for p in self.parquet_files:
             try:
@@ -118,6 +118,26 @@ class CompactDataset(Dataset):
                 df_p = pd.read_parquet(p)
             frames.append(df_p)
         self.dataframe = pd.concat(frames, ignore_index=True)
+        self._build_previous_actions()
+
+    def _build_previous_actions(self):
+        """Map each row to the action taken at the preceding session step."""
+        self._previous_actions = {}
+        if "session_id" not in self.dataframe.columns:
+            return
+
+        order_col = (
+            "session_step_idx"
+            if "session_step_idx" in self.dataframe.columns
+            else "step_idx"
+        )
+        for _, group in self.dataframe.groupby("session_id", sort=False):
+            ordered = group.sort_values(order_col, kind="stable")
+            previous_action = "noop()"
+            for row_idx, row in ordered.iterrows():
+                self._previous_actions[row_idx] = previous_action
+                current_action = row.get(self.action_key, "")
+                previous_action = "" if pd.isna(current_action) else str(current_action)
 
     def _validate_and_filter(self):
         """Filter out samples that exceed max_length.
@@ -169,7 +189,7 @@ class CompactDataset(Dataset):
 
         prompt = str(row.get(self.prompt_key, ""))
         response = str(row.get(self.response_key, ""))
-        action = str(row.get(self.action_key, ""))
+        action = self._previous_actions.get(row_idx, "")
 
         # ── Build chat messages ──
         # Always load the screenshot if available, even if prompt has no <image> tag.
@@ -226,6 +246,9 @@ class CompactDataset(Dataset):
 
         input_ids = full_inputs["input_ids"][0]
         attention_mask = full_inputs.get("attention_mask", torch.ones_like(input_ids))[0]
+        mm_token_type_ids = full_inputs.get("mm_token_type_ids")
+        if mm_token_type_ids is not None:
+            mm_token_type_ids = mm_token_type_ids[0]
         prompt_length = prompt_inputs["input_ids"].shape[-1]
 
         # ── Truncate if needed ──
@@ -243,6 +266,8 @@ class CompactDataset(Dataset):
             # Left-truncate prompt by `excess` tokens, keep all response tokens
             input_ids = input_ids[excess:]
             attention_mask = attention_mask[excess:]
+            if mm_token_type_ids is not None:
+                mm_token_type_ids = mm_token_type_ids[excess:]
             prompt_length = prompt_length - excess
             # F2: If the surviving prompt is shorter than 64 tokens, drop
             # the sample — too little context for meaningful memory updates.
@@ -261,13 +286,25 @@ class CompactDataset(Dataset):
             f"All labels are -100 after truncation (prompt_len={prompt_length}, " \
             f"seq_len={input_ids.shape[0]})"
 
+        # Only the prompt/current observation exists at inference time. The
+        # response tokens are teacher-forced targets and must not enter the
+        # memory observation pool.
+        observation_mask = torch.zeros_like(attention_mask)
+        observation_mask[:effective_prompt_len] = 1
+
         # ── Action embedding input ──
         action_tokens = self.tokenizer.encode(
             action, add_special_tokens=False, max_length=32, truncation=True,
         )
+        has_previous_action = bool(action_tokens)
         if not action_tokens:
             action_tokens = [self.tokenizer.pad_token_id or 0]
         action_input_ids = torch.tensor(action_tokens, dtype=torch.long)
+        action_attention_mask = torch.full(
+            action_input_ids.shape,
+            1 if has_previous_action else 0,
+            dtype=torch.long,
+        )
 
         # ── Extract pixel values if available ──
         # Qwen3-VL processor returns pixel_values as [num_patches, patch_dim]
@@ -296,8 +333,11 @@ class CompactDataset(Dataset):
         return {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
+            "observation_mask": observation_mask,
+            "mm_token_type_ids": mm_token_type_ids,
             "labels": labels,
             "action_input_ids": action_input_ids,
+            "action_attention_mask": action_attention_mask,
             "pixel_values": pixel_values,
             "image_grid_thw": image_grid_thw,
             "session_id": str(row.get("session_id", "")),
@@ -329,8 +369,11 @@ def collate_fn(batch: list[dict], pad_token_id: int = 0) -> dict:
 
     input_ids = []
     attention_masks = []
+    observation_masks = []
+    mm_token_type_ids_list = []
     labels = []
     action_inputs = []
+    action_attention_masks = []
     sample_weights = []
 
     for item in batch:
@@ -345,6 +388,14 @@ def collate_fn(batch: list[dict], pad_token_id: int = 0) -> dict:
             item["attention_mask"],
             torch.zeros(pad_len, dtype=torch.long),
         ]))
+        observation_masks.append(torch.cat([
+            item["observation_mask"],
+            torch.zeros(pad_len, dtype=torch.long),
+        ]))
+        mm_ids = item.get("mm_token_type_ids")
+        if mm_ids is not None:
+            mm_ids = torch.cat([mm_ids, torch.zeros(pad_len, dtype=torch.long)])
+        mm_token_type_ids_list.append(mm_ids)
         labels.append(torch.cat([
             item["labels"],
             torch.full((pad_len,), -100, dtype=torch.long),
@@ -356,17 +407,25 @@ def collate_fn(batch: list[dict], pad_token_id: int = 0) -> dict:
             item["action_input_ids"],
             torch.full((act_pad,), pad_token_id, dtype=torch.long),
         ]))
+        action_attention_masks.append(torch.cat([
+            item["action_attention_mask"],
+            torch.zeros(act_pad, dtype=torch.long),
+        ]))
         sample_weights.append(item.get("sample_weight", 1.0))
 
     result = {
         "input_ids": torch.stack(input_ids),
         "attention_mask": torch.stack(attention_masks),
+        "observation_mask": torch.stack(observation_masks),
         "labels": torch.stack(labels),
         "action_input_ids": torch.stack(action_inputs),
+        "action_attention_mask": torch.stack(action_attention_masks),
         "sample_weights": torch.tensor(sample_weights, dtype=torch.float32),
         "session_ids": [item["session_id"] for item in batch],
         "step_indices": [item["step_idx"] for item in batch],
     }
+    if all(ids is not None for ids in mm_token_type_ids_list):
+        result["mm_token_type_ids"] = torch.stack(mm_token_type_ids_list)
 
     # Pixel values: concatenate all patches along dim 0.
     # Each sample is [num_patches, patch_dim] (2D). Concatenating gives
@@ -422,8 +481,11 @@ def session_collate_fn(batch, pad_token_id: int = 0) -> dict:
 
     input_ids_list = []
     attention_masks_list = []
+    observation_masks_list = []
+    mm_token_type_ids_list = []
     labels_list = []
     action_inputs_list = []
+    action_attention_masks_list = []
     pixel_values_list = []
     grid_thws_list = []
     sample_weights_list = []
@@ -440,6 +502,14 @@ def session_collate_fn(batch, pad_token_id: int = 0) -> dict:
             item["attention_mask"],
             torch.zeros(pad_len, dtype=torch.long),
         ]))
+        observation_masks_list.append(torch.cat([
+            item["observation_mask"],
+            torch.zeros(pad_len, dtype=torch.long),
+        ]))
+        mm_ids = item.get("mm_token_type_ids")
+        if mm_ids is not None:
+            mm_ids = torch.cat([mm_ids, torch.zeros(pad_len, dtype=torch.long)])
+        mm_token_type_ids_list.append(mm_ids)
         labels_list.append(torch.cat([
             item["labels"],
             torch.full((pad_len,), -100, dtype=torch.long),
@@ -450,6 +520,10 @@ def session_collate_fn(batch, pad_token_id: int = 0) -> dict:
         action_inputs_list.append(torch.cat([
             item["action_input_ids"],
             torch.full((act_pad,), pad_token_id, dtype=torch.long),
+        ]))
+        action_attention_masks_list.append(torch.cat([
+            item["action_attention_mask"],
+            torch.zeros(act_pad, dtype=torch.long),
         ]))
 
         pv = item.get("pixel_values")
@@ -463,8 +537,14 @@ def session_collate_fn(batch, pad_token_id: int = 0) -> dict:
     result = {
         "input_ids": [ids.unsqueeze(0) for ids in input_ids_list],
         "attention_mask": [am.unsqueeze(0) for am in attention_masks_list],
+        "observation_mask": [om.unsqueeze(0) for om in observation_masks_list],
+        "mm_token_type_ids": [
+            ids.unsqueeze(0) if ids is not None else None
+            for ids in mm_token_type_ids_list
+        ],
         "labels": [lab.unsqueeze(0) for lab in labels_list],
         "action_input_ids": [ai.unsqueeze(0) for ai in action_inputs_list],
+        "action_attention_mask": [am.unsqueeze(0) for am in action_attention_masks_list],
         "pixel_values": pixel_values_list,  # list of [num_patches, dim] or None
         "image_grid_thw": grid_thws_list,    # list of [num_images, 3] or None
         "sample_weights": torch.tensor(sample_weights_list, dtype=torch.float32),
@@ -542,26 +622,41 @@ class SessionChunkDataset(Dataset):
         df = self.dataframe
         valid_indices = self._base._valid_indices
 
-        # Group valid indices by session_id, preserving step_idx order
+        # Group by session_id. session_step_idx is monotonic across reset-local
+        # episodes; step_idx restarts at every reset and must not be used here.
         session_groups = {}
-        for idx in valid_indices:
-            row = df.iloc[idx]
+        for dataset_idx, row_idx in enumerate(valid_indices):
+            row = df.iloc[row_idx]
             sid = str(row.get("session_id", ""))
-            step_idx = int(row.get("step_idx", 0))
+            order_idx = int(row.get("session_step_idx", row.get("step_idx", 0)))
             if sid not in session_groups:
                 session_groups[sid] = []
-            session_groups[sid].append((step_idx, idx))
+            # Store CompactDataset positions, not raw dataframe indices.
+            session_groups[sid].append((order_idx, dataset_idx))
 
-        # Sort each session by step_idx, then build chunks
+        # Sort by the continuous session index and split at missing steps so a
+        # dropped sample cannot silently bridge unrelated observations.
         self._chunks = []
         for sid, steps in session_groups.items():
-            steps.sort(key=lambda x: x[0])  # sort by step_idx
-            for i in range(0, len(steps), self.chunk_size):
-                chunk = steps[i:i + self.chunk_size]
-                # Only keep chunks that are full (or at least 2 steps)
-                # Shorter chunks at session boundaries are still useful
-                if len(chunk) >= 1:
-                    self._chunks.append([idx for _, idx in chunk])
+            steps.sort(key=lambda x: x[0])
+            runs = []
+            run = []
+            previous_order = None
+            for order_idx, row_idx in steps:
+                if previous_order is not None and order_idx != previous_order + 1:
+                    if run:
+                        runs.append(run)
+                    run = []
+                run.append((order_idx, row_idx))
+                previous_order = order_idx
+            if run:
+                runs.append(run)
+
+            for run in runs:
+                for i in range(0, len(run), self.chunk_size):
+                    chunk = run[i:i + self.chunk_size]
+                    if chunk:
+                        self._chunks.append([idx for _, idx in chunk])
 
         # Shuffle chunk order (DataLoader will also shuffle, but this helps
         # when shuffle=True samples are drawn)
@@ -821,7 +916,7 @@ invent bids and never combine two actions in one response."""
             pruned = _prune_axtree(axtree_raw, max_chars=8000)
             target_app = str(row.get("target_app", ""))
             start_url = str(row.get("start_url", row.get("target_url", "")))
-            step_idx = int(row.get("step_idx", row.get("session_step_idx", 0)))
+            step_idx = int(row.get("session_step_idx", row.get("step_idx", 0)))
             open_urls = row.get("before_open_pages_urls", (start_url,))
 
             new_prompt = _build_prompt(
@@ -853,8 +948,9 @@ def prepare_compact_dataset(
     Prepare SFT data for JAMEL-COMPACT training.
 
     Unlike original JAMEL, no memory compression is needed — the model
-    learns memory online.  We just concatenate, shuffle, and split into
-    train/val parquet files.
+    learns memory online. We concatenate the data and split complete sessions
+    into train/validation parquet files so recurrent chunks never cross the
+    train/validation boundary.
 
     Args:
         input_files: can be:
@@ -865,7 +961,7 @@ def prepare_compact_dataset(
                       The directory case auto-discovers all
                       trajectory.parquet files under app subdirectories.
         output_dir:  directory to write train/val parquet
-        val_ratio:   fraction of data for validation
+        val_ratio:   fraction of sessions for validation (at least one session)
         seed:        random seed for shuffling
         variant:     if input_files is a root containing both "react-text"
                      and "react-vision", filter to one variant.
@@ -929,24 +1025,33 @@ def prepare_compact_dataset(
     del frames_meta
     gc.collect()
 
-    print(f"[data] Total: {len(df_meta)} rows | "
+    total_rows = len(df_meta)
+    print(f"[data] Total: {total_rows} rows | "
           f"sessions={df_meta['session_id'].nunique() if 'session_id' in df_meta.columns else 'N/A'} | "
           f"apps={df_meta['target_app'].nunique() if 'target_app' in df_meta.columns else 'N/A'}")
 
-    # ── Shuffle and split ──
+    # ── Session-level shuffle and split ──
     rng = random.Random(seed)
-    indices = list(range(len(df_meta)))
-    rng.shuffle(indices)
+    session_to_indices = {}
+    for row_idx, session_id in enumerate(df_meta["session_id"].astype(str)):
+        session_to_indices.setdefault(session_id, []).append(row_idx)
+    session_ids = list(session_to_indices)
+    rng.shuffle(session_ids)
 
-    if val_ratio <= 0:
-        train_indices = set(indices)
-        val_indices = {indices[0]}
-    else:
-        split_idx = max(1, int(len(df_meta) * (1.0 - val_ratio)))
-        train_indices = set(indices[:split_idx])
-        val_indices = set(indices[split_idx:])
-        if len(val_indices) == 0:
-            val_indices = {indices[0]}
+    if len(session_ids) < 2:
+        raise ValueError(
+            "Session-level splitting requires at least two distinct sessions"
+        )
+    val_session_count = max(1, int(round(len(session_ids) * max(val_ratio, 0.0))))
+    val_session_count = min(val_session_count, len(session_ids) - 1)
+    val_sessions = set(session_ids[:val_session_count])
+    val_indices = {
+        row_idx
+        for session_id in val_sessions
+        for row_idx in session_to_indices[session_id]
+    }
+    all_indices = set(range(len(df_meta)))
+    train_indices = all_indices - val_indices
 
     del df_meta
     gc.collect()
@@ -998,7 +1103,7 @@ def prepare_compact_dataset(
             del df_chunk
             if global_idx % 3000 == 0:
                 gc.collect()
-                print(f"  ... processed {global_idx}/{len(indices)} rows")
+                print(f"  ... processed {global_idx}/{total_rows} rows")
     finally:
         # Close writers and release pyarrow C++ resources to avoid
         # "terminate called without an active exception" on exit.
@@ -1013,7 +1118,7 @@ def prepare_compact_dataset(
         except Exception:
             pass
 
-    del train_indices, val_indices, indices
+        del train_indices, val_indices, session_to_indices, session_ids, total_rows
     gc.collect()
 
     print(f"[data] Train: {train_path}")

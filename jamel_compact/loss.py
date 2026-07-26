@@ -104,16 +104,11 @@ def compute_compact_loss(
     loss_nll = loss_nll.to(device=device, dtype=dtype)
 
     # ── 4. L_mem: L2 regularization on memory states ──
-    # L_mem = (1/L) Σ_l ||M_l||²_2  — per-layer L2 norm (sum, not mean)
-    # Using sum instead of mean makes the regularizer batch-size independent:
-    # the L2 norm of the memory state scales with B, so ||M||² scales with B,
-    # but when multiplied by lambda_mem and combined with L_act (which is also
-    # ~per-sample), the relative weight stays consistent.
-    # For B=1 this is identical to the mean-based version.
+    # L_mem = (1/L) Σ_l ||M_l||²_2, matching the method definition.
     loss_mem = torch.tensor(0.0, device=device, dtype=dtype)
     L = len(memory_states)
     for M in memory_states:
-        loss_mem = loss_mem + M.pow(2).sum()
+        loss_mem = loss_mem + M.float().pow(2).sum().to(dtype)
     loss_mem = loss_mem / L
 
     # ── Total ──

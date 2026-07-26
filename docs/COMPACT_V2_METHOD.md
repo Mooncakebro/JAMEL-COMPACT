@@ -64,31 +64,39 @@ $$\hat P_l^t = \lambda_l \odot P_l^{t-1} + \mathrm{softplus}(W_q\, a_\downarrow)
 
 $\lambda_l$ is a learnable per-slot vector initialized to the hierarchy
 (0.70 shallow / 0.85 mid / 0.95 deep), so shallow layers still forget faster but
-can adapt.
+can adapt. $\bar e_{t-1}=\min(e_{t-1}, e_{max})$ is a numerical guardrail on the
+recurrent inflation path only; the NLL below still uses the un-clipped surprise.
 
 ### Step 2 — Pretrained layer (unchanged)
 
 $$h_{layer} = \mathrm{DecoderLayer}_l(H_{l-1})$$
 
 The pretrained self-attention + FFN are called in-place; KV cache is kept for
-generation (§4).
+generation (§4). After the final decoder layer, the wrapper applies the
+pretrained decoder's final normalization before the unchanged LM head.
+For image prompts, the wrapper preserves the processor's modality IDs and uses
+the base Qwen3-VL 3D M-RoPE position computation.
 
 ### Step 3 — Observe (learned masked pooling)
 
-$k$ learned latent queries attend over the non-padding positions of $h_{layer}$:
+$h_{layer}$ is projected to the compact memory width first, then $k$ learned
+latent queries attend over prompt/current-observation positions only:
 
-$$Z_t = \mathrm{AttnPool}_{masked}(Q_{1..k},\; h_{layer}) \in \mathbb{R}^{B\times k\times d},
-\qquad Z_\downarrow = W_{z\downarrow} Z_t$$
+$$\tilde H = W_{z\downarrow}h_{layer} \in \mathbb{R}^{B\times N\times d_{mem}},
+\qquad Z_t = \mathrm{AttnPool}_{masked}(Q^{mem}_{1..k},\; \tilde H)
+\in \mathbb{R}^{B\times k\times d_{mem}}$$
 
 This replaces v1's "mean over everything including padding" and, because $k>1$,
-makes the innovation below non-degenerate.
+makes the innovation below non-degenerate. Projecting before attention keeps the
+pooling cost in $d_{mem}$ rather than $d$. During teacher-forced training, the
+mask excludes assistant response tokens so memory cannot observe its target.
 
 ### Step 4 — Correct (Kalman update, learned)
 
-$$\Delta M = \mathrm{CrossAttn}(Q{=}\hat M,\; K,V{=}Z_\downarrow)
+$$\Delta M = \mathrm{CrossAttn}(Q{=}\hat M,\; K,V{=}Z_t)
 \qquad\text{(innovation, now per-slot)}$$
 
-$$R_t = \mathrm{softplus}\big(\mathrm{MLP}(\bar Z_\downarrow)\big)
+$$R_t = \mathrm{softplus}\big(\mathrm{MLP}(\bar Z_t)\big) + R_{min}
 \qquad\text{(learned observation noise)}$$
 
 $$K_t = \frac{\hat P}{\hat P + R_t} \in [0,1]^{B\times N_m\times 1}
@@ -105,7 +113,7 @@ gradients actually flow — unlike v1's pinned recursion.
 will see — this is what gives "predict" a meaning and defines surprise:
 
 $$\hat Z = g_\phi(\overline{\hat M}), \qquad
-e_t = \big\|\hat Z - \bar Z_\downarrow\big\|^2 \quad (\text{surprise})$$
+e_t = \big\|\hat Z - \bar Z_t\big\|^2 \quad (\text{surprise})$$
 
 $e_t$ feeds two places: the losses below, and the $\gamma_e \bar e_{t-1}$ inflation
 term in Step 1 of the next step (closed adaptive loop).
@@ -115,9 +123,9 @@ term in Step 1 of the next step (closed adaptive loop).
 $$H_l = h_{layer} + w_l \tanh(g_l)\cdot W_\uparrow\,
 \mathrm{CrossAttn}(Q{=}h_\downarrow,\; K,V{=}M_t)$$
 
-with $g_l = 0$ and $W_\uparrow = 0$ at initialization, so **at step 0 the wrapped
-model is exactly the pretrained LLM**; the memory pathway opens only as training
-makes it useful. $w_l$ keeps the hierarchy (0.8/0.5/0.3).
+with $W_\uparrow = 0$ and a small nonzero gate at initialization, so **at step 0
+the wrapped model is exactly the pretrained LLM** while gradients can immediately
+train the output projection. $w_l$ keeps the hierarchy (0.8/0.5/0.3).
 
 ## 3. Why the uncertainty now works
 
@@ -148,11 +156,14 @@ history lives in $(M_t, P_t)$ carried across steps.
   (`SessionChunkDataset`). Memory *values* carry forward inside a chunk; gradients
   are detached between steps (TBPTT-1), so each step's loss trains the modules
   against a realistic, evolved memory state. Samples can be weighted by the
-  coverage-delta novelty signal already present in the data ($w_{cov}$).
+  coverage-delta novelty signal already present in the data ($w_{cov}$). The
+  control input is the actual previous action $a_{t-1}$ (`noop()` at session
+  start), and train/validation splits contain disjoint complete sessions.
 - **Inference** runs one memory-augmented forward over the prompt (updating
-  $M, P, e$), hands the resulting per-layer KV cache to the base model's
-  `generate()`, and thereby samples actions **conditioned on memory** — fixing
-  v1's bypass, where the injected states were discarded.
+  $M, P, e$), then uses the resulting per-layer KV cache in a cache-backed
+  incremental decoding loop with the pretrained decoder. It thereby samples
+  actions **conditioned on memory** — fixing v1's bypass, where the injected
+  states were discarded.
 
 ## 5. Losses
 
@@ -164,10 +175,11 @@ $$\mathcal{L} = w_{cov}\,\mathcal{L}_{act}
 - $\mathcal{L}_{act}$ — shifted next-token cross-entropy on response tokens
   (prompt masked to −100). $w_{cov} = 1 + \eta\,\max(\Delta c, 0)$ weights
   high-novelty samples (optional, $\eta{=}0$ = off).
-- $\mathcal{L}_{obs} = \frac{1}{L}\sum_l \|\hat Z_l - \bar Z_{\downarrow,l}\|^2$
-  — trains the memory to anticipate observations (target detached).
-- $\mathcal{L}_{nll} = \frac{1}{L}\sum_l \frac{1}{2}\big(\log R_l + e_l^2 / R_l\big)$
-  — Gaussian NLL calibrating the learned observation noise against actual surprise.
+- $\mathcal{L}_{obs} = \frac{1}{L}\sum_l \|\hat Z_l - \bar Z_{t,l}\|^2$
+  — trains the memory to anticipate the down-projected observation (target detached).
+- $\mathcal{L}_{nll} = \frac{1}{L}\sum_l \frac{1}{2}\big(\log R_l + e_l / R_l\big)$,
+  where $e_l$ is already the per-sample squared residual — Gaussian NLL
+  calibrating the learned observation noise against actual surprise.
 - $\lambda_{mem}$ keeps memory magnitudes bounded ($10^{-3}$).
 
 ## 6. Initialization and key hyperparameters
@@ -175,9 +187,9 @@ $$\mathcal{L} = w_{cov}\,\mathcal{L}_{act}
 | Item | Value |
 |---|---|
 | Memory | $N_m{=}16$ tokens/layer, $d_{mem}{=}512$, $M_0$ learnable $\sim\mathcal{N}(0, 0.02^2)$ |
-| Uncertainty | $P_0 = 0.5$; $\lambda_l$ init 0.70/0.85/0.95 (shallow/mid/deep); $\gamma_e = 1.0$ |
-| Observation | $k{=}4$ latent queries |
-| Injection | $g_l{=}0$, $W_\uparrow{=}0$; $w_l$ = 0.8/0.5/0.3 |
+| Uncertainty | $P_0 = 0.5$; $\lambda_l$ init 0.70/0.85/0.95; $\gamma_e = 1.0$; $e_{max}=10$; $R_{min}=0.01$ |
+| Observation | $k{=}4$ latent queries in $d_{mem}$ after pre-projection |
+| Injection | $g_l{=}0.1$, $W_\uparrow{=}0$; $w_l$ = 0.8/0.5/0.3 |
 | Training | chunk 8 steps, TBPTT-1; $\lambda_{obs}{=}0.1$, $\lambda_{nll}{=}0.1$, $\lambda_{mem}{=}10^{-3}$ |
 | Parameter overhead | ≈ +12% on Qwen3-VL-2B, ≈ +6% on 8B (same order as v1; U1–U3 add < 1M/layer) |
 

@@ -24,6 +24,10 @@ Root causes (verified in code — do not skip the diagnosis):
 | R6 | Observation = unmasked mean over **all** positions (padding included) | `model.py:198-205` |
 | R7 | Innovation cross-attention has a single KV token ⇒ `ΔM` identical across all 16 slots (rank-1 write) | `model.py:169-173` |
 | R8 | Default `chunk_size=1`: memory never evolves during training; eval uses 50-step evolved memory (distribution shift) | `config.py:59`, `train.py:289-341` |
+| R9 | Wrapper bypasses the pretrained final norm and adds an extra per-layer injection norm, so zero injection is not base-model-equivalent | `model.py` manual decoder/LM-head path |
+| R10 | Training feeds the current target action instead of $a_{t-1}$ and orders reset-local episodes by `step_idx` | `data.py`, `SessionChunkDataset` |
+| R11 | `e` is already an MSE, but NLL uses `e**2 / R`, making the residual term quartic | `model.py` `SideMemoryModule.correct()` |
+| R12 | Observation pooling sees teacher-forced response tokens during training, which are absent at inference | `data.py`, `model.py` pooling mask |
 
 ## Ground rules
 
@@ -76,23 +80,28 @@ response tokens, never prompt tokens; zero all-`-100` samples in a full pass ove
 ### F3 — Masked observation pooling (fixes R6)
 
 **Change**:
-- `model.py` `extract_observation(h, attention_mask)`:
-  `z = (h * mask.unsqueeze(-1)).sum(1) / mask.sum(1, keepdim=True).clamp(min=1)`.
-- Thread `attention_mask` through both call sites (`forward()` ~line 691,
-  `generate()` ~line 802).
+- Thread a dedicated observation mask through training and generation. It masks
+  padding and, during teacher forcing, masks assistant response tokens.
+- Phase-1 mean pooling uses this mask; U1 replaces the mean with latent-query
+  attention while preserving identical mask semantics.
 
 **Acceptance**: for the same unpadded sample, `z` computed alone vs inside a padded
-batch differs by < 1e-5.
+batch differs by < 1e-5; changing response tokens does not change pooled $Z_t$.
 
 ### F4 — Zero-initialized injection (fixes R5)
 
 **Change** (`model.py` `SideMemoryModule.__init__` / `inject`):
 - `nn.init.zeros_(self.delta_up.weight); nn.init.zeros_(self.delta_up.bias)`.
-- Replace the fixed `inject_weight` float with a learnable gate:
-  `self.inject_gate = nn.Parameter(torch.zeros(()))`; inject uses
+- Replace the fixed `inject_weight` float with a small nonzero learnable gate
+  (default `0.1`); inject uses
   `h + w_max * tanh(self.inject_gate) * delta_up` where `w_max` keeps the current
   hierarchical values (0.8/0.5/0.3).
-- Keep the existing `inject_norm` LayerNorm.
+- Remove/bypass the extra `inject_norm`; zero injection must return `h` exactly.
+- Apply the pretrained decoder's final norm before the LM head in both forward
+  and generation paths.
+
+Zeroing both `delta_up` and the gate is forbidden: it gives both factors zero
+gradient and permanently disconnects memory from action CE.
 
 **Acceptance**: script `scripts/check_zero_init.py` (new): load base model and
 wrapper (fresh side memory), assert wrapper logits == base logits (`allclose`,
@@ -103,17 +112,19 @@ rtol 1e-4, atol 1e-4) on a real batch. After this fix, compact action CE should 
 
 **Change** (`model.py` `generate()`):
 - During the memory-update prompt pass, call each decoder layer with
-  `use_cache=True` and collect per-layer `(key, value)`; assemble a
-  `transformers.cache_utils.DynamicCache` (legacy tuple format if required by the
-  installed transformers version).
-- Call `self.llm.generate(..., past_key_values=cache)` so generation starts from
-  the **memory-injected** hidden states. Verify position IDs / RoPE handling for
-  Qwen3-VL (mrope) matches the base model's own prefill — compare against
-  `self.llm.forward` on the same prompt.
-- Fallback if the cache handoff proves incompatible: greedy/sampling loop that
-  calls the wrapper `forward()` per generated token with memory held fixed (slower,
-  but correct). Gate the choice behind `config.memory_conditioned_generate`
-  (default True).
+  `use_cache=True` and populate a `transformers.cache_utils.DynamicCache`.
+- Preserve processor-provided `mm_token_type_ids` and use the base Qwen3-VL
+  `compute_3d_position_ids`/`get_rope_index` path for prompt and incremental
+  generation M-RoPE; do not substitute plain 1D positions for image prompts.
+- Use the memory-injected prompt hidden state for the first-token logits, then
+  run the pretrained decoder one token at a time against the populated cache.
+  This is the current cache-backed implementation of memory-conditioned
+  continuation; verify position IDs / RoPE handling for Qwen3-VL (M-RoPE) matches
+  the base model's own prefill.
+- Gate the cache-backed path behind `config.memory_conditioned_generate`
+  (default True). Setting it to `False` remains an explicit raw-base-generation
+  ablation; a wrapper-forward fallback for incompatible Transformers versions is
+  not silently substituted because that would change the evaluation contract.
 - Add eval flag `--freeze-memory-init` (eval.py): never write `new_memory` back
   into the session state. Used for ablation.
 
@@ -127,13 +138,18 @@ still not influencing outputs — investigate).
 **Change**:
 - `config.py`: `chunk_size: int = 8`.
 - `shell/run_compact_train.sh`: pass through `CHUNK_SIZE=${CHUNK_SIZE:-8}`.
-- Verify `SessionChunkDataset` groups by `session_id` and orders by `step_idx`
+- Verify `SessionChunkDataset` groups by `session_id` and orders by
+  continuous `session_step_idx` (not reset-local `step_idx`)
   (fix if not).
+- Build action conditioning from the preceding session action $a_{t-1}$, with
+  `noop()` at session start; mask action-token padding during pooling.
+- Split train/validation by complete `session_id`, never by individual rows.
 - Keep TBPTT-1 detach (`train.py:161-176`) for now; add `config.tbptt_detach`
   (default True) so it can be ablated.
 
 **Acceptance**: TensorBoard `memory/*` stats differ between chunk step 0 and step 7
-(memory actually evolves); loss curves stable.
+(memory actually evolves); every chunk has consecutive `session_step_idx`; train
+and validation session sets are disjoint; loss curves stable.
 
 ### F7 — Coverage-weighted SFT (uses the novelty signal already in the data)
 
@@ -151,7 +167,7 @@ loss; training runs stable.
 
 **Change**:
 - Throttled TensorBoard histograms (every `log_steps` optimizer steps, cheap):
-  per-layer `K`/`1-C`, `match`, `||M||`.
+  per-layer `K`, `P`, `R`, surprise `e`, and `||M||`.
 - New `scripts/probe_memory.py`: linear probe on eval-time memory snapshots —
   predict `app id`, `step_idx` from `M_t` per layer; report accuracy per layer.
 - This task has no model changes.
@@ -169,14 +185,17 @@ U1 → U2 → U3. U4 items are independent experiments, one at a time.
 ### U1 — Multi-token observation (fixes R7)
 
 **Change** (`SideMemoryModule`):
-- Add `self.obs_queries = nn.Parameter(torch.randn(k, d) * 0.02)` with `k = 4`
+- Add `self.obs_queries = nn.Parameter(torch.randn(k, d_mem) * 0.02)` with `k = 4`
   (config `num_obs_tokens`).
-- Observation: `Z = MultiheadAttention(Q=obs_queries.expand(B,-1,-1), KV=h,
-  key_padding_mask=~mask)` → `[B, k, d]`, then `obs_down` per token →
-  `[B, k, d_mem]`.
+- Project first: `h_down = obs_down(h)` → `[B, N, d_mem]`; then
+  `Z = MultiheadAttention(Q=obs_queries.expand(B,-1,-1), KV=h_down,
+  key_padding_mask=~observation_mask)` → `[B, k, d_mem]`.
+- This pre-projection is the required low-overhead implementation; attention must
+  not operate in full hidden width `d`.
 - `mem_cross_attn` now gets `k` KV tokens (was 1) — innovation is no longer
   rank-1.
-- `k_gate` input: concat per-slot `m_hat_i` with mean-pooled `z_down` (as now).
+- U2's scalar Kalman gain consumes the resulting per-slot innovation; the old
+  learned `k_gate` path is removed with the confidence recursion.
 
 **Acceptance**: `ΔM` variance across slots > 0; F3's mask test still passes;
 checkpoint `model_version: 2`.
@@ -192,12 +211,15 @@ checkpoint `model_version: 2`.
   - `Q_theta`: `Linear(d_mem → N_m)` + `softplus`, input the layer's action
     embedding.
   - `e_prev`: previous step's observation-prediction error (per sample, detached);
-    0 at chunk start. `gamma_e = 1.0` (config).
-- Correct: `R = softplus(MLP(mean-pooled z_down → N_m))` (config-hidden 128);
+    0 at chunk start. `gamma_e = 1.0` (config). Clamp only this recurrent
+    inflation input to `surprise_clip` for stability.
+- Correct: `R = softplus(MLP(mean-pooled z_down → N_m)) + r_min`
+  (config-hidden 128; `r_min=0.01` prevents variance collapse);
   `K = P_hat / (P_hat + R)` → `[B, N_m, 1]`; `M = M_hat + K * ΔM`;
   `P = (1 - K) * P_hat`.
 - Loss: replace `loss_uncert` with
-  `L_nll = 0.5 * (log R + e^2 / R).mean()` (e from U3; until U3 lands use
+  `L_nll = 0.5 * (log R + e / R).mean()` in float32 (e from U3 is already a
+  squared residual and is not squared or clipped again; until U3 lands use
   placeholder `e = ||mean-pool(m_hat) − pooled z_down||²`, detached).
   Remove the Bernoulli-entropy term; keep `loss_mem_l2`. Keep `lambda_uncert`
   as the weight (rename to `lambda_nll`, default 0.1).

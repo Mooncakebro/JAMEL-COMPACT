@@ -2,8 +2,8 @@
 # run_compact_prepare_data.sh — Prepare SFT data for JAMEL-COMPACT
 #
 # Unlike original JAMEL, COMPACT does NOT need offline memory compression.
-# This script just concatenates, shuffles, and splits trajectory parquet
-# files into train/val.
+# This script concatenates trajectory parquet files and splits complete
+# sessions into train/val to preserve recurrent sequence continuity.
 #
 # Supports three INPUT formats:
 #   1. Single parquet file:

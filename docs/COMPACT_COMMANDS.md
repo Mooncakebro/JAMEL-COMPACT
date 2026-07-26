@@ -83,7 +83,7 @@ bash shell/run_compact_prepare_data.sh
 - **No data copies in memory** — avoids OOM even for large datasets
 - **Training/eval prompt consistency** — prompts match the canonical format used at evaluation time
 
-> **Note**: By default, `prompt` is rebuilt from atomic columns (`before_observation_str`, etc.) and `response` has `<think>` stripped — this matches what original JAMEL does. Pass `--no-rebuild-prompts` to the CLI if you want to keep the upstream prompt/response as-is.
+> **Note**: By default, `prompt` is rebuilt from atomic columns (`before_observation_str`, etc.) and `response` has `<think>` stripped — this matches what original JAMEL does. Splitting is session-level to preserve recurrent trajectories. Pass `--no-rebuild-prompts` to the CLI if you want to keep the upstream prompt/response as-is.
 
 **Input dataset structure:**
 ```
@@ -123,7 +123,7 @@ data/compact_sft_data/
 
 ## Step 2: Training (Compact Model v2 — with learned Kalman side memory)
 
-> **Data**: v1-prepared data (e.g. `data/compact_sft_data/compact_train.parquet`) is **fully reusable** for v2 — all required columns (`coverage_delta_score`, `session_id`, `step_idx`, `target_app`) are already present. The v2 changes are in how data is *processed* (left-truncation, coverage weights, session chunking), not the data format. No need to re-run data prep.
+> **Data**: Re-run data preparation after this update. The parquet schema is unchanged, but train/validation splitting is now session-level and rebuilt prompts use continuous `session_step_idx`; older row-random splits break recurrent chunk continuity.
 
 > **v2 defaults**: `CHUNK_SIZE=8` (session-chunked training), `COVERAGE_WEIGHT_ETA=0.0` (off by default). These are passed automatically by the shell script.
 

@@ -66,7 +66,7 @@ def collect_memory_stats(model) -> dict:
         stats[f"{prefix}_Q_mean"] = Q.mean().item()
 
         # Observation noise R
-        R = F.softplus(sm.R_psi(zero_input))
+        R = F.softplus(sm.R_psi(zero_input)) + sm.r_min
         stats[f"{prefix}_R_mean"] = R.mean().item()
 
         # Init memory norm
@@ -91,7 +91,7 @@ def collect_runtime_stats(
     Args:
         model:           JAMELCompactWrapper (or DataParallel)
         memory_states:   list of [B, N_m, d_mem] — from outputs["new_memory"]
-        variance_states: list of [B, N_m] — from outputs["new_confidence"]
+        variance_states: list of [B, N_m] — from outputs["new_variance"]
         e_list:          list of [B] — from outputs["e_list"] (surprise)
 
     Returns:
@@ -117,7 +117,10 @@ def collect_runtime_stats(
         # Using mean R from the layer's R_psi with zero input
         zero_input = torch.zeros(1, raw.side_memories[i].mem_dim,
                                  device=p.device, dtype=p.dtype)
-        R = F.softplus(raw.side_memories[i].R_psi(zero_input))  # [1, N_m]
+        R = (
+            F.softplus(raw.side_memories[i].R_psi(zero_input))
+            + raw.side_memories[i].r_min
+        )  # [1, N_m]
         K = p.mean(dim=0) / (p.mean(dim=0) + R.squeeze(0) + 1e-8)  # [N_m]
         stats[f"{prefix}_kalman_gain_mean"] = K.mean().item()
 
@@ -226,12 +229,12 @@ def main():
                 attention_mask=attention_mask,
                 action_embed_input=action_embed,
                 memory_states=memory_states,
-                confidence_states=variance_states,
+                variance_states=variance_states,
             )
         runtime_stats = collect_runtime_stats(
             model,
             outputs["new_memory"],
-            outputs["new_confidence"],
+            outputs["new_variance"],
             outputs.get("e_list"),
         )
         print_stats(runtime_stats, "Runtime Stats (after 1 forward step)")

@@ -87,7 +87,7 @@ class SideMemoryModule(nn.Module):
     Dimension flow:
       • Main stream H:  d (e.g. 2048 or 4096)
       • Memory state M: d_mem (e.g. 512)
-      • Observation Z:  k tokens in d, down-projected to [B, k, d_mem]
+      • Observation Z:  h is down-projected first, then pooled to [B, k, d_mem]
       • Variance P:     [B, N_m] (per-slot scalar)
     """
 
@@ -114,8 +114,11 @@ class SideMemoryModule(nn.Module):
         nn.init.zeros_(self.delta_up.weight)
         nn.init.zeros_(self.delta_up.bias)
 
-        # F4: Learnable injection gate (init 0 → tanh(0)=0 → no injection at start)
-        self.inject_gate = nn.Parameter(torch.zeros(()))
+        # delta_up is zero-initialized, so the branch is exactly zero at init.
+        # The gate must be nonzero: zeroing both factors makes all injection
+        # gradients zero and permanently disconnects memory from action loss.
+        gate_init = config.inject_gate_init if config is not None else 0.1
+        self.inject_gate = nn.Parameter(torch.tensor(float(gate_init)))
 
         # ── Memory Predict: FiLM-GRU (in d_mem) ──
         self.gru = FiLMGRUCell(mem_dim)
@@ -161,7 +164,7 @@ class SideMemoryModule(nn.Module):
         self.inject_cross_attn = nn.MultiheadAttention(
             mem_dim, num_heads, batch_first=True,
         )
-        self.inject_norm = nn.LayerNorm(hidden_dim)
+        self.inject_norm = nn.Identity()
 
         # ── Hierarchical hyperparameters ──
         if config is not None:
@@ -170,10 +173,14 @@ class SideMemoryModule(nn.Module):
             inj_s, inj_m, inj_d = (config.inject_shallow, config.inject_mid,
                                    config.inject_deep)
             self.gamma_e = config.gamma_e
+            self.surprise_clip = config.surprise_clip
+            self.r_min = config.r_min
         else:
             lam_s, lam_m, lam_d = 0.70, 0.85, 0.95
             inj_s, inj_m, inj_d = 0.8, 0.5, 0.3
             self.gamma_e = 1.0
+            self.surprise_clip = 10.0
+            self.r_min = 0.01
 
         if layer_idx < num_layers // 3:
             lam_init, inj_val = lam_s, inj_s
@@ -225,7 +232,12 @@ class SideMemoryModule(nn.Module):
         q_noise = F.softplus(self.Q_theta(a_down))  # [B, N_m]
         p_hat = lam.unsqueeze(0) * p_prev + q_noise  # [B, N_m]
         if e_prev is not None and self.gamma_e > 0:
-            p_hat = p_hat + self.gamma_e * e_prev.detach().unsqueeze(-1)  # broadcast [B,1]→[B,N_m]
+            # Clamp the surprise before inflating variance: e is an MSE in an
+            # unbounded space, and without a cap a single large e drives
+            # P_hat -> inf, K -> 1, and the memory into a write-overwrite
+            # feedback loop (observed as mem_l2/nll blow-up during training).
+            e_inflate = e_prev.detach().clamp(max=self.surprise_clip)
+            p_hat = p_hat + self.gamma_e * e_inflate.unsqueeze(-1)  # broadcast [B,1]→[B,N_m]
 
         return m_hat, p_hat
 
@@ -256,7 +268,9 @@ class SideMemoryModule(nn.Module):
 
         # ── U2: Learned observation noise R ──
         z_mean = z_down.mean(dim=1)  # [B, d_mem]
-        R = F.softplus(self.R_psi(z_mean))  # [B, N_m]
+        # r_min floor: keeps log R finite and bounds e/R so the NLL cannot
+        # explode when the learned noise collapses toward zero.
+        R = F.softplus(self.R_psi(z_mean)) + self.r_min  # [B, N_m]
 
         # ── U2: Kalman gain K = P_hat / (P_hat + R) ──
         K = p_hat / (p_hat + R + eps)  # [B, N_m]
@@ -274,9 +288,16 @@ class SideMemoryModule(nn.Module):
         # L_obs: trains the observation model
         loss_obs = F.mse_loss(z_pred, z_target)
 
-        # L_nll: calibrates R against actual surprise (e detached → gradients through R only)
-        e_detached = e_per_sample.detach().unsqueeze(-1)  # [B, 1]
-        loss_nll = 0.5 * (torch.log(R + eps) + e_detached.pow(2) / (R + eps)).mean()
+        # L_nll: Gaussian NLL calibrates R against actual surprise.
+        # NOTE: e_per_sample is ALREADY the squared residual (per-sample MSE),
+        # so the NLL term is e / R — do NOT square it again (squaring makes
+        # the loss quartic in the residual and its gradient ~ -e^2/(2R^2),
+        # which explodes and starves the action CE under global grad clipping).
+        # Computed in float32 for bf16 stability.
+        e_detached = e_per_sample.detach().unsqueeze(-1).float()  # [B, 1]
+        R_f = R.float()
+        loss_nll = 0.5 * (torch.log(R_f) + e_detached / R_f).mean()
+        loss_nll = loss_nll.to(R.dtype)
 
         # Surprise for next step (detached)
         e = e_per_sample.detach()  # [B]
@@ -284,12 +305,12 @@ class SideMemoryModule(nn.Module):
         return m_new, p_new, e, loss_obs, loss_nll
 
     def inject(self, h: torch.Tensor, m_new: torch.Tensor) -> torch.Tensor:
-        """F4: Zero-init gated injection. At init, tanh(0)=0 → no modification."""
+        """F4: Zero-output-projection gated injection."""
         h_down = self.h_down(h)
         delta_down, _ = self.inject_cross_attn(h_down, m_new, m_new)
         delta_up = self.delta_up(delta_down)  # zero-init → 0 at start
-        w = self.inject_w_max * torch.tanh(self.inject_gate)  # 0 at start
-        return self.inject_norm(h + w * delta_up)
+        w = self.inject_w_max * torch.tanh(self.inject_gate)
+        return h + w * delta_up
 
     def extract_observation(self, h: torch.Tensor,
                             attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -481,24 +502,122 @@ class JAMELCompactWrapper(nn.Module):
             return self.llm.language_model.lm_head
         raise ValueError("Cannot find lm_head in this model")
 
-    def _compute_position_embeddings(self, h: torch.Tensor,
-                                     attention_mask: torch.Tensor):
+    def _get_final_norm(self):
+        """Get the pretrained decoder's final normalization layer."""
+        model = self.llm
+        candidates = [
+            lambda m: getattr(
+                getattr(getattr(m, "model", None), "language_model", None),
+                "norm", None,
+            ),
+            lambda m: getattr(getattr(m, "language_model", None), "norm", None),
+            lambda m: getattr(getattr(m, "model", None), "norm", None),
+            lambda m: getattr(getattr(m, "transformer", None), "ln_f", None),
+            lambda m: getattr(m, "norm", None),
+        ]
+        for get_norm in candidates:
+            norm = get_norm(model)
+            if norm is not None:
+                return norm
+        return None
+
+    def _apply_final_norm(self, h: torch.Tensor) -> torch.Tensor:
+        norm = self._get_final_norm()
+        return norm(h) if norm is not None else h
+
+    def _compute_position_embeddings(
+        self,
+        h: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        input_ids: Optional[torch.Tensor] = None,
+        image_grid_thw: Optional[torch.Tensor] = None,
+        mm_token_type_ids: Optional[torch.Tensor] = None,
+        past_key_values=None,
+    ):
         """
         Compute rotary position embeddings for Qwen3-VL layers.
 
         Qwen3-VL's decoder layer requires `position_embeddings` as a kwarg.
-        These are computed by the model's `rotary_emb` module from position IDs.
+        For image prompts, position IDs come from the base model's 3D M-RoPE
+        helper so manual layer execution matches the pretrained forward path.
         """
         # Find the rotary embedding module
         rotary_emb = self._find_rotary_emb()
         if rotary_emb is None:
             return None  # model doesn't use RoPE
 
-        # Build position IDs from attention mask
-        if attention_mask.dim() == 2:
+        # Qwen3-VL uses 3D M-RoPE for multimodal sequences. Ask the base
+        # multimodal backbone for the same position IDs it uses in its own
+        # forward path; this is essential for wrapper/base equivalence.
+        if image_grid_thw is not None and input_ids is not None and mm_token_type_ids is None:
+            raise ValueError(
+                "image_grid_thw requires processor-provided mm_token_type_ids "
+                "for correct Qwen3-VL M-RoPE positions"
+            )
+        position_ids = None
+        backbone_candidates = [
+            getattr(self.llm, "model", None),
+            self.llm,
+        ]
+        for backbone in backbone_candidates:
+            if backbone is None or not hasattr(backbone, "compute_3d_position_ids"):
+                continue
+            try:
+                position_ids = backbone.compute_3d_position_ids(
+                    input_ids=input_ids,
+                    inputs_embeds=h,
+                    image_grid_thw=image_grid_thw,
+                    attention_mask=attention_mask,
+                    past_key_values=past_key_values,
+                    mm_token_type_ids=mm_token_type_ids,
+                )
+            except TypeError:
+                # Older Transformers/Qwen versions do not accept
+                # mm_token_type_ids or past_key_values in this helper.
+                try:
+                    position_ids = backbone.compute_3d_position_ids(
+                        input_ids=input_ids,
+                        inputs_embeds=h,
+                        image_grid_thw=image_grid_thw,
+                        attention_mask=attention_mask,
+                    )
+                except (TypeError, ValueError):
+                    position_ids = None
+            except ValueError:
+                position_ids = None
+            if position_ids is not None:
+                break
+
+        # Older Qwen2.5-VL-style backbones expose get_rope_index directly.
+        if position_ids is None and input_ids is not None:
+            for backbone in backbone_candidates:
+                if backbone is None or not hasattr(backbone, "get_rope_index"):
+                    continue
+                try:
+                    position_ids, _ = backbone.get_rope_index(
+                        input_ids=input_ids,
+                        image_grid_thw=image_grid_thw,
+                        attention_mask=attention_mask,
+                        mm_token_type_ids=mm_token_type_ids,
+                    )
+                except (TypeError, ValueError):
+                    try:
+                        position_ids, _ = backbone.get_rope_index(
+                            input_ids=input_ids,
+                            image_grid_thw=image_grid_thw,
+                            attention_mask=attention_mask,
+                        )
+                    except (TypeError, ValueError):
+                        position_ids = None
+                if position_ids is not None:
+                    break
+
+        # Text-only/fallback path: a 2D position sequence is expanded by the
+        # Qwen3-VL rotary embedding implementation when needed.
+        if position_ids is None and attention_mask is not None and attention_mask.dim() == 2:
             position_ids = attention_mask.long().cumsum(dim=-1) - 1
             position_ids.masked_fill_(attention_mask == 0, 1)
-        else:
+        elif position_ids is None:
             position_ids = torch.arange(
                 h.shape[1], device=h.device
             ).unsqueeze(0).expand(h.shape[0], -1)
@@ -708,6 +827,8 @@ class JAMELCompactWrapper(nn.Module):
         action_embed_input: torch.Tensor,
         memory_states: List[torch.Tensor],
         variance_states: List[torch.Tensor],
+        observation_mask: Optional[torch.Tensor] = None,
+        mm_token_type_ids: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
         pixel_values: Optional[torch.Tensor] = None,
         image_grid_thw: Optional[torch.Tensor] = None,
@@ -733,6 +854,8 @@ class JAMELCompactWrapper(nn.Module):
             action_embed_input: [B, d] — raw action embedding (control variable)
             memory_states:      List of [B, N_m, d_mem]
             variance_states:   List of [B, N_m] — variance P per layer
+            observation_mask:   [B, N] — prompt/current-observation tokens only
+            mm_token_type_ids:  [B, N] — Qwen3-VL modality IDs for M-RoPE
             labels:             [B, N] — token labels for loss (optional)
             pixel_values:       [B, C, H, W] — processed image tensor (optional)
             image_grid_thw:     [B, 3] — image grid dimensions (optional)
@@ -749,6 +872,15 @@ class JAMELCompactWrapper(nn.Module):
         """
         B = input_ids.shape[0]
         device = input_ids.device
+        if observation_mask is None:
+            observation_mask = attention_mask
+        else:
+            # The dedicated mask may only narrow the model's valid-token mask;
+            # never allow padding to enter observation pooling.
+            observation_mask = (
+                observation_mask.to(dtype=torch.bool)
+                & attention_mask.to(dtype=torch.bool)
+            )
 
         # ── Embed tokens ──
         if inputs_embeds is not None:
@@ -778,7 +910,9 @@ class JAMELCompactWrapper(nn.Module):
 
         # ── Compute position embeddings if the model uses RoPE ──
         position_embeddings = self._compute_position_embeddings(
-            h, attention_mask,
+            h, attention_mask, input_ids=input_ids,
+            image_grid_thw=image_grid_thw,
+            mm_token_type_ids=mm_token_type_ids,
         )
 
         # ── Convert attention_mask to 4D causal mask ──
@@ -829,7 +963,7 @@ class JAMELCompactWrapper(nn.Module):
                             h_layer[b, positions] = h_layer[b, positions] + ds_feat[:n]
 
             # 4c. Extract observation (F3: masked, U1: multi-token)
-            z_down = sm.extract_observation(h_layer, attention_mask)
+            z_down = sm.extract_observation(h_layer, observation_mask)
 
             # 4d. Memory Correct (learned Kalman + obs model)
             m_new, p_new, e, loss_obs_l, loss_nll_l = sm.correct(
@@ -849,7 +983,7 @@ class JAMELCompactWrapper(nn.Module):
         loss_nll_total = loss_nll_total / L
 
         # ── LM head (pretrained) ──
-        logits = self._get_lm_head()(h)  # [B, N, vocab_size]
+        logits = self._get_lm_head()(self._apply_final_norm(h))
 
         result = {
             "logits": logits,
@@ -891,6 +1025,7 @@ class JAMELCompactWrapper(nn.Module):
         top_p: float = 0.9,
         pixel_values: Optional[torch.Tensor] = None,
         image_grid_thw: Optional[torch.Tensor] = None,
+        mm_token_type_ids: Optional[torch.Tensor] = None,
         e_prev_list: Optional[List[Optional[torch.Tensor]]] = None,
         freeze_memory: bool = False,
         **kwargs,
@@ -901,12 +1036,15 @@ class JAMELCompactWrapper(nn.Module):
         then called base llm.generate() on the RAW prompt (memory-injected
         hidden states were never used for generation).
 
-        v2: After the memory-update forward pass, we pass the memory-injected
-        hidden states' KV cache to the base model's generate(), so generation
-        starts from memory-influenced representations.
+        v2: After the memory-update prompt pass, the memory-injected final
+        hidden state supplies the first-token logits. Subsequent tokens run
+        through the pretrained decoder against the populated KV cache, so the
+        continuation remains conditioned on memory-influenced prompt states.
 
-        If memory_conditioned_generate is False or the cache handoff fails,
-        we fall back to the v1 approach (base llm.generate on raw prompt).
+        If memory_conditioned_generate is False, generation uses the base
+        llm.generate() path on the raw prompt as an explicit ablation/fallback.
+        The memory-conditioned path requires a Transformers version that
+        provides DynamicCache-compatible decoder calls.
         """
         B = input_ids.shape[0]
         device = input_ids.device
@@ -936,7 +1074,14 @@ class JAMELCompactWrapper(nn.Module):
         attn_mask_4d = self._build_causal_attention_mask(attention_mask, h.dtype)
 
         # ── Compute position embeddings for prompt ──
-        position_embeddings = self._compute_position_embeddings(h, attention_mask)
+        position_embeddings = self._compute_position_embeddings(
+            h,
+            attention_mask,
+            input_ids=input_ids,
+            image_grid_thw=image_grid_thw,
+            mm_token_type_ids=mm_token_type_ids,
+            past_key_values=cache,
+        )
 
         # ── Initialize e_prev_list if not provided ──
         if e_prev_list is None:
@@ -1007,6 +1152,8 @@ class JAMELCompactWrapper(nn.Module):
                 gen_kwargs["pixel_values"] = pixel_values
             if image_grid_thw is not None:
                 gen_kwargs["image_grid_thw"] = image_grid_thw
+            if mm_token_type_ids is not None:
+                gen_kwargs["mm_token_type_ids"] = mm_token_type_ids
 
             full_ids = self.llm.generate(**gen_kwargs)
             prompt_len = input_ids.shape[1]
@@ -1057,27 +1204,25 @@ class JAMELCompactWrapper(nn.Module):
         decoder_layers = self._get_decoder_layers()
         embed_layer = self._get_input_embeddings()
         lm_head = self._get_lm_head()
-        rotary_emb = self._find_rotary_emb()
 
         # ── Step 1: First token from memory-injected h ──
-        logits = lm_head(h[:, -1:, :])  # [B, 1, vocab]
+        logits = lm_head(self._apply_final_norm(h[:, -1:, :]))
         next_token = self._sample_token(logits[:, -1, :], temperature, top_p)
         generated.append(next_token)
 
         # ── Step 2: Generate remaining tokens using the cache ──
-        cur_len = prompt_len
-
         for _ in range(max_new_tokens - 1):
             # Embed the new token
             new_embed = embed_layer(next_token.unsqueeze(-1))  # [B, 1, d]
 
-            # Position embeddings for the new position
-            new_pos_emb = None
-            if position_embeddings is not None and rotary_emb is not None:
-                pos_ids = torch.tensor([[cur_len]], device=device, dtype=torch.long)
-                pos_ids = pos_ids.expand(B, -1)
-                cos_new, sin_new = rotary_emb(new_embed, pos_ids)
-                new_pos_emb = (cos_new.to(llm_dtype), sin_new.to(llm_dtype))
+            # Position embeddings for the new position. The base multimodal
+            # backbone reuses its prompt rope deltas for incremental M-RoPE.
+            new_pos_emb = self._compute_position_embeddings(
+                new_embed,
+                attention_mask=None,
+                input_ids=None,
+                past_key_values=cache,
+            )
 
             # Run new token through all layers with cache (no memory update
             # during generation — memory was already updated in the prompt pass)
@@ -1092,10 +1237,8 @@ class JAMELCompactWrapper(nn.Module):
                 )
                 h_new = layer_output[0] if isinstance(layer_output, tuple) else layer_output
 
-            cur_len += 1
-
             # Get logits and sample
-            logits = lm_head(h_new[:, -1:, :])  # [B, 1, vocab]
+            logits = lm_head(self._apply_final_norm(h_new[:, -1:, :]))
             next_token = self._sample_token(logits[:, -1, :], temperature, top_p)
             generated.append(next_token)
 
@@ -1229,7 +1372,9 @@ class JAMELCompactWrapper(nn.Module):
         side_mem_dir = load_path / "side_memory"
         if side_mem_dir.exists():
             sm_state = torch.load(side_mem_dir / "side_memories.pt", map_location="cpu")
-            model.side_memories.load_state_dict(sm_state)
+            incompatible = model.side_memories.load_state_dict(sm_state, strict=False)
+            if incompatible.unexpected_keys:
+                print(f"[load] Ignored legacy side-memory keys: {incompatible.unexpected_keys}")
             ae_state = torch.load(side_mem_dir / "action_embed.pt", map_location="cpu")
             model.action_embed.load_state_dict(ae_state)
             print(f"[load] Side memory modules loaded from {side_mem_dir}")
