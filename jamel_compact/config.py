@@ -38,8 +38,8 @@ class CompactConfig:
     surprise_clip: float = 10.0       # max surprise fed into variance inflation (stability)
     r_min: float = 0.01               # floor on learned observation noise R (stability)
     inject_gate_init: float = 0.1      # lets the zero-init output projection receive gradients
-    lambda_obs: float = 0.1           # weight for observation-prediction loss L_obs (U3)
-    lambda_nll: float = 0.1           # weight for Gaussian NLL loss L_nll (U2; replaces lambda_uncert)
+    lambda_obs: float = 0.01          # weight for observation-prediction loss L_obs (U3)
+    lambda_nll: float = 0.01          # weight for Gaussian NLL loss L_nll (U2; replaces lambda_uncert)
     obs_loss: str = "mse"             # "mse" or "infonce" for L_obs variant (U3)
     memory_conditioned_generate: bool = True  # F5: use KV-cache prefill for generation
 

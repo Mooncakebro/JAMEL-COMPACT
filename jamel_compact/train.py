@@ -127,6 +127,27 @@ def _ensure_batch_dim(value):
     return value
 
 
+def _validate_and_save_best(
+    model,
+    val_dataloader: DataLoader,
+    config: CompactConfig,
+    writer: SummaryWriter,
+    global_step: int,
+    device: torch.device,
+    best_val_loss: float,
+) -> float:
+    """Validate and immediately persist improved model weights."""
+    val_loss = validate(
+        model, val_dataloader, config, writer, global_step, device,
+    )
+    if val_loss < best_val_loss:
+        best_val_loss = val_loss
+        best_dir = Path(config.output_dir) / "best"
+        _unwrap(model).save_pretrained(best_dir)
+        print(f"  [best] New best val loss: {best_val_loss:.4f}")
+    return best_val_loss
+
+
 def _process_chunk_step(
     model,
     raw_model: JAMELCompactWrapper,
@@ -268,8 +289,10 @@ def train_one_epoch(
     device: torch.device,
     epoch: int,
     scheduler: Optional[torch.optim.lr_scheduler.LambdaLR] = None,
-) -> int:
-    """Train for one epoch. Returns updated global_step.
+    val_dataloader: Optional[DataLoader] = None,
+    best_val_loss: float = float("inf"),
+) -> tuple[int, float, Optional[int]]:
+    """Train for one epoch and track the best mid-epoch validation loss.
 
     Supports both single-step (chunk_size=1) and session-chunked training
     (chunk_size>1). In chunked mode, memory carries forward across steps
@@ -281,6 +304,7 @@ def train_one_epoch(
     accum_steps = config.gradient_accumulation_steps
     use_chunking = config.chunk_size > 1
     optimizer.zero_grad()
+    last_val_step = None
 
     # Build progress bar
     if _TQDM_AVAILABLE:
@@ -483,11 +507,24 @@ def train_one_epoch(
                 raw_model.save_pretrained(ckpt_dir)
                 print(f"  [checkpoint] saved to {ckpt_dir}")
 
+            # Validate during the epoch so a later auxiliary-loss divergence
+            # cannot overwrite the best weights observed earlier.
+            if (
+                val_dataloader is not None
+                and config.val_steps > 0
+                and global_step % config.val_steps == 0
+            ):
+                best_val_loss = _validate_and_save_best(
+                    model, val_dataloader, config, writer,
+                    global_step, device, best_val_loss,
+                )
+                last_val_step = global_step
+
     # Close progress bar
     if _TQDM_AVAILABLE:
         pbar.close()
 
-    return global_step
+    return global_step, best_val_loss, last_val_step
 
 
 def validate(
@@ -693,6 +730,10 @@ def main():
     parser.add_argument("--log-steps", type=int, default=10)
     parser.add_argument("--save-steps", type=int, default=500)
     parser.add_argument("--val-steps", type=int, default=200)
+    parser.add_argument("--lambda-obs", type=float, default=0.01,
+                        help="Weight for observation-prediction loss.")
+    parser.add_argument("--lambda-nll", type=float, default=0.01,
+                        help="Weight for Gaussian NLL loss.")
     parser.add_argument("--freeze-base", action="store_true",
                         help="Freeze pretrained LLM weights")
     parser.add_argument("--no-grad-checkpoint", action="store_true")
@@ -755,6 +796,8 @@ def main():
         log_steps=args.log_steps,
         save_steps=args.save_steps,
         val_steps=args.val_steps,
+        lambda_obs=args.lambda_obs,
+        lambda_nll=args.lambda_nll,
         freeze_base=args.freeze_base,
         gradient_checkpointing=not args.no_grad_checkpoint,
         bf16=args.bf16,
@@ -890,20 +933,21 @@ def main():
         print(f"Epoch {epoch + 1}/{config.max_epochs}")
         print(f"{'='*60}")
 
-        global_step = train_one_epoch(
+        global_step, best_val_loss, last_val_step = train_one_epoch(
             model, train_loader, optimizer, config, writer,
             global_step, device, epoch,
             scheduler=scheduler,
+            val_dataloader=val_loader,
+            best_val_loss=best_val_loss,
         )
 
-        # Validation
-        if (epoch + 1) * len(train_loader) // config.gradient_accumulation_steps >= config.val_steps:
-            val_loss = validate(model, val_loader, config, writer, global_step, device)
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                best_dir = Path(config.output_dir) / "best"
-                raw_model.save_pretrained(best_dir)
-                print(f"  [best] New best val loss: {best_val_loss:.4f}")
+        # Always validate the completed epoch unless the same weights were
+        # already validated exactly at the final optimizer step.
+        if last_val_step != global_step:
+            best_val_loss = _validate_and_save_best(
+                model, val_loader, config, writer,
+                global_step, device, best_val_loss,
+            )
 
     # ── Save final model ──
     final_dir = Path(config.output_dir) / "final"

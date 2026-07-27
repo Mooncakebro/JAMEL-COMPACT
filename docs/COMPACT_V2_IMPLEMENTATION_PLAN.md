@@ -222,7 +222,7 @@ checkpoint `model_version: 2`.
   squared residual and is not squared or clipped again; until U3 lands use
   placeholder `e = ||mean-pool(m_hat) − pooled z_down||²`, detached).
   Remove the Bernoulli-entropy term; keep `loss_mem_l2`. Keep `lambda_uncert`
-  as the weight (rename to `lambda_nll`, default 0.1).
+  as the weight (rename to `lambda_nll`, default 0.01).
 
 **Acceptance**: `train/loss_nll` decreases; logged `K` distribution spreads over
 `[0,1]` (not pinned in `[0.475, 0.65]`); synthetic unit test: feeding a large
@@ -233,7 +233,7 @@ checkpoint `model_version: 2`.
 **Change** (`SideMemoryModule`):
 - Add `self.obs_model = MLP(d_mem → d_mem → d_mem)` (GELU).
 - `z_pred = obs_model(mean-pool(m_hat))`; target `pooled z_down.detach()`.
-- `L_obs = MSE(z_pred, target)` per layer, weight `lambda_obs = 0.1` (config).
+- `L_obs = MSE(z_pred, target)` per layer, weight `lambda_obs = 0.01` (config).
 - `e = per-sample MSE.detach()` → carried to the next step for U2's
   `gamma_e * e_prev` term (plumb through wrapper result dict, train loop,
   `CompactAgent` session state).

@@ -39,6 +39,8 @@ LR=${LR:-2e-5}
 LOG_STEPS=${LOG_STEPS:-10}
 SAVE_STEPS=${SAVE_STEPS:-500}
 VAL_STEPS=${VAL_STEPS:-200}
+LAMBDA_OBS=${LAMBDA_OBS:-0.01}
+LAMBDA_NLL=${LAMBDA_NLL:-0.01}
 GPU_IDS=${GPU_IDS:-}              # e.g. "0" or "0,1,2" or "" (all)
 CHUNK_SIZE=${CHUNK_SIZE:-8}          # 1 = single-step, >1 = session-chunked (v2 default: 8)
 COVERAGE_WEIGHT_ETA=${COVERAGE_WEIGHT_ETA:-0.0}  # F7: 0=off, >0 upweights high-novelty samples
@@ -78,7 +80,10 @@ echo "  Epochs:       $MAX_EPOCHS"
 echo "  Batch:        $BATCH_SIZE × $GRAD_ACCUM (accum)"
 echo "  Chunk size:   $CHUNK_SIZE"
 echo "  LR:           $LR"
-  echo "  Cov weight:   $COVERAGE_WEIGHT_ETA"
+echo "  Val every:    $VAL_STEPS optimizer steps"
+echo "  Lambda obs:   $LAMBDA_OBS"
+echo "  Lambda NLL:   $LAMBDA_NLL"
+echo "  Cov weight:   $COVERAGE_WEIGHT_ETA"
 exec python -m jamel_compact.train \
     --train-file "$TRAIN_FILE" \
     --val-file "$VAL_FILE" \
@@ -95,6 +100,8 @@ exec python -m jamel_compact.train \
     --log-steps "$LOG_STEPS" \
     --save-steps "$SAVE_STEPS" \
     --val-steps "$VAL_STEPS" \
+    --lambda-obs "$LAMBDA_OBS" \
+    --lambda-nll "$LAMBDA_NLL" \
     --chunk-size "$CHUNK_SIZE" \
     --coverage-weight-eta "$COVERAGE_WEIGHT_ETA" \
     $GPU_ARG \
