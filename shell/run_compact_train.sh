@@ -36,6 +36,7 @@ MAX_EPOCHS=${MAX_EPOCHS:-2}
 BATCH_SIZE=${BATCH_SIZE:-1}
 GRAD_ACCUM=${GRAD_ACCUM:-16}
 LR=${LR:-2e-5}
+MEMORY_LR=${MEMORY_LR:-5e-6}
 LOG_STEPS=${LOG_STEPS:-10}
 SAVE_STEPS=${SAVE_STEPS:-500}
 VAL_STEPS=${VAL_STEPS:-200}
@@ -44,6 +45,7 @@ LAMBDA_NLL=${LAMBDA_NLL:-0.01}
 GPU_IDS=${GPU_IDS:-}              # e.g. "0" or "0,1,2" or "" (all)
 CHUNK_SIZE=${CHUNK_SIZE:-8}          # 1 = single-step, >1 = session-chunked (v2 default: 8)
 COVERAGE_WEIGHT_ETA=${COVERAGE_WEIGHT_ETA:-0.0}  # F7: 0=off, >0 upweights high-novelty samples
+FREEZE_BASE=${FREEZE_BASE:-1}       # 1 = memory-only training; 0 = also fine-tune base
 
 if [[ ! -f "$TRAIN_FILE" ]]; then
     echo "ERROR: TRAIN_FILE not found: $TRAIN_FILE" >&2
@@ -66,6 +68,12 @@ else
     GPU_ARG=""
 fi
 
+if [[ "$FREEZE_BASE" == "1" ]]; then
+    BASE_TRAINING_ARG="--freeze-base"
+else
+    BASE_TRAINING_ARG="--train-base"
+fi
+
 echo "=== JAMEL-COMPACT Training ==="
 echo "  Base model:  $BASE_MODEL"
 echo "  Train file:   $TRAIN_FILE"
@@ -79,7 +87,9 @@ echo "  Max length:   $MAX_LENGTH"
 echo "  Epochs:       $MAX_EPOCHS"
 echo "  Batch:        $BATCH_SIZE × $GRAD_ACCUM (accum)"
 echo "  Chunk size:   $CHUNK_SIZE"
-echo "  LR:           $LR"
+echo "  Base LR:      $LR"
+echo "  Memory LR:    $MEMORY_LR"
+echo "  Freeze base:  $FREEZE_BASE"
 echo "  Val every:    $VAL_STEPS optimizer steps"
 echo "  Lambda obs:   $LAMBDA_OBS"
 echo "  Lambda NLL:   $LAMBDA_NLL"
@@ -97,6 +107,7 @@ exec python -m jamel_compact.train \
     --batch-size "$BATCH_SIZE" \
     --grad-accum "$GRAD_ACCUM" \
     --lr "$LR" \
+    --memory-lr "$MEMORY_LR" \
     --log-steps "$LOG_STEPS" \
     --save-steps "$SAVE_STEPS" \
     --val-steps "$VAL_STEPS" \
@@ -104,5 +115,6 @@ exec python -m jamel_compact.train \
     --lambda-nll "$LAMBDA_NLL" \
     --chunk-size "$CHUNK_SIZE" \
     --coverage-weight-eta "$COVERAGE_WEIGHT_ETA" \
+    $BASE_TRAINING_ARG \
     $GPU_ARG \
     "$@"

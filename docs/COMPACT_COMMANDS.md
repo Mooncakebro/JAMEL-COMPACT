@@ -125,7 +125,9 @@ data/compact_sft_data/
 
 > **Data**: Re-run data preparation after this update. The parquet schema is unchanged, but train/validation splitting is now session-level and rebuilt prompts use continuous `session_step_idx`; older row-random splits break recurrent chunk continuity.
 
-> **v2 defaults**: `CHUNK_SIZE=8` (session-chunked training), `COVERAGE_WEIGHT_ETA=0.0` (off by default). These are passed automatically by the shell script.
+> **v2 defaults**: `CHUNK_SIZE=8`, `FREEZE_BASE=1`, `MEMORY_LR=5e-6`, and
+> `COVERAGE_WEIGHT_ETA=0.0`. The pretrained backbone is frozen unless
+> full-model fine-tuning is explicitly enabled.
 
 ### 2a. Train v2 on GPUs 6,7 (★ recommended)
 
@@ -143,6 +145,8 @@ MAX_EPOCHS=3 \
 BATCH_SIZE=1 \
 GRAD_ACCUM=16 \
 LR=2e-5 \
+MEMORY_LR=5e-6 \
+FREEZE_BASE=1 \
 CHUNK_SIZE=8 \
 COVERAGE_WEIGHT_ETA=0.0 \
 LOG_STEPS=10 \
@@ -167,6 +171,8 @@ MAX_EPOCHS=3 \
 BATCH_SIZE=1 \
 GRAD_ACCUM=16 \
 LR=2e-5 \
+MEMORY_LR=5e-6 \
+FREEZE_BASE=1 \
 CHUNK_SIZE=8 \
 COVERAGE_WEIGHT_ETA=0.0 \
 LOG_STEPS=10 \
@@ -248,18 +254,20 @@ CHUNK_SIZE=8 \
 bash shell/run_compact_train.sh
 ```
 
-### 2f. Freeze base model (train only side memory)
+### 2f. Opt into full-model fine-tuning
 
 ```bash
 TRAIN_FILE=data/compact_sft_data/compact_train.parquet \
 VAL_FILE=data/compact_sft_data/compact_val.parquet \
 BASE_MODEL=Qwen/Qwen3-VL-2B-Instruct \
-OUTPUT_DIR=outputs/compact_ckpt_frozen \
-TB_LOG_DIR=outputs/compact_tb_frozen \
+OUTPUT_DIR=outputs/compact_ckpt_full \
+TB_LOG_DIR=outputs/compact_tb_full \
 GPU_IDS=0 \
-FREEZE_BASE=1 \
+FREEZE_BASE=0 \
+LR=1e-5 \
+MEMORY_LR=5e-6 \
 CHUNK_SIZE=8 \
-bash shell/run_compact_train.sh --freeze-base
+bash shell/run_compact_train.sh
 ```
 
 ### 2g. Monitor training with TensorBoard
@@ -274,7 +282,7 @@ tensorboard --logdir outputs/compact_tb_v2 --port 6006
 **Logged metrics (v2):**
 - `train/loss_total`, `train/loss_action`, `train/loss_action_unweighted`, `train/loss_obs`, `train/loss_nll`, `train/loss_mem_l2`
 - `memory/layer{l}_gate`, `memory/layer{l}_lambda_mean`, `memory/layer{l}_Q_mean`, `memory/layer{l}_R_mean`, `memory/layer{l}_init_mem_norm`
-- `train/learning_rate`, `train/step_time_s`
+- `train/memory_learning_rate`, optional `train/base_learning_rate`, `train/step_time_s`
 - `val/loss_total`, `val/loss_action`, `val/loss_obs`, `val/loss_nll`
 
 > **v2 loss keys**: `loss_obs` (observation prediction MSE), `loss_nll` (Gaussian NLL for Kalman variance calibration), `loss_action_unweighted` (unweighted CE for comparison against coverage-weighted `loss_action`).
@@ -582,7 +590,9 @@ python scripts/snapshots_to_mp4.py outputs/compact_eval/weibo/session0/ \
 | `MAX_EPOCHS` | `3` | Number of training epochs |
 | `BATCH_SIZE` | `1` | Per-device batch size |
 | `GRAD_ACCUM` | `16` | Gradient accumulation steps |
-| `LR` | `2e-5` | Learning rate |
+| `LR` | `2e-5` | Base-model learning rate; used only when `FREEZE_BASE=0` |
+| `MEMORY_LR` | `5e-6` | Learning rate for side-memory and action modules |
+| `FREEZE_BASE` | `1` | `1` trains only COMPACT modules; `0` also fine-tunes the base model |
 | `LOG_STEPS` | `10` | TensorBoard logging frequency |
 | `SAVE_STEPS` | `500` | Checkpoint save frequency |
 | `VAL_STEPS` | `200` | Validation frequency |

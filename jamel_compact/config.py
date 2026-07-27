@@ -17,7 +17,7 @@ class CompactConfig:
     mem_dim: int = 512                # reduced memory dimension d_mem
     num_mem_tokens: int = 16           # N_m memory tokens per layer
     num_heads: int = 8                # attention heads in side memory
-    freeze_base: bool = False         # freeze pretrained LLM weights
+    freeze_base: bool = True          # freeze pretrained LLM weights by default
     num_act_tokens: int = 1           # action tokens in input sequence
 
     # ── Model version (for checkpoint compatibility) ──
@@ -52,6 +52,7 @@ class CompactConfig:
     # ── Training ──
     output_dir: str = "outputs/compact_ckpt"
     learning_rate: float = 2e-5
+    memory_learning_rate: float = 5e-6
     weight_decay: float = 0.01
     warmup_ratio: float = 0.05
     max_epochs: int = 3

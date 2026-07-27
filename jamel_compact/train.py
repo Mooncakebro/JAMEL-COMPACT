@@ -120,6 +120,14 @@ def _scalar(v):
     return float(v)
 
 
+def _optimizer_group_lr(optimizer, group_name: str) -> Optional[float]:
+    """Return the current learning rate for a named optimizer group."""
+    for group in optimizer.param_groups:
+        if group.get("name") == group_name:
+            return group["lr"]
+    return None
+
+
 def _ensure_batch_dim(value):
     """Keep scalar tensors scatterable by ``DataParallel``."""
     if isinstance(value, torch.Tensor) and value.dim() == 0:
@@ -454,11 +462,16 @@ def train_one_epoch(
             optimizer.step()
             optimizer.zero_grad()
             global_step += 1
+            memory_lr = _optimizer_group_lr(optimizer, "memory")
+            base_lr = _optimizer_group_lr(optimizer, "base")
+            lr = memory_lr if memory_lr is not None else optimizer.param_groups[0]["lr"]
 
             # ── TensorBoard logging ──
             if global_step % config.log_steps == 0:
                 elapsed = time.time() - batch_start
-                lr = optimizer.param_groups[0]["lr"]
+                lr_text = f"memory_lr={lr:.2e} "
+                if base_lr is not None:
+                    lr_text += f"base_lr={base_lr:.2e} "
 
                 if writer is not None:
                     writer.add_scalar("train/loss_total", loss_dict["total"], global_step)
@@ -468,6 +481,9 @@ def train_one_epoch(
                     writer.add_scalar("train/loss_obs", loss_dict.get("obs", 0.0), global_step)
                     writer.add_scalar("train/loss_nll", loss_dict.get("nll", 0.0), global_step)
                     writer.add_scalar("train/learning_rate", lr, global_step)
+                    writer.add_scalar("train/memory_learning_rate", lr, global_step)
+                    if base_lr is not None:
+                        writer.add_scalar("train/base_learning_rate", base_lr, global_step)
                     writer.add_scalar("train/step_time_s", elapsed, global_step)
 
                     # F8: Memory diagnostics (every 100 steps to avoid overhead)
@@ -484,7 +500,7 @@ def train_one_epoch(
                     f"mem_l2={loss_dict['mem_l2']:.6f} "
                     f"obs={loss_dict.get('obs', 0.0):.4f} "
                     f"nll={loss_dict.get('nll', 0.0):.4f} "
-                    f"lr={lr:.2e} "
+                    f"{lr_text}"
                     f"time={elapsed:.2f}s"
                 )
 
@@ -493,7 +509,7 @@ def train_one_epoch(
                 pbar.set_postfix({
                     "loss": f"{loss_dict['total']:.4f}",
                     "action": f"{loss_dict['action']:.4f}",
-                    "lr": f"{optimizer.param_groups[0]['lr']:.2e}",
+                    "memory_lr": f"{lr:.2e}",
                     "step": global_step,
                 })
 
@@ -723,7 +739,10 @@ def main():
     parser.add_argument("--max-epochs", type=int, default=3)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--grad-accum", type=int, default=16)
-    parser.add_argument("--lr", type=float, default=2e-5)
+    parser.add_argument("--lr", type=float, default=2e-5,
+                        help="Base-model learning rate when --train-base is enabled.")
+    parser.add_argument("--memory-lr", type=float, default=5e-6,
+                        help="Learning rate for side-memory and action modules.")
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--warmup-ratio", type=float, default=0.05)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
@@ -734,8 +753,16 @@ def main():
                         help="Weight for observation-prediction loss.")
     parser.add_argument("--lambda-nll", type=float, default=0.01,
                         help="Weight for Gaussian NLL loss.")
-    parser.add_argument("--freeze-base", action="store_true",
-                        help="Freeze pretrained LLM weights")
+    base_training_group = parser.add_mutually_exclusive_group()
+    base_training_group.add_argument(
+        "--freeze-base", dest="freeze_base", action="store_true",
+        help="Freeze pretrained LLM weights (default).",
+    )
+    base_training_group.add_argument(
+        "--train-base", dest="freeze_base", action="store_false",
+        help="Also fine-tune the pretrained LLM using --lr.",
+    )
+    parser.set_defaults(freeze_base=True)
     parser.add_argument("--no-grad-checkpoint", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--bf16", action="store_true", default=True)
@@ -790,6 +817,7 @@ def main():
         per_device_batch_size=args.batch_size,
         gradient_accumulation_steps=args.grad_accum,
         learning_rate=args.lr,
+        memory_learning_rate=args.memory_lr,
         weight_decay=args.weight_decay,
         warmup_ratio=args.warmup_ratio,
         max_grad_norm=args.max_grad_norm,
@@ -894,11 +922,39 @@ def main():
         )
 
     # ── Optimizer ──
+    # Keep the new recurrent-memory system on a lower learning rate than the
+    # pretrained backbone. When the base is frozen, only the memory group is
+    # present; --train-base explicitly opts into full-model fine-tuning.
+    memory_params = [
+        p for p in (
+            list(raw_model.side_memories.parameters())
+            + list(raw_model.action_embed.parameters())
+        )
+        if p.requires_grad
+    ]
+    base_params = [p for p in raw_model.llm.parameters() if p.requires_grad]
+    optimizer_groups = [
+        {
+            "name": "memory",
+            "params": memory_params,
+            "lr": config.memory_learning_rate,
+        }
+    ]
+    if base_params:
+        optimizer_groups.append({
+            "name": "base",
+            "params": base_params,
+            "lr": config.learning_rate,
+        })
     optimizer = torch.optim.AdamW(
-        [p for p in model.parameters() if p.requires_grad],
-        lr=config.learning_rate,
+        optimizer_groups,
         weight_decay=config.weight_decay,
     )
+    print(f"[train] Memory learning rate: {config.memory_learning_rate:.2e}")
+    if base_params:
+        print(f"[train] Base learning rate:   {config.learning_rate:.2e}")
+    else:
+        print("[train] Base model frozen")
 
     # ── LR scheduler (cosine with warmup) ──
     total_steps = len(train_loader) * config.max_epochs // config.gradient_accumulation_steps
