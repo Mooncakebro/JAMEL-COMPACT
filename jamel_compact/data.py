@@ -496,6 +496,7 @@ def session_collate_fn(batch, pad_token_id: int = 0) -> dict:
     pixel_values_list = []
     grid_thws_list = []
     sample_weights_list = []
+    step_valids = []
 
     for item in chunk:
         seq_len = item["input_ids"].shape[0]
@@ -538,6 +539,7 @@ def session_collate_fn(batch, pad_token_id: int = 0) -> dict:
         gt = item.get("image_grid_thw")
         grid_thws_list.append(gt)
         sample_weights_list.append(item.get("sample_weight", 1.0))
+        step_valids.append(bool(item.get("_chunk_step_valid", True)))
 
     # Stack per-step tensors: each becomes [1, N] (single sample per step)
     # so the training loop can process one step at a time with B=1
@@ -557,6 +559,7 @@ def session_collate_fn(batch, pad_token_id: int = 0) -> dict:
         "sample_weights": torch.tensor(sample_weights_list, dtype=torch.float32),
         "session_ids": [item["session_id"] for item in chunk],
         "step_indices": [item["step_idx"] for item in chunk],
+        "step_valids": step_valids,
         "chunk_size": len(chunk),
     }
 
@@ -588,8 +591,10 @@ class SessionChunkDataset(Dataset):
         image_key: str = "before_screenshot",
         action_key: str = "action",
         coverage_weight_eta: float = 0.0,
+        pad_to_chunk_size: bool = False,
     ):
         self.chunk_size = chunk_size
+        self.pad_to_chunk_size = pad_to_chunk_size
         self.prompt_key = prompt_key
         self.response_key = response_key
         self.image_key = image_key
@@ -680,7 +685,27 @@ class SessionChunkDataset(Dataset):
     def __getitem__(self, index: int) -> list[dict]:
         """Return a list of step dicts for one chunk."""
         chunk_indices = self._chunks[index]
-        return [self._base[i] for i in chunk_indices]
+        items = []
+        for item_index in chunk_indices:
+            item = self._base[item_index]
+            if item is not None:
+                item = dict(item)
+                item["_chunk_step_valid"] = True
+                items.append(item)
+
+        if self.pad_to_chunk_size:
+            if not items:
+                raise RuntimeError(
+                    "Every sample in a distributed session chunk was dropped "
+                    "during tokenization. Reduce max_length filtering or "
+                    "remove the invalid session."
+                )
+            while len(items) < self.chunk_size:
+                padded_item = dict(items[-1])
+                padded_item["_chunk_step_valid"] = False
+                items.append(padded_item)
+
+        return items
 
 
 def discover_parquet_files(input_path: str | list[str]) -> list[str]:

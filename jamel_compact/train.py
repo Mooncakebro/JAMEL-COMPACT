@@ -446,6 +446,8 @@ def train_one_epoch(
             total_chunk_loss = None
             last_loss_dict = {}
             all_loss_dicts = []
+            step_valids = batch.get("step_valids", [True] * chunk_size)
+            valid_step_count = max(sum(bool(value) for value in step_valids), 1)
 
             for s in range(chunk_size):
                 # sample_weights[s] indexes a 1-d tensor → produces a 0-d
@@ -479,21 +481,21 @@ def train_one_epoch(
                 # Carry e_list forward as next step's e_prev_list
                 e_prev_list = e_list
 
-                # Accumulate loss across steps in the chunk
-                # Weight each step equally
-                step_loss = loss / chunk_size
+                step_is_valid = bool(step_valids[s])
+                step_loss = loss * float(step_is_valid) / valid_step_count
                 total_chunk_loss = (
                     step_loss
                     if total_chunk_loss is None
                     else total_chunk_loss + step_loss
                 )
-                last_loss_dict = loss_dict
-                all_loss_dicts.append(loss_dict)
+                if step_is_valid:
+                    last_loss_dict = loss_dict
+                    all_loss_dicts.append(loss_dict)
 
             # Average loss dict across steps
             loss_dict = {}
             for k in last_loss_dict:
-                loss_dict[k] = sum(d[k] for d in all_loss_dicts) / chunk_size
+                loss_dict[k] = sum(d[k] for d in all_loss_dicts) / valid_step_count
 
             accumulation_divisor = min(
                 accum_steps,
@@ -699,6 +701,10 @@ def validate(
                 chunk_obs = 0.0
                 chunk_nll = 0.0
                 e_prev_list = None
+                step_valids = batch.get("step_valids", [True] * chunk_size)
+                valid_step_count = max(
+                    sum(bool(value) for value in step_valids), 1
+                )
 
                 for s in range(chunk_size):
                     step_data = {
@@ -726,22 +732,25 @@ def validate(
                         )
                     e_prev_list = e_list
 
-                    chunk_loss += loss_dict["total"]
-                    chunk_action += loss_dict["action"]
-                    chunk_mem += loss_dict["mem_l2"]
-                    chunk_obs += loss_dict.get("obs", 0.0)
-                    chunk_nll += loss_dict.get("nll", 0.0)
+                    if bool(step_valids[s]):
+                        chunk_loss += loss_dict["total"]
+                        chunk_action += loss_dict["action"]
+                        chunk_mem += loss_dict["mem_l2"]
+                        chunk_obs += loss_dict.get("obs", 0.0)
+                        chunk_nll += loss_dict.get("nll", 0.0)
 
                 # Average over steps in chunk
-                total_loss += chunk_loss / chunk_size
-                total_action_loss += chunk_action / chunk_size
-                total_mem_loss += chunk_mem / chunk_size
-                total_obs_loss += chunk_obs / chunk_size
-                total_nll_loss += chunk_nll / chunk_size
+                total_loss += chunk_loss / valid_step_count
+                total_action_loss += chunk_action / valid_step_count
+                total_mem_loss += chunk_mem / valid_step_count
+                total_obs_loss += chunk_obs / valid_step_count
+                total_nll_loss += chunk_nll / valid_step_count
                 num_batches += 1
 
                 if show_progress:
-                    pbar.set_postfix({"val_loss": f"{chunk_loss / chunk_size:.4f}"})
+                    pbar.set_postfix({
+                        "val_loss": f"{chunk_loss / valid_step_count:.4f}"
+                    })
 
             else:
                 # ── Single-step validation ──
@@ -1135,10 +1144,18 @@ def main():
 
     if use_chunking:
         # Wrap with SessionChunkDataset for multi-step training
-        train_dataset = SessionChunkDataset(train_dataset, chunk_size=config.chunk_size,
-                                             coverage_weight_eta=config.coverage_weight_eta)
-        val_dataset = SessionChunkDataset(val_dataset, chunk_size=config.chunk_size,
-                                           coverage_weight_eta=config.coverage_weight_eta)
+        train_dataset = SessionChunkDataset(
+            train_dataset,
+            chunk_size=config.chunk_size,
+            coverage_weight_eta=config.coverage_weight_eta,
+            pad_to_chunk_size=args.fsdp,
+        )
+        val_dataset = SessionChunkDataset(
+            val_dataset,
+            chunk_size=config.chunk_size,
+            coverage_weight_eta=config.coverage_weight_eta,
+            pad_to_chunk_size=args.fsdp,
+        )
         chunk_batch_size = 1
         if args.fsdp:
             train_sampler = DistributedSampler(
