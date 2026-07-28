@@ -221,19 +221,33 @@ COVERAGE_WEIGHT_ETA=1.0 \
 bash shell/run_compact_train.sh
 ```
 
-### 2e. Train on multiple GPUs
+### 2e. Full-SFT Qwen3-VL-8B across multiple GPUs with FSDP
 
 ```bash
-# Use GPUs 0, 1, 2
-TRAIN_FILE=data/compact_sft_data/compact_train.parquet \
-VAL_FILE=data/compact_sft_data/compact_val.parquet \
-BASE_MODEL=Qwen/Qwen3-VL-2B-Instruct \
-OUTPUT_DIR=outputs/compact_ckpt \
-TB_LOG_DIR=outputs/compact_tb \
-GPU_IDS=0,1,2 \
+TRAIN_FILE=data/compact_sft_data_all/compact_train.parquet \
+VAL_FILE=data/compact_sft_data_all/compact_val.parquet \
+BASE_MODEL=Qwen/Qwen3-VL-8B-Instruct \
+OUTPUT_DIR=outputs/compact_ckpt_8b_full_sft \
+TB_LOG_DIR=outputs/compact_tb_8b_full_sft \
+GPU_IDS=5,6,7 \
+FREEZE_BASE=0 \
+FSDP=1 \
+NPROC_PER_NODE=3 \
+MODEL_PARALLEL=0 \
+MAX_LENGTH=4096 \
 CHUNK_SIZE=8 \
+BATCH_SIZE=1 \
+GRAD_ACCUM=16 \
+LR=1e-5 \
+MEMORY_LR=5e-6 \
+VAL_STEPS=100 \
+SAVE_STEPS=100 \
 bash shell/run_compact_train.sh
 ```
+
+`FREEZE_BASE=0` with multiple selected GPUs automatically enables FSDP when
+`FSDP=auto`. FSDP runs one process per GPU, shards parameters, gradients, and
+optimizer state, and synchronizes validation/checkpointing across ranks.
 
 ### 2f. Opt into full-model fine-tuning
 
@@ -528,25 +542,25 @@ GPU_IDS=6,7 \
 MAX_EPOCHS=20 \
 bash shell/run_baseline_train.sh
 
-# ── 2b. Train baseline (pure Qwen3-VL SFT, no side memory) ──
-  TRAIN_FILE=data/compact_train.parquet \
-  VAL_FILE=data/compact_val.parquet \
-  BASE_MODEL=Qwen/Qwen3-VL-8B-Instruct \
-  OUTPUT_DIR=outputs/compact_8b_sharded \
-  TB_LOG_DIR=outputs/compact_8b_sharded_tb \
-  GPU_IDS=5,6,7 \
-  MODEL_PARALLEL=1 \
-  FREEZE_BASE=0 \
-  MEMORY_LR=5e-6 \
-  MAX_LENGTH=4096 \
-  CHUNK_SIZE=8 \
-  BATCH_SIZE=1 \
-  GRAD_ACCUM=16 \
-  LAMBDA_OBS=0.01 \
-  LAMBDA_NLL=0.01 \
-  VAL_STEPS=100 \
-  SAVE_STEPS=100 \
-  bash shell/run_compact_train.sh
+# ── 2c. Full-SFT compact 8B with FSDP ──
+TRAIN_FILE=data/compact_train.parquet \
+VAL_FILE=data/compact_val.parquet \
+BASE_MODEL=Qwen/Qwen3-VL-8B-Instruct \
+OUTPUT_DIR=outputs/compact_8b_full_sft \
+TB_LOG_DIR=outputs/compact_8b_full_sft_tb \
+GPU_IDS=5,6,7 \
+FREEZE_BASE=0 \
+FSDP=1 \
+NPROC_PER_NODE=3 \
+MAX_LENGTH=4096 \
+CHUNK_SIZE=8 \
+BATCH_SIZE=1 \
+GRAD_ACCUM=16 \
+LR=1e-5 \
+MEMORY_LR=5e-6 \
+VAL_STEPS=100 \
+SAVE_STEPS=100 \
+bash shell/run_compact_train.sh
 
 
 # ── 3a. Eval compact model v2 ──
@@ -600,6 +614,8 @@ python scripts/snapshots_to_mp4.py outputs/compact_eval/weibo/session0/ \
 | `MEMORY_LR` | `5e-6` | Learning rate for side-memory and action modules |
 | `FREEZE_BASE` | `1` | `1` trains only COMPACT modules; `0` also fine-tunes the base model |
 | `MODEL_PARALLEL` | `auto` | Auto-shards frozen chunked B=1 runs; `1` forces sharding and `0` forces DataParallel |
+| `FSDP` | `auto` | Auto-enables torchrun `FULL_SHARD` when `FREEZE_BASE=0` and multiple GPUs are selected; set `1` to force it |
+| `NPROC_PER_NODE` | selected GPU count | Number of FSDP worker processes; normally one per selected GPU |
 | `LOG_STEPS` | `10` | TensorBoard logging frequency |
 | `SAVE_STEPS` | `500` | Checkpoint save frequency |
 | `VAL_STEPS` | `200` | Validation frequency |

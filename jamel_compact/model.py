@@ -373,6 +373,7 @@ class JAMELCompactWrapper(nn.Module):
         load_kwargs = {
             "torch_dtype": dtype,
             "trust_remote_code": True,
+            "low_cpu_mem_usage": True,
         }
         if config.model_parallel:
             try:
@@ -916,9 +917,11 @@ class JAMELCompactWrapper(nn.Module):
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
-        action_embed_input: torch.Tensor,
-        memory_states: List[torch.Tensor],
-        variance_states: List[torch.Tensor],
+        action_embed_input: Optional[torch.Tensor] = None,
+        memory_states: Optional[List[torch.Tensor]] = None,
+        variance_states: Optional[List[torch.Tensor]] = None,
+        action_input_ids: Optional[torch.Tensor] = None,
+        action_attention_mask: Optional[torch.Tensor] = None,
         observation_mask: Optional[torch.Tensor] = None,
         mm_token_type_ids: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
@@ -943,7 +946,9 @@ class JAMELCompactWrapper(nn.Module):
         Args:
             input_ids:          [B, N] — token IDs (includes image placeholder tokens)
             attention_mask:     [B, N]
-            action_embed_input: [B, d] — raw action embedding (control variable)
+            action_embed_input: [B, d] — pre-computed action embedding
+            action_input_ids:   [B, L_act] — action tokens when the embedding
+                                must be computed inside the wrapped forward
             memory_states:      List of [B, N_m, d_mem]
             variance_states:   List of [B, N_m] — variance P per layer
             observation_mask:   [B, N] — prompt/current-observation tokens only
@@ -964,6 +969,8 @@ class JAMELCompactWrapper(nn.Module):
         """
         B = input_ids.shape[0]
         device = input_ids.device
+        if memory_states is None or variance_states is None:
+            memory_states, variance_states = self.init_memory(B, device)
         if observation_mask is None:
             observation_mask = attention_mask
         else:
@@ -995,6 +1002,24 @@ class JAMELCompactWrapper(nn.Module):
                 )
 
         # ── Raw action embedding ──
+        if action_embed_input is None:
+            if action_input_ids is None or action_attention_mask is None:
+                raise ValueError(
+                    "Provide action_embed_input or action token IDs and mask."
+                )
+            action_token_embed = self._get_input_embeddings()
+            action_token_device = self._module_device(action_token_embed)
+            action_token_hidden = action_token_embed(
+                action_input_ids.to(action_token_device)
+            )
+            action_token_mask = action_attention_mask.to(
+                action_token_device
+            ).unsqueeze(-1).to(action_token_hidden.dtype)
+            action_embed_input = (
+                (action_token_hidden * action_token_mask).sum(dim=1)
+                / action_token_mask.sum(dim=1).clamp(min=1)
+            )
+
         action_device = self._module_device(self.action_embed)
         action_embed = self.action_embed(
             action_embed_input.to(action_device)
@@ -1418,20 +1443,48 @@ class JAMELCompactWrapper(nn.Module):
 
     # ── Save / Load ──
 
-    def save_pretrained(self, save_directory: str | Path):
+    def save_pretrained(
+        self,
+        save_directory: str | Path,
+        state_dict: Optional[dict[str, torch.Tensor]] = None,
+    ):
         """Save the full model: base LLM + side memory modules + config."""
         save_path = Path(save_directory)
         save_path.mkdir(parents=True, exist_ok=True)
+
+        llm_state = None
+        side_memory_state = None
+        action_embed_state = None
+        if state_dict is not None:
+            normalized_state = {}
+            for key, value in state_dict.items():
+                normalized_key = key.replace("_fsdp_wrapped_module.", "")
+                normalized_state[normalized_key] = value
+            llm_state = {
+                key[len("llm."):]: value
+                for key, value in normalized_state.items()
+                if key.startswith("llm.")
+            }
+            side_memory_state = {
+                key[len("side_memories."):]: value
+                for key, value in normalized_state.items()
+                if key.startswith("side_memories.")
+            }
+            action_embed_state = {
+                key[len("action_embed."):]: value
+                for key, value in normalized_state.items()
+                if key.startswith("action_embed.")
+            }
 
         # Save side memory modules
         side_mem_dir = save_path / "side_memory"
         side_mem_dir.mkdir(exist_ok=True)
         torch.save(
-            self.side_memories.state_dict(),
+            side_memory_state or self.side_memories.state_dict(),
             side_mem_dir / "side_memories.pt",
         )
         torch.save(
-            self.action_embed.state_dict(),
+            action_embed_state or self.action_embed.state_dict(),
             side_mem_dir / "action_embed.pt",
         )
 
@@ -1448,7 +1501,10 @@ class JAMELCompactWrapper(nn.Module):
             # Only save a reference to the base model
             (save_path / "base_model_ref.txt").write_text(self.config.base_model_name)
         else:
-            self.llm.save_pretrained(save_path / "base_model")
+            self.llm.save_pretrained(
+                save_path / "base_model",
+                state_dict=llm_state,
+            )
 
         # Save tokenizer and processor
         self.tokenizer.save_pretrained(save_path)

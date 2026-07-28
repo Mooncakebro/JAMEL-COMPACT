@@ -40,13 +40,30 @@ import argparse
 import math
 import random
 import time
+from functools import partial
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+
+try:
+    from torch.distributed.fsdp import (
+        FullStateDictConfig,
+        FullyShardedDataParallel as FSDP,
+        MixedPrecision,
+        ShardingStrategy,
+        StateDictType,
+    )
+    from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+    _FSDP_AVAILABLE = True
+except ImportError:
+    FSDP = None
+    _FSDP_AVAILABLE = False
 
 # tqdm progress bar
 try:
@@ -99,7 +116,7 @@ def get_action_embedding(
     Uses the pretrained token embedding layer + mean pooling.
     Works with both raw model and DataParallel-wrapped model.
     """
-    raw = model.module if isinstance(model, torch.nn.DataParallel) else model
+    raw = _unwrap(model)
     action_input_ids = action_input_ids.to(device)
     action_attention_mask = action_attention_mask.to(device)
     embed_layer = raw._get_input_embeddings()
@@ -109,8 +126,74 @@ def get_action_embedding(
 
 
 def _unwrap(m):
-    """Return the underlying model from DataParallel if present."""
-    return m.module if isinstance(m, torch.nn.DataParallel) else m
+    """Return the underlying model from a parallel wrapper if present."""
+    if isinstance(m, torch.nn.DataParallel) or _is_fsdp(m):
+        return m.module
+    return m
+
+
+def _is_fsdp(model) -> bool:
+    return _FSDP_AVAILABLE and isinstance(model, FSDP)
+
+
+def _distributed_active() -> bool:
+    return dist.is_available() and dist.is_initialized()
+
+
+def _rank() -> int:
+    return dist.get_rank() if _distributed_active() else 0
+
+
+def _is_main_process() -> bool:
+    return _rank() == 0
+
+
+def _save_model(model, save_directory: str | Path) -> None:
+    raw_model = _unwrap(model)
+    if _is_fsdp(model):
+        save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        with FSDP.state_dict_type(
+            model,
+            StateDictType.FULL_STATE_DICT,
+            save_policy,
+        ):
+            state_dict = model.state_dict()
+        if _is_main_process():
+            raw_model.save_pretrained(save_directory, state_dict=state_dict)
+        dist.barrier()
+        return
+    if _is_main_process():
+        raw_model.save_pretrained(save_directory)
+
+
+def _wrap_fsdp_model(
+    model: JAMELCompactWrapper,
+    device: torch.device,
+    bf16: bool,
+):
+    decoder_layers = model._get_decoder_layers()
+    if not decoder_layers:
+        raise RuntimeError("Could not find decoder layers for FSDP wrapping.")
+    auto_wrap_policy = partial(
+        transformer_auto_wrap_policy,
+        transformer_layer_cls={decoder_layers[0].__class__},
+    )
+    mixed_precision = None
+    if bf16:
+        mixed_precision = MixedPrecision(
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.bfloat16,
+            buffer_dtype=torch.bfloat16,
+        )
+    return FSDP(
+        model,
+        auto_wrap_policy=auto_wrap_policy,
+        mixed_precision=mixed_precision,
+        sharding_strategy=ShardingStrategy.FULL_SHARD,
+        device_id=device,
+        use_orig_params=True,
+        limit_all_gathers=True,
+    )
 
 
 def _scalar(v):
@@ -151,8 +234,9 @@ def _validate_and_save_best(
     if val_loss < best_val_loss:
         best_val_loss = val_loss
         best_dir = Path(config.output_dir) / "best"
-        _unwrap(model).save_pretrained(best_dir)
-        print(f"  [best] New best val loss: {best_val_loss:.4f}")
+        _save_model(model, best_dir)
+        if _is_main_process():
+            print(f"  [best] New best val loss: {best_val_loss:.4f}")
     return best_val_loss
 
 
@@ -203,15 +287,22 @@ def _process_chunk_step(
         image_grid_thw = image_grid_thw.to(device)
 
     # Get action embedding (previous action → FiLM-GRU input)
-    action_embed_input = get_action_embedding(
-        action_input_ids, action_attention_mask, model, device,
-    )
+    fsdp_active = _is_fsdp(model)
+    action_embed_input = None
+    if not fsdp_active:
+        action_embed_input = get_action_embedding(
+            action_input_ids, action_attention_mask, model, device,
+        )
 
     # Pre-compute visual features on the raw model before DataParallel scatter
     inputs_embeds = None
     deepstack_features = None
     visual_pos_mask = None
-    if pixel_values is not None and raw_model._has_visual_encoder():
+    if (
+        not fsdp_active
+        and pixel_values is not None
+        and raw_model._has_visual_encoder()
+    ):
         embed_layer = raw_model._get_input_embeddings()
         h_embed = embed_layer(input_ids)
         inputs_embeds, deepstack_features, visual_pos_mask = \
@@ -235,12 +326,23 @@ def _process_chunk_step(
     # When config.tbptt_detach=False, states are NOT detached — enabling
     # full BPTT for ablation experiments (much higher memory cost).
     detach = config.tbptt_detach
-    mem_input = [m.detach() if detach and isinstance(m, torch.Tensor) else m
-                 for m in memory_states]
-    var_input = [c.detach() if detach and isinstance(c, torch.Tensor) else c
-                 for c in variance_states]
-    e_prev_input = [e.detach() if detach and isinstance(e, torch.Tensor) else e
-                    for e in (e_prev_list or [None] * len(memory_states))]
+    if memory_states is None or variance_states is None:
+        mem_input = None
+        var_input = None
+        e_prev_input = None
+    else:
+        mem_input = [
+            m.detach() if detach and isinstance(m, torch.Tensor) else m
+            for m in memory_states
+        ]
+        var_input = [
+            c.detach() if detach and isinstance(c, torch.Tensor) else c
+            for c in variance_states
+        ]
+        e_prev_input = [
+            e.detach() if detach and isinstance(e, torch.Tensor) else e
+            for e in (e_prev_list or [None] * len(memory_states))
+        ]
 
     # Get sample weights (F7: coverage-weighted SFT)
     sample_weights = step_data.get("sample_weights")
@@ -254,10 +356,12 @@ def _process_chunk_step(
         observation_mask=observation_mask,
         mm_token_type_ids=mm_token_type_ids,
         action_embed_input=action_embed_input,
+        action_input_ids=action_input_ids if fsdp_active else None,
+        action_attention_mask=action_attention_mask if fsdp_active else None,
         memory_states=mem_input,
         variance_states=var_input,
         labels=labels,
-        pixel_values=None,
+        pixel_values=pixel_values if fsdp_active else None,
         image_grid_thw=image_grid_thw,
         inputs_embeds=inputs_embeds,
         deepstack_features=deepstack_features,
@@ -315,7 +419,8 @@ def train_one_epoch(
     last_val_step = None
 
     # Build progress bar
-    if _TQDM_AVAILABLE:
+    show_progress = _TQDM_AVAILABLE and _is_main_process()
+    if show_progress:
         pbar = tqdm(
             dataloader, desc=f"Epoch {epoch}", total=total_steps,
             unit="chunk" if use_chunking else "batch", leave=True,
@@ -332,7 +437,10 @@ def train_one_epoch(
             chunk_size = batch["chunk_size"]
 
             # Initialize memory and e_prev at the start of each chunk
-            memory_states, variance_states = raw_model.init_memory(1, device)
+            if _is_fsdp(model):
+                memory_states, variance_states = None, None
+            else:
+                memory_states, variance_states = raw_model.init_memory(1, device)
             e_prev_list = None  # None for first step in chunk
 
             total_chunk_loss = None
@@ -387,7 +495,11 @@ def train_one_epoch(
             for k in last_loss_dict:
                 loss_dict[k] = sum(d[k] for d in all_loss_dicts) / chunk_size
 
-            loss = total_chunk_loss / accum_steps
+            accumulation_divisor = min(
+                accum_steps,
+                total_steps - (step // accum_steps) * accum_steps,
+            )
+            loss = total_chunk_loss / accumulation_divisor
 
         else:
             # ── Single-step training (original path) ──
@@ -407,63 +519,56 @@ def train_one_epoch(
             if image_grid_thw is not None and isinstance(image_grid_thw, torch.Tensor):
                 image_grid_thw = image_grid_thw.to(device)
 
-            action_embed_input = get_action_embedding(
-                action_input_ids, action_attention_mask, model, device,
-            )
             B = input_ids.shape[0]
-            memory_states, variance_states = raw_model.init_memory(B, device)
+            if _is_fsdp(model):
+                memory_states, variance_states = None, None
+            else:
+                memory_states, variance_states = raw_model.init_memory(B, device)
 
             # Get sample weights (F7)
             sample_weights = batch.get("sample_weights")
             if sample_weights is not None and isinstance(sample_weights, torch.Tensor):
                 sample_weights = sample_weights.to(device)
 
-            # Pre-compute visual features on the raw model before DataParallel
-            inputs_embeds = None
-            deepstack_features = None
-            visual_pos_mask = None
-            if pixel_values is not None and raw_model._has_visual_encoder():
-                embed_layer = raw_model._get_input_embeddings()
-                h_embed = embed_layer(input_ids)
-                inputs_embeds, deepstack_features, visual_pos_mask = \
-                    raw_model._inject_visual_features(
-                        h_embed, input_ids, pixel_values, image_grid_thw,
-                    )
-
-            outputs = model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                observation_mask=observation_mask,
-                mm_token_type_ids=mm_token_type_ids,
-                action_embed_input=action_embed_input,
-                memory_states=memory_states,
-                variance_states=variance_states,
-                labels=labels,
-                pixel_values=None,
-                image_grid_thw=image_grid_thw,
-                inputs_embeds=inputs_embeds,
-                deepstack_features=deepstack_features,
-                visual_pos_mask=visual_pos_mask,
-                sample_weights=sample_weights,
+            step_data = {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "observation_mask": observation_mask,
+                "mm_token_type_ids": mm_token_type_ids,
+                "labels": labels,
+                "action_input_ids": action_input_ids,
+                "action_attention_mask": action_attention_mask,
+                "pixel_values": pixel_values,
+                "image_grid_thw": image_grid_thw,
+                "sample_weights": sample_weights,
+            }
+            loss, loss_dict, _, _, _ = _process_chunk_step(
+                model,
+                raw_model,
+                config,
+                device,
+                step_data,
+                memory_states,
+                variance_states,
             )
-
-            loss = outputs["loss"]
-            if loss.dim() > 0:
-                loss = loss.mean()
-            loss = loss / accum_steps
-
-            def _to_scalar(v):
-                if isinstance(v, torch.Tensor):
-                    return v.mean().item()
-                return float(v)
-            loss_dict = {k: _to_scalar(v) for k, v in outputs["loss_dict"].items()}
+            accumulation_divisor = min(
+                accum_steps,
+                total_steps - (step // accum_steps) * accum_steps,
+            )
+            loss = loss / accumulation_divisor
 
         # Backward
         loss.backward()
 
         # Gradient accumulation
-        if (step + 1) % accum_steps == 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
+        should_step = (step + 1) % accum_steps == 0 or step + 1 == total_steps
+        if should_step:
+            if _is_fsdp(model):
+                model.clip_grad_norm_(config.max_grad_norm)
+            else:
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), config.max_grad_norm,
+                )
             optimizer.step()
             optimizer.zero_grad()
             global_step += 1
@@ -472,7 +577,7 @@ def train_one_epoch(
             lr = memory_lr if memory_lr is not None else optimizer.param_groups[0]["lr"]
 
             # ── TensorBoard logging ──
-            if global_step % config.log_steps == 0:
+            if global_step % config.log_steps == 0 and _is_main_process():
                 elapsed = time.time() - batch_start
                 lr_text = f"memory_lr={lr:.2e} "
                 if base_lr is not None:
@@ -510,7 +615,7 @@ def train_one_epoch(
                 )
 
             # Update progress bar
-            if _TQDM_AVAILABLE:
+            if show_progress:
                 pbar.set_postfix({
                     "loss": f"{loss_dict['total']:.4f}",
                     "action": f"{loss_dict['action']:.4f}",
@@ -525,8 +630,9 @@ def train_one_epoch(
             # ── Save checkpoint ──
             if global_step % config.save_steps == 0:
                 ckpt_dir = Path(config.output_dir) / f"global_step_{global_step}"
-                raw_model.save_pretrained(ckpt_dir)
-                print(f"  [checkpoint] saved to {ckpt_dir}")
+                _save_model(model, ckpt_dir)
+                if _is_main_process():
+                    print(f"  [checkpoint] saved to {ckpt_dir}")
 
             # Validate during the epoch so a later auxiliary-loss divergence
             # cannot overwrite the best weights observed earlier.
@@ -542,7 +648,7 @@ def train_one_epoch(
                 last_val_step = global_step
 
     # Close progress bar
-    if _TQDM_AVAILABLE:
+    if show_progress:
         pbar.close()
 
     return global_step, best_val_loss, last_val_step
@@ -569,9 +675,10 @@ def validate(
     total_obs_loss = 0.0
     total_nll_loss = 0.0
     num_batches = 0
+    show_progress = _TQDM_AVAILABLE and _is_main_process()
 
     with torch.no_grad():
-        if _TQDM_AVAILABLE:
+        if show_progress:
             pbar = tqdm(dataloader, desc="Validating",
                         unit="chunk" if use_chunking else "batch", leave=False)
         else:
@@ -581,7 +688,10 @@ def validate(
             if use_chunking:
                 # ── Session-chunked validation ──
                 chunk_size = batch["chunk_size"]
-                memory_states, variance_states = raw_model.init_memory(1, device)
+                if _is_fsdp(model):
+                    memory_states, variance_states = None, None
+                else:
+                    memory_states, variance_states = raw_model.init_memory(1, device)
 
                 chunk_loss = 0.0
                 chunk_action = 0.0
@@ -630,7 +740,7 @@ def validate(
                 total_nll_loss += chunk_nll / chunk_size
                 num_batches += 1
 
-                if _TQDM_AVAILABLE:
+                if show_progress:
                     pbar.set_postfix({"val_loss": f"{chunk_loss / chunk_size:.4f}"})
 
             else:
@@ -651,58 +761,74 @@ def validate(
                 if image_grid_thw is not None and isinstance(image_grid_thw, torch.Tensor):
                     image_grid_thw = image_grid_thw.to(device)
 
-                action_embed_input = get_action_embedding(
-                    action_input_ids, action_attention_mask, model, device,
-                )
                 B = input_ids.shape[0]
-                memory_states, variance_states = raw_model.init_memory(B, device)
+                if _is_fsdp(model):
+                    memory_states, variance_states = None, None
+                else:
+                    memory_states, variance_states = raw_model.init_memory(B, device)
 
                 # Get sample weights (F7)
                 sample_weights = batch.get("sample_weights")
                 if sample_weights is not None and isinstance(sample_weights, torch.Tensor):
                     sample_weights = sample_weights.to(device)
 
-                inputs_embeds = None
-                deepstack_features = None
-                visual_pos_mask = None
-                if pixel_values is not None and raw_model._has_visual_encoder():
-                    embed_layer = raw_model._get_input_embeddings()
-                    h_embed = embed_layer(input_ids)
-                    inputs_embeds, deepstack_features, visual_pos_mask = \
-                        raw_model._inject_visual_features(
-                            h_embed, input_ids, pixel_values, image_grid_thw,
-                        )
-
-                outputs = model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    observation_mask=observation_mask,
-                    mm_token_type_ids=mm_token_type_ids,
-                    action_embed_input=action_embed_input,
-                    memory_states=memory_states,
-                    variance_states=variance_states,
-                    labels=labels,
-                    pixel_values=None,
-                    image_grid_thw=image_grid_thw,
-                    inputs_embeds=inputs_embeds,
-                    deepstack_features=deepstack_features,
-                    visual_pos_mask=visual_pos_mask,
-                    sample_weights=sample_weights,
+                step_data = {
+                    "input_ids": input_ids,
+                    "attention_mask": attention_mask,
+                    "observation_mask": observation_mask,
+                    "mm_token_type_ids": mm_token_type_ids,
+                    "labels": labels,
+                    "action_input_ids": action_input_ids,
+                    "action_attention_mask": action_attention_mask,
+                    "pixel_values": pixel_values,
+                    "image_grid_thw": image_grid_thw,
+                    "sample_weights": sample_weights,
+                }
+                _, loss_dict, _, _, _ = _process_chunk_step(
+                    model,
+                    raw_model,
+                    config,
+                    device,
+                    step_data,
+                    memory_states,
+                    variance_states,
                 )
 
-                ld = outputs["loss_dict"]
-                total_loss += _scalar(ld["total"])
-                total_action_loss += _scalar(ld["action"])
-                total_mem_loss += _scalar(ld["mem_l2"])
-                total_obs_loss += _scalar(ld.get("obs", 0.0))
-                total_nll_loss += _scalar(ld.get("nll", 0.0))
+                total_loss += loss_dict["total"]
+                total_action_loss += loss_dict["action"]
+                total_mem_loss += loss_dict["mem_l2"]
+                total_obs_loss += loss_dict.get("obs", 0.0)
+                total_nll_loss += loss_dict.get("nll", 0.0)
                 num_batches += 1
 
-                if _TQDM_AVAILABLE:
-                    pbar.set_postfix({"val_loss": f"{_scalar(ld['total']):.4f}"})
+                if show_progress:
+                    pbar.set_postfix({"val_loss": f"{loss_dict['total']:.4f}"})
 
-        if _TQDM_AVAILABLE:
+        if show_progress:
             pbar.close()
+
+    if _distributed_active():
+        totals = torch.tensor(
+            [
+                total_loss,
+                total_action_loss,
+                total_mem_loss,
+                total_obs_loss,
+                total_nll_loss,
+                num_batches,
+            ],
+            dtype=torch.float64,
+            device=device,
+        )
+        dist.all_reduce(totals, op=dist.ReduceOp.SUM)
+        (
+            total_loss,
+            total_action_loss,
+            total_mem_loss,
+            total_obs_loss,
+            total_nll_loss,
+            num_batches,
+        ) = totals.tolist()
 
     avg_loss = total_loss / max(num_batches, 1)
     avg_action = total_action_loss / max(num_batches, 1)
@@ -717,14 +843,15 @@ def validate(
         writer.add_scalar("val/loss_obs", avg_obs, global_step)
         writer.add_scalar("val/loss_nll", avg_nll, global_step)
 
-    print(
-        f"  [val step {global_step}] "
-        f"loss={avg_loss:.4f} "
-        f"action={avg_action:.4f} "
-        f"mem_l2={avg_mem:.6f} "
-        f"obs={avg_obs:.4f} "
-        f"nll={avg_nll:.4f}"
-    )
+    if _is_main_process():
+        print(
+            f"  [val step {global_step}] "
+            f"loss={avg_loss:.4f} "
+            f"action={avg_action:.4f} "
+            f"mem_l2={avg_mem:.6f} "
+            f"obs={avg_obs:.4f} "
+            f"nll={avg_nll:.4f}"
+        )
 
     model.train()
     return avg_loss
@@ -790,6 +917,10 @@ def main():
         help="Force legacy batch-splitting DataParallel.",
     )
     parser.set_defaults(model_parallel=None)
+    parser.add_argument(
+        "--fsdp", action="store_true",
+        help="Use torchrun + FSDP FULL_SHARD for multi-GPU training.",
+    )
     parser.add_argument("--chunk-size", type=int, default=1,
                         help="Session-chunked training: number of consecutive "
                              "steps per chunk. 1 = single-step (original). "
@@ -800,31 +931,48 @@ def main():
                              "samples with high coverage delta (novelty).")
     args = parser.parse_args()
 
-    if args.chunk_size > 1 and args.batch_size != 1:
+    if (
+        args.chunk_size > 1
+        and args.batch_size != 1
+        and int(os.environ.get("RANK", "0")) == 0
+    ):
         print(
             f"[train] WARNING: --batch-size {args.batch_size} is incompatible "
             "with recurrent session chunks; overriding it to 1. Increase "
             "--grad-accum for a larger effective batch."
         )
+    if args.chunk_size > 1:
         args.batch_size = 1
 
-    # ── GPU selection ──
-    # CUDA_VISIBLE_DEVICES was already set before torch import (see top of file).
-    # Here we just report what's visible.
-    if args.gpu_ids:
-        print(f"[train] Requested GPUs: {args.gpu_ids} (CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', 'not set')})")
-    else:
-        print("[train] GPU_IDS not set — using all visible GPUs")
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    if world_size > 1:
+        args.fsdp = True
+    if args.fsdp and not _FSDP_AVAILABLE:
+        parser.error("This PyTorch build does not provide FSDP.")
+    if args.fsdp and world_size < 2:
+        parser.error(
+            "--fsdp requires torchrun with at least two processes. Use the "
+            "shell launcher with FSDP=1."
+        )
+    if args.fsdp and not torch.cuda.is_available():
+        parser.error("FSDP multi-GPU training requires CUDA.")
 
-    # Clear CUDA cache after changing visible devices
+    if args.fsdp:
+        if not dist.is_initialized():
+            dist.init_process_group(backend="nccl")
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+    set_seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    set_seed(args.seed)
-
-    num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
-    if args.model_parallel is None:
+    visible_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    num_gpus = world_size if args.fsdp else visible_gpus
+    if args.model_parallel is None and not args.fsdp:
         args.model_parallel = bool(
             num_gpus > 1
             and args.freeze_base
@@ -836,27 +984,45 @@ def main():
                 "[train] Auto-enabled model parallelism for frozen, "
                 "chunked B=1 multi-GPU training."
             )
+    if args.fsdp:
+        args.model_parallel = False
     if args.model_parallel and num_gpus < 2:
         parser.error("--model-parallel requires at least two visible GPUs")
     if args.model_parallel and not args.freeze_base:
         parser.error(
             "--model-parallel uses Transformers/Accelerate device-map "
             "sharding and only supports a frozen base model. Set "
-            "FREEZE_BASE=1, or use an FSDP/ZeRO-3 training path to fine-tune "
-            "the sharded base model."
+            "FREEZE_BASE=1, or launch full-base training with torchrun "
+            "and --fsdp."
         )
-    use_data_parallel = num_gpus > 1 and not args.model_parallel
+    use_data_parallel = (
+        num_gpus > 1 and not args.model_parallel and not args.fsdp
+    )
 
     parallel_mode = (
-        "MODEL_PARALLEL" if args.model_parallel
+        "FSDP_FULL_SHARD" if args.fsdp
+        else "MODEL_PARALLEL" if args.model_parallel
         else "DATA_PARALLEL" if use_data_parallel
         else "SINGLE_DEVICE"
     )
-    print(f"[train] device={device}, GPUs visible={num_gpus}, mode={parallel_mode}")
-    if torch.cuda.is_available():
-        for i in range(num_gpus):
-            print(f"  GPU {i}: {torch.cuda.get_device_name(i)} "
-                  f"({torch.cuda.get_device_properties(i).total_memory / 1e9:.1f}GB)")
+    if _is_main_process():
+        if args.gpu_ids:
+            print(
+                f"[train] Requested GPUs: {args.gpu_ids} "
+                f"(CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', 'not set')})"
+            )
+        else:
+            print("[train] GPU_IDS not set — using all visible GPUs")
+        print(
+            f"[train] device={device}, world_size={world_size}, "
+            f"mode={parallel_mode}"
+        )
+        if torch.cuda.is_available():
+            for i in range(visible_gpus):
+                print(
+                    f"  GPU {i}: {torch.cuda.get_device_name(i)} "
+                    f"({torch.cuda.get_device_properties(i).total_memory / 1e9:.1f}GB)"
+                )
 
     # ── Build config ──
     config = CompactConfig.from_args(
@@ -889,9 +1055,15 @@ def main():
     )
 
     # ── Build model ──
-    print(f"[train] Loading base model: {config.base_model_name}")
+    if _is_main_process():
+        print(f"[train] Loading base model: {config.base_model_name}")
     model = JAMELCompactWrapper(config)
-    if config.model_parallel:
+    param_info = model.count_parameters()
+    if args.fsdp:
+        model = _wrap_fsdp_model(model, device, config.bf16)
+        if _is_main_process():
+            print(f"[train] FSDP FULL_SHARD active on {world_size} GPUs")
+    elif config.model_parallel:
         device = model.input_device
     else:
         model = model.to(device)
@@ -903,18 +1075,24 @@ def main():
         print(f"[train] DataParallel active on {num_gpus} GPUs: {device_ids}")
 
     raw_model = _unwrap(model)
-    param_info = raw_model.count_parameters()
-    print(f"[train] Base params:   {param_info['base'] / 1e9:.2f}B")
-    print(f"[train] New params:    {param_info['new'] / 1e6:.1f}M")
-    print(f"[train] Total:         {param_info['total'] / 1e9:.2f}B")
-    print(f"[train] Overhead:      {param_info['overhead_pct']:.1f}%")
+    if _is_main_process():
+        print(f"[train] Base params:   {param_info['base'] / 1e9:.2f}B")
+        print(f"[train] New params:    {param_info['new'] / 1e6:.1f}M")
+        print(f"[train] Total:         {param_info['total'] / 1e9:.2f}B")
+        print(f"[train] Overhead:      {param_info['overhead_pct']:.1f}%")
 
     # ── Build dataset ──
     use_chunking = config.chunk_size > 1
-    print(f"[train] Loading data: {args.train_file}")
-    print(f"[train] Chunk size: {config.chunk_size} "
-          f"({'session-chunked' if use_chunking else 'single-step'})")
-    if use_chunking and use_data_parallel and config.per_device_batch_size == 1:
+    if _is_main_process():
+        print(f"[train] Loading data: {args.train_file}")
+        print(f"[train] Chunk size: {config.chunk_size} "
+              f"({'session-chunked' if use_chunking else 'single-step'})")
+    if (
+        _is_main_process()
+        and use_chunking
+        and use_data_parallel
+        and config.per_device_batch_size == 1
+    ):
         print(
             "[train] WARNING: DataParallel cannot split chunked B=1 inputs; "
             "only the first GPU will compute. Use --model-parallel for large "
@@ -938,6 +1116,23 @@ def main():
         coverage_weight_eta=config.coverage_weight_eta,
     )
 
+    train_sampler = None
+    val_sampler = None
+    if args.fsdp:
+        train_sampler = DistributedSampler(
+            train_dataset,
+            num_replicas=world_size,
+            rank=_rank(),
+            shuffle=True,
+            seed=config.seed,
+        )
+        val_sampler = DistributedSampler(
+            val_dataset,
+            num_replicas=world_size,
+            rank=_rank(),
+            shuffle=False,
+        )
+
     if use_chunking:
         # Wrap with SessionChunkDataset for multi-step training
         train_dataset = SessionChunkDataset(train_dataset, chunk_size=config.chunk_size,
@@ -945,13 +1140,29 @@ def main():
         val_dataset = SessionChunkDataset(val_dataset, chunk_size=config.chunk_size,
                                            coverage_weight_eta=config.coverage_weight_eta)
         chunk_batch_size = 1
-        print(f"[train] Chunked mode: batch_size={chunk_batch_size} "
-              f"× {config.chunk_size} steps/chunk")
+        if args.fsdp:
+            train_sampler = DistributedSampler(
+                train_dataset,
+                num_replicas=world_size,
+                rank=_rank(),
+                shuffle=True,
+                seed=config.seed,
+            )
+            val_sampler = DistributedSampler(
+                val_dataset,
+                num_replicas=world_size,
+                rank=_rank(),
+                shuffle=False,
+            )
+        if _is_main_process():
+            print(f"[train] Chunked mode: batch_size={chunk_batch_size} "
+                  f"× {config.chunk_size} steps/chunk/GPU")
         pad_token_id = raw_model.tokenizer.pad_token_id or 0
         train_loader = DataLoader(
             train_dataset,
             batch_size=chunk_batch_size,
-            shuffle=True,
+            shuffle=train_sampler is None,
+            sampler=train_sampler,
             collate_fn=lambda b: session_collate_fn(b, pad_token_id),
             num_workers=8,
         )
@@ -959,19 +1170,30 @@ def main():
             val_dataset,
             batch_size=chunk_batch_size,
             shuffle=False,
+            sampler=val_sampler,
             collate_fn=lambda b: session_collate_fn(b, pad_token_id),
             num_workers=8,
         )
     else:
         # Single-step mode (original)
-        effective_batch = config.per_device_batch_size * max(num_gpus, 1)
-        print(f"[train] Per-GPU batch size: {config.per_device_batch_size}"
-              f" × {max(num_gpus, 1)} GPUs = effective batch {effective_batch}")
+        if args.fsdp:
+            effective_batch = config.per_device_batch_size
+            global_batch = effective_batch * world_size
+        elif use_data_parallel:
+            effective_batch = config.per_device_batch_size * max(num_gpus, 1)
+            global_batch = effective_batch
+        else:
+            effective_batch = config.per_device_batch_size
+            global_batch = effective_batch
+        if _is_main_process():
+            print(f"[train] Per-GPU batch size: {config.per_device_batch_size}"
+                  f" × {max(num_gpus, 1)} GPUs = global batch {global_batch}")
         pad_token_id = raw_model.tokenizer.pad_token_id or 0
         train_loader = DataLoader(
             train_dataset,
             batch_size=effective_batch,
-            shuffle=True,
+            shuffle=train_sampler is None,
+            sampler=train_sampler,
             collate_fn=lambda b: collate_fn(b, pad_token_id),
             num_workers=8,
         )
@@ -979,6 +1201,7 @@ def main():
             val_dataset,
             batch_size=effective_batch,
             shuffle=False,
+            sampler=val_sampler,
             collate_fn=lambda b: collate_fn(b, pad_token_id),
             num_workers=8,
         )
@@ -1012,14 +1235,19 @@ def main():
         optimizer_groups,
         weight_decay=config.weight_decay,
     )
-    print(f"[train] Memory learning rate: {config.memory_learning_rate:.2e}")
-    if base_params:
-        print(f"[train] Base learning rate:   {config.learning_rate:.2e}")
-    else:
-        print("[train] Base model frozen")
+    if _is_main_process():
+        print(f"[train] Memory learning rate: {config.memory_learning_rate:.2e}")
+        if base_params:
+            print(f"[train] Base learning rate:   {config.learning_rate:.2e}")
+        else:
+            print("[train] Base model frozen")
 
     # ── LR scheduler (cosine with warmup) ──
-    total_steps = len(train_loader) * config.max_epochs // config.gradient_accumulation_steps
+    total_steps = math.ceil(
+        len(train_loader)
+        * config.max_epochs
+        / config.gradient_accumulation_steps
+    )
     warmup_steps = int(total_steps * config.warmup_ratio)
 
     def lr_lambda(step):
@@ -1031,25 +1259,30 @@ def main():
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     # ── TensorBoard (optional) ──
-    if _TB_AVAILABLE:
+    if _TB_AVAILABLE and _is_main_process():
         writer = SummaryWriter(log_dir=config.tb_log_dir)
         print(f"[train] TensorBoard logging to {config.tb_log_dir}")
         print(f"  Run: tensorboard --logdir {config.tb_log_dir}")
         for k, v in config.to_dict().items():
             writer.add_text("config", f"{k}: {v}")
-    else:
+    elif _is_main_process():
         writer = None
         print("[train] TensorBoard not available (pip install tensorboard)")
         print(f"[train] Logs will go to stdout only")
+    else:
+        writer = None
 
     # ── Training loop ──
     global_step = 0
     best_val_loss = float('inf')
 
     for epoch in range(config.max_epochs):
-        print(f"\n{'='*60}")
-        print(f"Epoch {epoch + 1}/{config.max_epochs}")
-        print(f"{'='*60}")
+        if isinstance(train_sampler, DistributedSampler):
+            train_sampler.set_epoch(epoch)
+        if _is_main_process():
+            print(f"\n{'='*60}")
+            print(f"Epoch {epoch + 1}/{config.max_epochs}")
+            print(f"{'='*60}")
 
         global_step, best_val_loss, last_val_step = train_one_epoch(
             model, train_loader, optimizer, config, writer,
@@ -1069,12 +1302,16 @@ def main():
 
     # ── Save final model ──
     final_dir = Path(config.output_dir) / "final"
-    raw_model.save_pretrained(final_dir)
-    print(f"\n[train] Final model saved to {final_dir}")
+    _save_model(model, final_dir)
+    if _is_main_process():
+        print(f"\n[train] Final model saved to {final_dir}")
 
     if writer is not None:
         writer.close()
-    print("[train] Done.")
+    if _is_main_process():
+        print("[train] Done.")
+    if _distributed_active():
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
