@@ -370,11 +370,25 @@ class JAMELCompactWrapper(nn.Module):
         # We try causal first (for text-only models like Qwen3-8B), then fall
         # back to ImageTextToText (for vision-language models like Qwen3-VL).
         dtype = torch.bfloat16 if config.bf16 else torch.float32
+        load_kwargs = {
+            "torch_dtype": dtype,
+            "trust_remote_code": True,
+        }
+        if config.model_parallel:
+            try:
+                import accelerate
+            except ImportError as exc:
+                raise RuntimeError(
+                    "Model-parallel loading requires `accelerate`."
+                ) from exc
+            load_kwargs.update({
+                "device_map": "balanced_low_0",
+                "low_cpu_mem_usage": True,
+            })
         try:
             self.llm = AutoModelForCausalLM.from_pretrained(
                 config.base_model_name,
-                torch_dtype=dtype,
-                trust_remote_code=True,
+                **load_kwargs,
             )
         except (ValueError, OSError) as e:
             print(f"[model] AutoModelForCausalLM failed ({e}), "
@@ -382,8 +396,7 @@ class JAMELCompactWrapper(nn.Module):
             from transformers import AutoModelForImageTextToText
             self.llm = AutoModelForImageTextToText.from_pretrained(
                 config.base_model_name,
-                torch_dtype=dtype,
-                trust_remote_code=True,
+                **load_kwargs,
             )
         try:
             self.tokenizer = AutoTokenizer.from_pretrained(
@@ -428,6 +441,11 @@ class JAMELCompactWrapper(nn.Module):
         for sm in self.side_memories:
             sm.to(dtype=llm_dtype)
 
+        self.model_parallel = bool(config.model_parallel)
+        self.input_device = next(self.llm.parameters()).device
+        if self.model_parallel:
+            self._configure_model_parallel(llm_dtype)
+
         # ── Optionally freeze the base LLM ──
         if config.freeze_base:
             for param in self.llm.parameters():
@@ -438,6 +456,69 @@ class JAMELCompactWrapper(nn.Module):
             self.llm.config.use_cache = False
 
     # ── Architecture helpers ──
+
+    @staticmethod
+    def _module_device(module: nn.Module) -> torch.device:
+        for parameter in module.parameters():
+            if parameter.device.type != "meta":
+                return parameter.device
+        for buffer in module.buffers():
+            if buffer.device.type != "meta":
+                return buffer.device
+        return torch.device("cpu")
+
+    @staticmethod
+    def _to_device(value, device: torch.device):
+        if isinstance(value, torch.Tensor):
+            return value.to(device)
+        if isinstance(value, tuple):
+            return tuple(JAMELCompactWrapper._to_device(v, device) for v in value)
+        if isinstance(value, list):
+            return [JAMELCompactWrapper._to_device(v, device) for v in value]
+        if isinstance(value, dict):
+            return {
+                key: JAMELCompactWrapper._to_device(item, device)
+                for key, item in value.items()
+            }
+        return value
+
+    def _configure_model_parallel(self, llm_dtype: torch.dtype) -> None:
+        device_map = getattr(self.llm, "hf_device_map", None)
+        if not device_map:
+            raise RuntimeError("Transformers did not create a model device map.")
+
+        decoder_layers = self._get_decoder_layers()
+        layer_devices = []
+        for layer, side_memory in zip(decoder_layers, self.side_memories):
+            layer_device = self._module_device(layer)
+            if layer_device.type != "cuda":
+                raise RuntimeError(
+                    "The 8B model did not fit entirely on the selected GPUs; "
+                    f"a decoder layer was offloaded to {layer_device}. Select "
+                    "more GPUs or reduce max_length."
+                )
+            side_memory.to(device=layer_device, dtype=llm_dtype)
+            layer_devices.append(str(layer_device))
+
+        embedding_device = self._module_device(self._get_input_embeddings())
+        self.action_embed.to(device=embedding_device, dtype=llm_dtype)
+        self.input_device = embedding_device
+
+        distribution = {}
+        for layer_device in layer_devices:
+            distribution[layer_device] = distribution.get(layer_device, 0) + 1
+        print(f"[model] Model-parallel decoder distribution: {distribution}")
+        print(f"[model] Input/vision device: {self.input_device}")
+
+    def _run_decoder_layer(self, layer: nn.Module, h: torch.Tensor, **kwargs):
+        if self.config.gradient_checkpointing and self.training:
+            from torch.utils.checkpoint import checkpoint
+
+            def layer_forward(hidden_states):
+                return layer(hidden_states, **kwargs)
+
+            return checkpoint(layer_forward, h, use_reentrant=False)
+        return layer(h, **kwargs)
 
     @staticmethod
     def _infer_hidden_size(model) -> int:
@@ -523,7 +604,9 @@ class JAMELCompactWrapper(nn.Module):
 
     def _apply_final_norm(self, h: torch.Tensor) -> torch.Tensor:
         norm = self._get_final_norm()
-        return norm(h) if norm is not None else h
+        if norm is None:
+            return h
+        return norm(h.to(self._module_device(norm)))
 
     def _compute_position_embeddings(
         self,
@@ -811,9 +894,10 @@ class JAMELCompactWrapper(nn.Module):
         llm_dtype = next(self.llm.parameters()).dtype
         m_states, p_states = [], []
         for sm in self.side_memories:
-            m = sm.init_memory.unsqueeze(0).expand(batch_size, -1, -1).clone().to(device=device, dtype=llm_dtype)
+            state_device = self._module_device(sm) if self.model_parallel else device
+            m = sm.init_memory.unsqueeze(0).expand(batch_size, -1, -1).clone().to(device=state_device, dtype=llm_dtype)
             p = torch.full((batch_size, self.num_mem), sm.init_variance,
-                           device=device, dtype=llm_dtype)
+                           device=state_device, dtype=llm_dtype)
             m_states.append(m)
             p_states.append(p)
         return m_states, p_states
@@ -903,7 +987,10 @@ class JAMELCompactWrapper(nn.Module):
                 )
 
         # ── Raw action embedding ──
-        action_embed = self.action_embed(action_embed_input)  # [B, d]
+        action_device = self._module_device(self.action_embed)
+        action_embed = self.action_embed(
+            action_embed_input.to(action_device)
+        )  # [B, d]
 
         # ── Get decoder layers ──
         decoder_layers = self._get_decoder_layers()
@@ -927,23 +1014,35 @@ class JAMELCompactWrapper(nn.Module):
         # ── Process through each layer ──
         new_memory, new_variance = [], []
         e_list = []  # surprise per layer for next step
-        loss_obs_total = torch.tensor(0.0, device=device, dtype=h.dtype)
-        loss_nll_total = torch.tensor(0.0, device=device, dtype=h.dtype)
+        loss_obs_terms = []
+        loss_nll_terms = []
         L = len(decoder_layers)
 
         for l, (layer, sm) in enumerate(zip(decoder_layers, self.side_memories)):
+            layer_device = self._module_device(layer)
+            h = h.to(layer_device)
+            memory_state = memory_states[l].to(layer_device)
+            variance_state = variance_states[l].to(layer_device)
+            action_embed_layer = action_embed.to(layer_device)
+            e_prev = e_prev_list[l]
+            if isinstance(e_prev, torch.Tensor):
+                e_prev = e_prev.to(layer_device)
+
             # 4a. Memory Predict (FiLM-GRU + variance predict)
             m_hat, p_hat = sm.predict(
-                memory_states[l], variance_states[l], action_embed,
-                e_prev=e_prev_list[l],
+                memory_state, variance_state, action_embed_layer,
+                e_prev=e_prev,
             )
 
             # 4b. Run pretrained layer (self-attn + FFN)
-            layer_output = layer(
+            layer_output = self._run_decoder_layer(
+                layer,
                 h,
-                attention_mask=attention_mask_4d,
-                position_embeddings=position_embeddings,
-                **kwargs,
+                attention_mask=attention_mask_4d.to(layer_device),
+                position_embeddings=self._to_device(
+                    position_embeddings, layer_device,
+                ),
+                **self._to_device(kwargs, layer_device),
             )
             if isinstance(layer_output, tuple):
                 h_layer = layer_output[0]
@@ -955,7 +1054,7 @@ class JAMELCompactWrapper(nn.Module):
             if deepstack_features and l < len(deepstack_features):
                 ds_feat = deepstack_features[l].to(h_layer.device, h_layer.dtype)
                 if visual_pos_mask is not None:
-                    mask_1d = visual_pos_mask  # [B, N]
+                    mask_1d = visual_pos_mask.to(h_layer.device)  # [B, N]
                     for b in range(h_layer.shape[0]):
                         positions = mask_1d[b].nonzero(as_tuple=True)[0]
                         n = len(positions)
@@ -963,7 +1062,9 @@ class JAMELCompactWrapper(nn.Module):
                             h_layer[b, positions] = h_layer[b, positions] + ds_feat[:n]
 
             # 4c. Extract observation (F3: masked, U1: multi-token)
-            z_down = sm.extract_observation(h_layer, observation_mask)
+            z_down = sm.extract_observation(
+                h_layer, observation_mask.to(layer_device),
+            )
 
             # 4d. Memory Correct (learned Kalman + obs model)
             m_new, p_new, e, loss_obs_l, loss_nll_l = sm.correct(
@@ -976,14 +1077,20 @@ class JAMELCompactWrapper(nn.Module):
             new_memory.append(m_new)
             new_variance.append(p_new)
             e_list.append(e)
-            loss_obs_total = loss_obs_total + loss_obs_l
-            loss_nll_total = loss_nll_total + loss_nll_l
-
-        loss_obs_total = loss_obs_total / L
-        loss_nll_total = loss_nll_total / L
+            loss_obs_terms.append(loss_obs_l)
+            loss_nll_terms.append(loss_nll_l)
 
         # ── LM head (pretrained) ──
-        logits = self._get_lm_head()(self._apply_final_norm(h))
+        lm_head = self._get_lm_head()
+        normalized_h = self._apply_final_norm(h)
+        logits = lm_head(normalized_h.to(self._module_device(lm_head)))
+        loss_device = logits.device
+        loss_obs_total = torch.stack([
+            term.to(loss_device) for term in loss_obs_terms
+        ]).sum() / L
+        loss_nll_total = torch.stack([
+            term.to(loss_device) for term in loss_nll_terms
+        ]).sum() / L
 
         result = {
             "logits": logits,
@@ -997,7 +1104,7 @@ class JAMELCompactWrapper(nn.Module):
             from .loss import compute_compact_loss
             loss, loss_dict = compute_compact_loss(
                 logits=logits,
-                labels=labels,
+                labels=labels.to(loss_device),
                 memory_states=new_memory,
                 variance_states=new_variance,
                 config=self.config,
@@ -1055,11 +1162,16 @@ class JAMELCompactWrapper(nn.Module):
         from transformers import DynamicCache
         cache = DynamicCache()
 
-        action_embed = self.action_embed(action_embed_input)
+        action_device = self._module_device(self.action_embed)
+        action_embed = self.action_embed(action_embed_input.to(action_device))
         decoder_layers = self._get_decoder_layers()
         embed_layer = self._get_input_embeddings()
 
         # ── Process prompt embeddings ──
+        embedding_device = self._module_device(embed_layer)
+        input_ids = input_ids.to(embedding_device)
+        attention_mask = attention_mask.to(embedding_device)
+        action_embed_input = action_embed_input.to(embedding_device)
         h = embed_layer(input_ids)  # [B, N, d]
 
         # Inject visual features if available
@@ -1093,24 +1205,43 @@ class JAMELCompactWrapper(nn.Module):
         new_memory, new_variance = [], []
         e_list = []
         for l, (layer, sm) in enumerate(zip(decoder_layers, self.side_memories)):
-            m_hat, p_hat = sm.predict(memory_states[l], variance_states[l], action_embed,
-                                      e_prev=e_prev_list[l])
-            layer_output = layer(h, attention_mask=attn_mask_4d,
-                                position_embeddings=position_embeddings,
-                                past_key_values=cache, use_cache=True)
+            layer_device = self._module_device(layer)
+            h = h.to(layer_device)
+            memory_state = memory_states[l].to(layer_device)
+            variance_state = variance_states[l].to(layer_device)
+            action_embed_layer = action_embed.to(layer_device)
+            e_prev = e_prev_list[l]
+            if isinstance(e_prev, torch.Tensor):
+                e_prev = e_prev.to(layer_device)
+            m_hat, p_hat = sm.predict(
+                memory_state, variance_state, action_embed_layer,
+                e_prev=e_prev,
+            )
+            layer_output = layer(
+                h,
+                attention_mask=attn_mask_4d.to(layer_device),
+                position_embeddings=self._to_device(
+                    position_embeddings, layer_device,
+                ),
+                past_key_values=cache,
+                use_cache=True,
+            )
             h_layer = layer_output[0] if isinstance(layer_output, tuple) else layer_output
 
             # DeepStack injection
             if deepstack_features and l < len(deepstack_features):
                 ds_feat = deepstack_features[l].to(h_layer.device, h_layer.dtype)
                 if visual_pos_mask is not None:
+                    visual_mask = visual_pos_mask.to(h_layer.device)
                     for b in range(h_layer.shape[0]):
-                        positions = visual_pos_mask[b].nonzero(as_tuple=True)[0]
+                        positions = visual_mask[b].nonzero(as_tuple=True)[0]
                         n = len(positions)
                         if n > 0 and n <= ds_feat.shape[0]:
                             h_layer[b, positions] = h_layer[b, positions] + ds_feat[:n]
 
-            z_down = sm.extract_observation(h_layer, attention_mask)
+            z_down = sm.extract_observation(
+                h_layer, attention_mask.to(layer_device),
+            )
             m_new, p_new, e, _, _ = sm.correct(m_hat, p_hat, z_down)
             h = sm.inject(h_layer, m_new)
             new_memory.append(m_new)
@@ -1197,7 +1328,6 @@ class JAMELCompactWrapper(nn.Module):
             cache:              DynamicCache populated during the prompt pass
         """
         B = h.shape[0]
-        device = h.device
         llm_dtype = h.dtype
         prompt_len = h.shape[1]
         generated = []
@@ -1206,14 +1336,18 @@ class JAMELCompactWrapper(nn.Module):
         lm_head = self._get_lm_head()
 
         # ── Step 1: First token from memory-injected h ──
-        logits = lm_head(self._apply_final_norm(h[:, -1:, :]))
+        normalized_h = self._apply_final_norm(h[:, -1:, :])
+        logits = lm_head(normalized_h.to(self._module_device(lm_head)))
         next_token = self._sample_token(logits[:, -1, :], temperature, top_p)
         generated.append(next_token)
 
         # ── Step 2: Generate remaining tokens using the cache ──
         for _ in range(max_new_tokens - 1):
             # Embed the new token
-            new_embed = embed_layer(next_token.unsqueeze(-1))  # [B, 1, d]
+            embedding_device = self._module_device(embed_layer)
+            new_embed = embed_layer(
+                next_token.to(embedding_device).unsqueeze(-1)
+            )  # [B, 1, d]
 
             # Position embeddings for the new position. The base multimodal
             # backbone reuses its prompt rope deltas for incremental M-RoPE.
@@ -1228,17 +1362,22 @@ class JAMELCompactWrapper(nn.Module):
             # during generation — memory was already updated in the prompt pass)
             h_new = new_embed
             for layer in decoder_layers:
+                layer_device = self._module_device(layer)
+                h_new = h_new.to(layer_device)
                 layer_output = layer(
                     h_new,
                     attention_mask=None,  # single token, cache handles history
-                    position_embeddings=new_pos_emb,
+                    position_embeddings=self._to_device(
+                        new_pos_emb, layer_device,
+                    ),
                     past_key_values=cache,
                     use_cache=True,
                 )
                 h_new = layer_output[0] if isinstance(layer_output, tuple) else layer_output
 
             # Get logits and sample
-            logits = lm_head(self._apply_final_norm(h_new[:, -1:, :]))
+            normalized_h = self._apply_final_norm(h_new[:, -1:, :])
+            logits = lm_head(normalized_h.to(self._module_device(lm_head)))
             next_token = self._sample_token(logits[:, -1, :], temperature, top_p)
             generated.append(next_token)
 

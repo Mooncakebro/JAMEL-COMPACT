@@ -335,7 +335,7 @@ def train_one_epoch(
             memory_states, variance_states = raw_model.init_memory(1, device)
             e_prev_list = None  # None for first step in chunk
 
-            total_chunk_loss = torch.tensor(0.0, device=device, requires_grad=False)
+            total_chunk_loss = None
             last_loss_dict = {}
             all_loss_dicts = []
 
@@ -373,7 +373,12 @@ def train_one_epoch(
 
                 # Accumulate loss across steps in the chunk
                 # Weight each step equally
-                total_chunk_loss = total_chunk_loss + loss / chunk_size
+                step_loss = loss / chunk_size
+                total_chunk_loss = (
+                    step_loss
+                    if total_chunk_loss is None
+                    else total_chunk_loss + step_loss
+                )
                 last_loss_dict = loss_dict
                 all_loss_dicts.append(loss_dict)
 
@@ -770,6 +775,10 @@ def main():
                         help="Comma-separated GPU IDs to use (e.g. '0,1,2'). "
                              "Empty = all available GPUs. "
                              "For single-GPU training, specify one ID (e.g. '0').")
+    parser.add_argument(
+        "--model-parallel", action="store_true",
+        help="Shard a frozen base model across all visible GPUs.",
+    )
     parser.add_argument("--chunk-size", type=int, default=1,
                         help="Session-chunked training: number of consecutive "
                              "steps per chunk. 1 = single-step (original). "
@@ -796,10 +805,18 @@ def main():
     set_seed(args.seed)
 
     num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
-    use_data_parallel = num_gpus > 1
+    if args.model_parallel and num_gpus < 2:
+        parser.error("--model-parallel requires at least two visible GPUs")
+    if args.model_parallel and not args.freeze_base:
+        parser.error("--model-parallel currently requires --freeze-base")
+    use_data_parallel = num_gpus > 1 and not args.model_parallel
 
-    print(f"[train] device={device}, GPUs visible={num_gpus}, "
-          f"DataParallel={'YES' if use_data_parallel else 'NO'}")
+    parallel_mode = (
+        "MODEL_PARALLEL" if args.model_parallel
+        else "DATA_PARALLEL" if use_data_parallel
+        else "SINGLE_DEVICE"
+    )
+    print(f"[train] device={device}, GPUs visible={num_gpus}, mode={parallel_mode}")
     if torch.cuda.is_available():
         for i in range(num_gpus):
             print(f"  GPU {i}: {torch.cuda.get_device_name(i)} "
@@ -827,6 +844,7 @@ def main():
         lambda_obs=args.lambda_obs,
         lambda_nll=args.lambda_nll,
         freeze_base=args.freeze_base,
+        model_parallel=args.model_parallel,
         gradient_checkpointing=not args.no_grad_checkpoint,
         bf16=args.bf16,
         seed=args.seed,
@@ -836,7 +854,11 @@ def main():
 
     # ── Build model ──
     print(f"[train] Loading base model: {config.base_model_name}")
-    model = JAMELCompactWrapper(config).to(device)
+    model = JAMELCompactWrapper(config)
+    if config.model_parallel:
+        device = model.input_device
+    else:
+        model = model.to(device)
 
     # Wrap with DataParallel for multi-GPU training
     if use_data_parallel:
@@ -856,6 +878,12 @@ def main():
     print(f"[train] Loading data: {args.train_file}")
     print(f"[train] Chunk size: {config.chunk_size} "
           f"({'session-chunked' if use_chunking else 'single-step'})")
+    if use_chunking and use_data_parallel and config.per_device_batch_size == 1:
+        print(
+            "[train] WARNING: DataParallel cannot split chunked B=1 inputs; "
+            "only the first GPU will compute. Use --model-parallel for large "
+            "frozen models."
+        )
 
     train_dataset = CompactDataset(
         parquet_files=args.train_file,

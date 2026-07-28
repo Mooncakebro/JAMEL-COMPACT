@@ -181,7 +181,7 @@ VAL_STEPS=200 \
 bash shell/run_compact_train.sh
 ```
 
-### 2c. Train with Qwen3-VL-8B (single GPU)
+### 2c. Train with Qwen3-VL-8B (model-sharded across GPUs)
 
 ```bash
 TRAIN_FILE=data/compact_sft_data_all/compact_train.parquet \
@@ -189,7 +189,9 @@ VAL_FILE=data/compact_sft_data_all/compact_val.parquet \
 BASE_MODEL=Qwen/Qwen3-VL-8B-Instruct \
 OUTPUT_DIR=outputs/compact_ckpt_8b \
 TB_LOG_DIR=outputs/compact_tb_8b \
-GPU_IDS=0 \
+GPU_IDS=5,6,7 \
+MODEL_PARALLEL=1 \
+FREEZE_BASE=1 \
 MEM_DIM=512 \
 NUM_MEM=16 \
 MAX_LENGTH=8192 \
@@ -197,6 +199,7 @@ MAX_EPOCHS=3 \
 BATCH_SIZE=1 \
 GRAD_ACCUM=32 \
 LR=1e-5 \
+MEMORY_LR=5e-6 \
 CHUNK_SIZE=8 \
 LOG_STEPS=10 \
 SAVE_STEPS=500 \
@@ -215,28 +218,6 @@ TB_LOG_DIR=outputs/compact_tb_cw \
 GPU_IDS=6,7 \
 CHUNK_SIZE=8 \
 COVERAGE_WEIGHT_ETA=1.0 \
-bash shell/run_compact_train.sh
-```
-
-### 2b. Train with Qwen3-VL-8B (single GPU)
-
-```bash
-TRAIN_FILE=data/compact_sft_data_all/compact_train.parquet \
-VAL_FILE=data/compact_sft_data_all/compact_val.parquet \
-BASE_MODEL=Qwen/Qwen3-VL-8B-Instruct \
-OUTPUT_DIR=outputs/compact_ckpt_8b \
-TB_LOG_DIR=outputs/compact_tb_8b \
-GPU_IDS=0 \
-MEM_DIM=512 \
-NUM_MEM=16 \
-MAX_LENGTH=8192 \
-MAX_EPOCHS=3 \
-BATCH_SIZE=1 \
-GRAD_ACCUM=32 \
-LR=1e-5 \
-LOG_STEPS=10 \
-SAVE_STEPS=500 \
-VAL_STEPS=200 \
 bash shell/run_compact_train.sh
 ```
 
@@ -543,6 +524,27 @@ GPU_IDS=6,7 \
 MAX_EPOCHS=20 \
 bash shell/run_baseline_train.sh
 
+# ── 2b. Train baseline (pure Qwen3-VL SFT, no side memory) ──
+  TRAIN_FILE=data/compact_train.parquet \
+  VAL_FILE=data/compact_val.parquet \
+  BASE_MODEL=Qwen/Qwen3-VL-8B-Instruct \
+  OUTPUT_DIR=outputs/compact_8b_sharded \
+  TB_LOG_DIR=outputs/compact_8b_sharded_tb \
+  GPU_IDS=5,6,7 \
+  MODEL_PARALLEL=1 \
+  FREEZE_BASE=0 \
+  MEMORY_LR=5e-6 \
+  MAX_LENGTH=4096 \
+  CHUNK_SIZE=8 \
+  BATCH_SIZE=1 \
+  GRAD_ACCUM=16 \
+  LAMBDA_OBS=0.01 \
+  LAMBDA_NLL=0.01 \
+  VAL_STEPS=100 \
+  SAVE_STEPS=100 \
+  bash shell/run_compact_train.sh
+
+
 # ── 3a. Eval compact model v2 ──
 CHECKPOINT=outputs/compact_ckpt_v2/final \
 APPS_MODE=test10 \
@@ -593,6 +595,7 @@ python scripts/snapshots_to_mp4.py outputs/compact_eval/weibo/session0/ \
 | `LR` | `2e-5` | Base-model learning rate; used only when `FREEZE_BASE=0` |
 | `MEMORY_LR` | `5e-6` | Learning rate for side-memory and action modules |
 | `FREEZE_BASE` | `1` | `1` trains only COMPACT modules; `0` also fine-tunes the base model |
+| `MODEL_PARALLEL` | `0` | `1` shards a frozen base model across all visible GPUs; recommended for 8B |
 | `LOG_STEPS` | `10` | TensorBoard logging frequency |
 | `SAVE_STEPS` | `500` | Checkpoint save frequency |
 | `VAL_STEPS` | `200` | Validation frequency |

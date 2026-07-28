@@ -18,6 +18,7 @@ class CompactConfig:
     num_mem_tokens: int = 16           # N_m memory tokens per layer
     num_heads: int = 8                # attention heads in side memory
     freeze_base: bool = True          # freeze pretrained LLM weights by default
+    model_parallel: bool = False      # shard frozen base layers across visible GPUs
     num_act_tokens: int = 1           # action tokens in input sequence
 
     # ── Model version (for checkpoint compatibility) ──

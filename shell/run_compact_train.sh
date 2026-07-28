@@ -14,6 +14,7 @@
 #   GPU_IDS=0          # single GPU 0
 #   GPU_IDS=0,1,2      # GPUs 0, 1, 2
 #   GPU_IDS=""          # all available GPUs (default)
+#   MODEL_PARALLEL=1   # shard a frozen 8B model across selected GPUs
 #
 # TensorBoard:
 #   tensorboard --logdir outputs/compact_tb
@@ -46,6 +47,7 @@ GPU_IDS=${GPU_IDS:-}              # e.g. "0" or "0,1,2" or "" (all)
 CHUNK_SIZE=${CHUNK_SIZE:-8}          # 1 = single-step, >1 = session-chunked (v2 default: 8)
 COVERAGE_WEIGHT_ETA=${COVERAGE_WEIGHT_ETA:-0.0}  # F7: 0=off, >0 upweights high-novelty samples
 FREEZE_BASE=${FREEZE_BASE:-1}       # 1 = memory-only training; 0 = also fine-tune base
+MODEL_PARALLEL=${MODEL_PARALLEL:-0} # 1 = shard frozen base across visible GPUs
 
 if [[ ! -f "$TRAIN_FILE" ]]; then
     echo "ERROR: TRAIN_FILE not found: $TRAIN_FILE" >&2
@@ -74,6 +76,11 @@ else
     BASE_TRAINING_ARG="--train-base"
 fi
 
+MODEL_PARALLEL_ARG=""
+if [[ "$MODEL_PARALLEL" == "1" ]]; then
+    MODEL_PARALLEL_ARG="--model-parallel"
+fi
+
 echo "=== JAMEL-COMPACT Training ==="
 echo "  Base model:  $BASE_MODEL"
 echo "  Train file:   $TRAIN_FILE"
@@ -90,6 +97,7 @@ echo "  Chunk size:   $CHUNK_SIZE"
 echo "  Base LR:      $LR"
 echo "  Memory LR:    $MEMORY_LR"
 echo "  Freeze base:  $FREEZE_BASE"
+echo "  Model shard:  $MODEL_PARALLEL"
 echo "  Val every:    $VAL_STEPS optimizer steps"
 echo "  Lambda obs:   $LAMBDA_OBS"
 echo "  Lambda NLL:   $LAMBDA_NLL"
@@ -116,5 +124,6 @@ exec python -m jamel_compact.train \
     --chunk-size "$CHUNK_SIZE" \
     --coverage-weight-eta "$COVERAGE_WEIGHT_ETA" \
     $BASE_TRAINING_ARG \
+    $MODEL_PARALLEL_ARG \
     $GPU_ARG \
     "$@"

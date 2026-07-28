@@ -108,7 +108,9 @@ def compute_compact_loss(
     loss_mem = torch.tensor(0.0, device=device, dtype=dtype)
     L = len(memory_states)
     for M in memory_states:
-        loss_mem = loss_mem + M.float().pow(2).sum().to(dtype)
+        loss_mem = loss_mem + M.float().pow(2).sum().to(
+            device=device, dtype=dtype,
+        )
     loss_mem = loss_mem / L
 
     # ── Total ──
