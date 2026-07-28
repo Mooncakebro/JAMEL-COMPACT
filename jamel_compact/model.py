@@ -459,12 +459,20 @@ class JAMELCompactWrapper(nn.Module):
 
     @staticmethod
     def _module_device(module: nn.Module) -> torch.device:
+        for candidate in module.modules():
+            for attribute_name in ("weight", "bias"):
+                tensor = getattr(candidate, attribute_name, None)
+                if (
+                    isinstance(tensor, torch.Tensor)
+                    and tensor.device.type != "meta"
+                ):
+                    return tensor.device
+            for buffer in candidate.buffers(recurse=False):
+                if buffer.device.type != "meta":
+                    return buffer.device
         for parameter in module.parameters():
             if parameter.device.type != "meta":
                 return parameter.device
-        for buffer in module.buffers():
-            if buffer.device.type != "meta":
-                return buffer.device
         return torch.device("cpu")
 
     @staticmethod

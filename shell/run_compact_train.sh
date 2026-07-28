@@ -47,7 +47,7 @@ GPU_IDS=${GPU_IDS:-}              # e.g. "0" or "0,1,2" or "" (all)
 CHUNK_SIZE=${CHUNK_SIZE:-8}          # 1 = single-step, >1 = session-chunked (v2 default: 8)
 COVERAGE_WEIGHT_ETA=${COVERAGE_WEIGHT_ETA:-0.0}  # F7: 0=off, >0 upweights high-novelty samples
 FREEZE_BASE=${FREEZE_BASE:-1}       # 1 = memory-only training; 0 = also fine-tune base
-MODEL_PARALLEL=${MODEL_PARALLEL:-0} # 1 = shard frozen base across visible GPUs
+MODEL_PARALLEL=${MODEL_PARALLEL:-auto} # auto, 1 = model sharding, 0 = DataParallel
 
 if [[ ! -f "$TRAIN_FILE" ]]; then
     echo "ERROR: TRAIN_FILE not found: $TRAIN_FILE" >&2
@@ -79,6 +79,8 @@ fi
 MODEL_PARALLEL_ARG=""
 if [[ "$MODEL_PARALLEL" == "1" ]]; then
     MODEL_PARALLEL_ARG="--model-parallel"
+elif [[ "$MODEL_PARALLEL" == "0" ]]; then
+    MODEL_PARALLEL_ARG="--data-parallel"
 fi
 
 echo "=== JAMEL-COMPACT Training ==="

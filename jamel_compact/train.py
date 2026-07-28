@@ -775,10 +775,16 @@ def main():
                         help="Comma-separated GPU IDs to use (e.g. '0,1,2'). "
                              "Empty = all available GPUs. "
                              "For single-GPU training, specify one ID (e.g. '0').")
-    parser.add_argument(
-        "--model-parallel", action="store_true",
+    parallel_group = parser.add_mutually_exclusive_group()
+    parallel_group.add_argument(
+        "--model-parallel", dest="model_parallel", action="store_true",
         help="Shard a frozen base model across all visible GPUs.",
     )
+    parallel_group.add_argument(
+        "--data-parallel", dest="model_parallel", action="store_false",
+        help="Force legacy batch-splitting DataParallel.",
+    )
+    parser.set_defaults(model_parallel=None)
     parser.add_argument("--chunk-size", type=int, default=1,
                         help="Session-chunked training: number of consecutive "
                              "steps per chunk. 1 = single-step (original). "
@@ -805,6 +811,18 @@ def main():
     set_seed(args.seed)
 
     num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    if args.model_parallel is None:
+        args.model_parallel = bool(
+            num_gpus > 1
+            and args.freeze_base
+            and args.chunk_size > 1
+            and args.batch_size == 1
+        )
+        if args.model_parallel:
+            print(
+                "[train] Auto-enabled model parallelism for frozen, "
+                "chunked B=1 multi-GPU training."
+            )
     if args.model_parallel and num_gpus < 2:
         parser.error("--model-parallel requires at least two visible GPUs")
     if args.model_parallel and not args.freeze_base:

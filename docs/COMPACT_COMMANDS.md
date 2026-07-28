@@ -595,7 +595,7 @@ python scripts/snapshots_to_mp4.py outputs/compact_eval/weibo/session0/ \
 | `LR` | `2e-5` | Base-model learning rate; used only when `FREEZE_BASE=0` |
 | `MEMORY_LR` | `5e-6` | Learning rate for side-memory and action modules |
 | `FREEZE_BASE` | `1` | `1` trains only COMPACT modules; `0` also fine-tunes the base model |
-| `MODEL_PARALLEL` | `0` | `1` shards a frozen base model across all visible GPUs; recommended for 8B |
+| `MODEL_PARALLEL` | `auto` | Auto-shards frozen chunked B=1 runs; `1` forces sharding and `0` forces DataParallel |
 | `LOG_STEPS` | `10` | TensorBoard logging frequency |
 | `SAVE_STEPS` | `500` | Checkpoint save frequency |
 | `VAL_STEPS` | `200` | Validation frequency |
