@@ -78,6 +78,11 @@ fi
 
 MODEL_PARALLEL_ARG=""
 if [[ "$MODEL_PARALLEL" == "1" ]]; then
+    if [[ "$FREEZE_BASE" != "1" ]]; then
+        echo "ERROR: MODEL_PARALLEL=1 uses frozen-base device-map sharding." >&2
+        echo "Set FREEZE_BASE=1, or use FSDP/ZeRO-3 for full-base multi-GPU training." >&2
+        exit 2
+    fi
     MODEL_PARALLEL_ARG="--model-parallel"
 elif [[ "$MODEL_PARALLEL" == "0" ]]; then
     MODEL_PARALLEL_ARG="--data-parallel"

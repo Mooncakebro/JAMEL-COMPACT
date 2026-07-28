@@ -826,7 +826,12 @@ def main():
     if args.model_parallel and num_gpus < 2:
         parser.error("--model-parallel requires at least two visible GPUs")
     if args.model_parallel and not args.freeze_base:
-        parser.error("--model-parallel currently requires --freeze-base")
+        parser.error(
+            "--model-parallel uses Transformers/Accelerate device-map "
+            "sharding and only supports a frozen base model. Set "
+            "FREEZE_BASE=1, or use an FSDP/ZeRO-3 training path to fine-tune "
+            "the sharded base model."
+        )
     use_data_parallel = num_gpus > 1 and not args.model_parallel
 
     parallel_mode = (
