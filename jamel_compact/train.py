@@ -953,14 +953,14 @@ def main():
             batch_size=chunk_batch_size,
             shuffle=True,
             collate_fn=lambda b: session_collate_fn(b, pad_token_id),
-            num_workers=2,
+            num_workers=8,
         )
         val_loader = DataLoader(
             val_dataset,
             batch_size=chunk_batch_size,
             shuffle=False,
             collate_fn=lambda b: session_collate_fn(b, pad_token_id),
-            num_workers=2,
+            num_workers=8,
         )
     else:
         # Single-step mode (original)
@@ -973,14 +973,14 @@ def main():
             batch_size=effective_batch,
             shuffle=True,
             collate_fn=lambda b: collate_fn(b, pad_token_id),
-            num_workers=2,
+            num_workers=8,
         )
         val_loader = DataLoader(
             val_dataset,
             batch_size=effective_batch,
             shuffle=False,
             collate_fn=lambda b: collate_fn(b, pad_token_id),
-            num_workers=2,
+            num_workers=8,
         )
 
     # ── Optimizer ──
