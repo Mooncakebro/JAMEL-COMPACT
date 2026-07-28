@@ -742,7 +742,12 @@ def main():
     parser.add_argument("--num-mem-tokens", type=int, default=16)
     parser.add_argument("--max-length", type=int, default=8192)
     parser.add_argument("--max-epochs", type=int, default=3)
-    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument(
+        "--batch-size", type=int, default=1,
+        help="Per-device batch size in single-step mode. Recurrent chunked "
+             "training (--chunk-size > 1) always processes one chunk at a "
+             "time; use --grad-accum to increase its effective batch size.",
+    )
     parser.add_argument("--grad-accum", type=int, default=16)
     parser.add_argument("--lr", type=float, default=2e-5,
                         help="Base-model learning rate when --train-base is enabled.")
@@ -794,6 +799,14 @@ def main():
                         help="F7: Coverage-weighted SFT. 0 = off; >0 upweights "
                              "samples with high coverage delta (novelty).")
     args = parser.parse_args()
+
+    if args.chunk_size > 1 and args.batch_size != 1:
+        print(
+            f"[train] WARNING: --batch-size {args.batch_size} is incompatible "
+            "with recurrent session chunks; overriding it to 1. Increase "
+            "--grad-accum for a larger effective batch."
+        )
+        args.batch_size = 1
 
     # ── GPU selection ──
     # CUDA_VISIBLE_DEVICES was already set before torch import (see top of file).
@@ -931,9 +944,7 @@ def main():
                                              coverage_weight_eta=config.coverage_weight_eta)
         val_dataset = SessionChunkDataset(val_dataset, chunk_size=config.chunk_size,
                                            coverage_weight_eta=config.coverage_weight_eta)
-        # In chunked mode, each "batch" is one chunk (B=1, multiple steps)
-        # batch_size=1 because each chunk already contains chunk_size steps
-        chunk_batch_size = config.per_device_batch_size
+        chunk_batch_size = 1
         print(f"[train] Chunked mode: batch_size={chunk_batch_size} "
               f"× {config.chunk_size} steps/chunk")
         pad_token_id = raw_model.tokenizer.pad_token_id or 0

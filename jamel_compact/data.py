@@ -461,15 +461,22 @@ def session_collate_fn(batch, pad_token_id: int = 0) -> dict:
     Returns a dict where each value is a list of per-step tensors (for
     sequence-level processing in the training loop).
 
-    Note: When used with DataLoader(batch_size=1), the DataLoader wraps the
-    list-of-dicts from SessionChunkDataset.__getitem__ in another list,
-    so we may receive [[dict, dict, ...]]. We flatten one level if needed.
+    Note: Recurrent chunk training requires DataLoader(batch_size=1). The
+    DataLoader wraps the list-of-dicts from SessionChunkDataset.__getitem__
+    in another list, so we receive [[dict, dict, ...]].
     """
-    # DataLoader with batch_size=1 wraps the list in another list
-    if len(batch) == 1 and isinstance(batch[0], list):
+    if not batch:
+        return None
+
+    if isinstance(batch[0], dict):
+        chunk = batch
+    elif len(batch) == 1 and isinstance(batch[0], list):
         chunk = batch[0]
     else:
-        chunk = batch
+        raise ValueError(
+            "Session-chunked training requires DataLoader batch_size=1; "
+            "use gradient accumulation to increase the effective batch size."
+        )
 
     # F2: Filter out None samples (dropped during truncation)
     chunk = [item for item in chunk if item is not None]

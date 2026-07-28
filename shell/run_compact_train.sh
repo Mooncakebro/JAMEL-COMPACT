@@ -49,6 +49,12 @@ COVERAGE_WEIGHT_ETA=${COVERAGE_WEIGHT_ETA:-0.0}  # F7: 0=off, >0 upweights high-
 FREEZE_BASE=${FREEZE_BASE:-1}       # 1 = memory-only training; 0 = also fine-tune base
 MODEL_PARALLEL=${MODEL_PARALLEL:-auto} # auto, 1 = model sharding, 0 = DataParallel
 
+if [[ "$CHUNK_SIZE" =~ ^[0-9]+$ ]] && (( CHUNK_SIZE > 1 )) && [[ "$BATCH_SIZE" != "1" ]]; then
+    echo "WARNING: CHUNK_SIZE=$CHUNK_SIZE uses recurrent training and requires BATCH_SIZE=1." >&2
+    echo "Overriding BATCH_SIZE=$BATCH_SIZE to 1; increase GRAD_ACCUM for a larger effective batch." >&2
+    BATCH_SIZE=1
+fi
+
 if [[ ! -f "$TRAIN_FILE" ]]; then
     echo "ERROR: TRAIN_FILE not found: $TRAIN_FILE" >&2
     exit 2

@@ -590,8 +590,8 @@ python scripts/snapshots_to_mp4.py outputs/compact_eval/weibo/session0/ \
 | `NUM_MEM` | `16` | Memory tokens per layer $N_m$ |
 | `MAX_LENGTH` | `8192` | Max token length |
 | `MAX_EPOCHS` | `3` | Number of training epochs |
-| `BATCH_SIZE` | `1` | Per-device batch size |
-| `GRAD_ACCUM` | `16` | Gradient accumulation steps |
+| `BATCH_SIZE` | `1` | Per-device batch size in single-step mode; fixed to `1` when `CHUNK_SIZE>1` because each batch is one recurrent session chunk |
+| `GRAD_ACCUM` | `16` | Gradient accumulation steps; use this to increase effective batch size in chunked mode |
 | `LR` | `2e-5` | Base-model learning rate; used only when `FREEZE_BASE=0` |
 | `MEMORY_LR` | `5e-6` | Learning rate for side-memory and action modules |
 | `FREEZE_BASE` | `1` | `1` trains only COMPACT modules; `0` also fine-tunes the base model |
