@@ -118,7 +118,7 @@ class SideMemoryModule(nn.Module):
         # The gate must be nonzero: zeroing both factors makes all injection
         # gradients zero and permanently disconnects memory from action loss.
         gate_init = config.inject_gate_init if config is not None else 0.1
-        self.inject_gate = nn.Parameter(torch.tensor(float(gate_init)))
+        self.inject_gate = nn.Parameter(torch.tensor([float(gate_init)]))
 
         # ── Memory Predict: FiLM-GRU (in d_mem) ──
         self.gru = FiLMGRUCell(mem_dim)
@@ -1579,6 +1579,9 @@ class JAMELCompactWrapper(nn.Module):
         side_mem_dir = load_path / "side_memory"
         if side_mem_dir.exists():
             sm_state = torch.load(side_mem_dir / "side_memories.pt", map_location="cpu")
+            for key, value in list(sm_state.items()):
+                if key.endswith(".inject_gate") and value.ndim == 0:
+                    sm_state[key] = value.unsqueeze(0)
             incompatible = model.side_memories.load_state_dict(sm_state, strict=False)
             if incompatible.unexpected_keys:
                 print(f"[load] Ignored legacy side-memory keys: {incompatible.unexpected_keys}")
