@@ -29,6 +29,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
+from .gpu import configure_cuda_visibility
+
+configure_cuda_visibility()
+
 import numpy as np
 import pandas as pd
 import torch
@@ -117,8 +121,16 @@ class CompactAgent:
         image_resize: tuple = (640, 360),
     ):
         print(f"[agent] Loading JAMEL-COMPACT from {checkpoint} ...")
-        self.model = JAMELCompactWrapper.from_pretrained(checkpoint)
-        self.model = self.model.to(device)
+        use_model_parallel = device == "cuda" and torch.cuda.device_count() > 1
+        self.model = JAMELCompactWrapper.from_pretrained(
+            checkpoint,
+            model_parallel_override=use_model_parallel,
+        )
+        if self.model.model_parallel:
+            self.device = self.model.input_device
+        else:
+            self.model = self.model.to(device)
+            self.device = torch.device(device)
         self.model.eval()
 
         # ── Override training-only settings that waste memory at inference ──
@@ -137,7 +149,6 @@ class CompactAgent:
         gc.collect()
         torch.cuda.empty_cache()
 
-        self.device = torch.device(device)
         self.tokenizer = self.model.tokenizer
         self.processor = self.model.processor
 
@@ -668,11 +679,6 @@ def run_eval(
 
 
 def main():
-    # ── set CUDA_VISIBLE_DEVICES before importing torch ──
-    _gpu_ids = os.environ.get("GPU_IDS", "")
-    if _gpu_ids:
-        os.environ["CUDA_VISIBLE_DEVICES"] = _gpu_ids
-
     parser = argparse.ArgumentParser(description="JAMEL-COMPACT Evaluation")
     parser.add_argument("--checkpoint", required=True, help="Model checkpoint directory")
     parser.add_argument("--apps", default="", help="Comma-separated app list (overrides --apps-mode)")
@@ -692,10 +698,6 @@ def main():
                         help="Freeze memory at initial state (ablation: tests "
                              "whether memory writes improve generation)")
     args = parser.parse_args()
-
-    # Set GPU visibility
-    if args.gpu_ids:
-        os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_ids
 
     # Resolve apps
     if args.apps:
@@ -724,7 +726,11 @@ def main():
     print(f"[eval] Checkpoint: {args.checkpoint}")
     print(f"[eval] Max steps: {args.max_steps}")
     print(f"[eval] Sessions: {args.num_sessions}")
-    print(f"[eval] GPU IDs: {args.gpu_ids or os.environ.get('CUDA_VISIBLE_DEVICES', 'not set')}")
+    visible_gpu_ids = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    print(f"[eval] Physical GPU IDs visible: {visible_gpu_ids or 'all'}")
+    if torch.cuda.is_available():
+        print(f"[eval] Logical CUDA devices: {torch.cuda.device_count()} "
+              f"(cuda:0 maps to physical GPU {(visible_gpu_ids.split(',')[0] if visible_gpu_ids else '0')})")
 
     run_eval(
         checkpoint=args.checkpoint,

@@ -1462,7 +1462,8 @@ class JAMELCompactWrapper(nn.Module):
 
     @classmethod
     def from_pretrained(cls, load_directory: str | Path,
-                        config_override: Optional[CompactConfig] = None) -> "JAMELCompactWrapper":
+                        config_override: Optional[CompactConfig] = None,
+                        model_parallel_override: Optional[bool] = None) -> "JAMELCompactWrapper":
         """Load a saved JAMEL-COMPACT model."""
         load_path = Path(load_directory)
 
@@ -1479,6 +1480,9 @@ class JAMELCompactWrapper(nn.Module):
             for k, v in config_override.to_dict().items():
                 if hasattr(config, k):
                     setattr(config, k, v)
+
+        if model_parallel_override is not None:
+            config.model_parallel = model_parallel_override
 
         # Check for base model reference (frozen) or saved base model
         base_ref_path = load_path / "base_model_ref.txt"

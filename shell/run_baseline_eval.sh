@@ -57,6 +57,7 @@ echo ""
 # Set CUDA_VISIBLE_DEVICES in the shell BEFORE Python launches.
 if [[ -n "$GPU_IDS" ]]; then
     export CUDA_VISIBLE_DEVICES="$GPU_IDS"
+    echo "  CUDA mapping: Python cuda:0 -> physical GPU ${GPU_IDS%%,*}"
 fi
 
 python -m jamel_compact.baseline_eval \

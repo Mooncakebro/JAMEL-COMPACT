@@ -367,6 +367,10 @@ TOP_P=0.9 \
 bash shell/run_compact_eval.sh
 ```
 
+Set `GPU_IDS` only once. Inside Python, `cuda:0` maps to the first physical
+GPU in that list; for example, `GPU_IDS=1` means Python `cuda:0` is physical
+GPU 1. If a shell command assigns `GPU_IDS` twice, the last assignment wins.
+
 ### 3a-bis. Evaluate with frozen memory (F5 ablation: --freeze-memory-init)
 
 ```bash
@@ -616,7 +620,7 @@ python scripts/snapshots_to_mp4.py outputs/compact_eval/weibo/session0/ \
 | `DEVICE` | `cuda` | Device for inference |
 | `TEMPERATURE` | `0.8` | Sampling temperature |
 | `TOP_P` | `0.9` | Top-p sampling |
-| `GPU_IDS` | (empty = all) | GPU ID(s) for eval (e.g. `0` or `0,1`) |
+| `GPU_IDS` | (empty = all) | GPU ID(s) for eval (e.g. `0` or `0,1`); the selected IDs are applied before PyTorch loads |
 | `FREEZE_MEMORY_INIT` | `0` | v2 F5 ablation: `1` = never write new memory back to session state (tests if memory influences outputs) |
 
 ### Baseline Training (`run_baseline_train.sh`)
