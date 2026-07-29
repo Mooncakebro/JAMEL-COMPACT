@@ -34,12 +34,13 @@ from PIL import Image
 # prepare_compact_dataset.  Import lazily to allow data prep without torch.
 try:
     import torch
-    from torch.utils.data import Dataset
+    from torch.utils.data import Dataset, Sampler
     _TORCH_AVAILABLE = True
 except ImportError:
     _TORCH_AVAILABLE = False
     torch = None
     Dataset = object  # fallback base class
+    Sampler = object
 
 
 def _decode_png(image_bytes: bytes | None) -> Image.Image | None:
@@ -455,8 +456,8 @@ def session_collate_fn(batch, pad_token_id: int = 0) -> dict:
     """Collate a chunk of consecutive steps from one session.
 
     Each step in the chunk is a dict from CompactDataset.__getitem__.
-    We pad each step's input_ids/attention_mask/labels to the same length
-    (within the chunk), and concatenate pixel_values across steps.
+    Steps are processed sequentially with batch size one, so each step keeps
+    its own token length instead of being padded to the longest step.
 
     Returns a dict where each value is a list of per-step tensors (for
     sequence-level processing in the training loop).
@@ -483,9 +484,6 @@ def session_collate_fn(batch, pad_token_id: int = 0) -> dict:
     if not chunk:
         return None
 
-    max_len = max(item["input_ids"].shape[0] for item in chunk)
-    max_action_len = max(item["action_input_ids"].shape[0] for item in chunk)
-
     input_ids_list = []
     attention_masks_list = []
     observation_masks_list = []
@@ -499,40 +497,13 @@ def session_collate_fn(batch, pad_token_id: int = 0) -> dict:
     step_valids = []
 
     for item in chunk:
-        seq_len = item["input_ids"].shape[0]
-        pad_len = max_len - seq_len
-
-        input_ids_list.append(torch.cat([
-            item["input_ids"],
-            torch.full((pad_len,), pad_token_id, dtype=torch.long),
-        ]))
-        attention_masks_list.append(torch.cat([
-            item["attention_mask"],
-            torch.zeros(pad_len, dtype=torch.long),
-        ]))
-        observation_masks_list.append(torch.cat([
-            item["observation_mask"],
-            torch.zeros(pad_len, dtype=torch.long),
-        ]))
-        mm_ids = item.get("mm_token_type_ids")
-        if mm_ids is not None:
-            mm_ids = torch.cat([mm_ids, torch.zeros(pad_len, dtype=torch.long)])
-        mm_token_type_ids_list.append(mm_ids)
-        labels_list.append(torch.cat([
-            item["labels"],
-            torch.full((pad_len,), -100, dtype=torch.long),
-        ]))
-
-        act_len = item["action_input_ids"].shape[0]
-        act_pad = max_action_len - act_len
-        action_inputs_list.append(torch.cat([
-            item["action_input_ids"],
-            torch.full((act_pad,), pad_token_id, dtype=torch.long),
-        ]))
-        action_attention_masks_list.append(torch.cat([
-            item["action_attention_mask"],
-            torch.zeros(act_pad, dtype=torch.long),
-        ]))
+        input_ids_list.append(item["input_ids"])
+        attention_masks_list.append(item["attention_mask"])
+        observation_masks_list.append(item["observation_mask"])
+        mm_token_type_ids_list.append(item.get("mm_token_type_ids"))
+        labels_list.append(item["labels"])
+        action_inputs_list.append(item["action_input_ids"])
+        action_attention_masks_list.append(item["action_attention_mask"])
 
         pv = item.get("pixel_values")
         pixel_values_list.append(pv)
@@ -592,9 +563,11 @@ class SessionChunkDataset(Dataset):
         action_key: str = "action",
         coverage_weight_eta: float = 0.0,
         pad_to_chunk_size: bool = False,
+        pad_dropped_steps: bool = False,
     ):
         self.chunk_size = chunk_size
         self.pad_to_chunk_size = pad_to_chunk_size
+        self.pad_dropped_steps = pad_dropped_steps
         self.prompt_key = prompt_key
         self.response_key = response_key
         self.image_key = image_key
@@ -693,19 +666,87 @@ class SessionChunkDataset(Dataset):
                 item["_chunk_step_valid"] = True
                 items.append(item)
 
+        target_length = None
         if self.pad_to_chunk_size:
+            target_length = self.chunk_size
+        elif self.pad_dropped_steps:
+            target_length = len(chunk_indices)
+
+        if target_length is not None:
             if not items:
                 raise RuntimeError(
                     "Every sample in a distributed session chunk was dropped "
                     "during tokenization. Reduce max_length filtering or "
                     "remove the invalid session."
                 )
-            while len(items) < self.chunk_size:
+            while len(items) < target_length:
                 padded_item = dict(items[-1])
                 padded_item["_chunk_step_valid"] = False
                 items.append(padded_item)
 
         return items
+
+
+class SynchronizedChunkDistributedSampler(Sampler):
+    """Assign equal-length recurrent chunks to all ranks per iteration."""
+
+    def __init__(
+        self,
+        dataset: SessionChunkDataset,
+        num_replicas: int,
+        rank: int,
+        shuffle: bool = True,
+        seed: int = 0,
+    ):
+        self.dataset = dataset
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self.shuffle = shuffle
+        self.seed = seed
+        self.epoch = 0
+
+    def _groups(self) -> list[list[int]]:
+        buckets = {}
+        for index, chunk in enumerate(self.dataset._chunks):
+            buckets.setdefault(len(chunk), []).append(index)
+
+        rng = random.Random(self.seed + self.epoch)
+        groups = []
+        for chunk_length in sorted(buckets):
+            indices = list(buckets[chunk_length])
+            if self.shuffle:
+                rng.shuffle(indices)
+            group_count = (
+                len(indices) + self.num_replicas - 1
+            ) // self.num_replicas
+            padded_count = group_count * self.num_replicas
+            padded_indices = [
+                indices[position % len(indices)]
+                for position in range(padded_count)
+            ]
+            groups.extend([
+                padded_indices[start:start + self.num_replicas]
+                for start in range(0, padded_count, self.num_replicas)
+            ])
+
+        if self.shuffle:
+            rng.shuffle(groups)
+        return groups
+
+    def __iter__(self):
+        return iter(group[self.rank] for group in self._groups())
+
+    def __len__(self) -> int:
+        bucket_counts = {}
+        for chunk in self.dataset._chunks:
+            bucket_counts[len(chunk)] = bucket_counts.get(len(chunk), 0) + 1
+        return sum(
+            (count + self.num_replicas - 1) // self.num_replicas
+            for count in bucket_counts.values()
+        )
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
 
 
 def discover_parquet_files(input_path: str | list[str]) -> list[str]:

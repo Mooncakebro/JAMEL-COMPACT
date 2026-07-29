@@ -83,7 +83,13 @@ except ImportError:
 
 from .config import CompactConfig
 from .model import JAMELCompactWrapper
-from .data import CompactDataset, collate_fn, SessionChunkDataset, session_collate_fn
+from .data import (
+    CompactDataset,
+    SessionChunkDataset,
+    SynchronizedChunkDistributedSampler,
+    collate_fn,
+    session_collate_fn,
+)
 from .loss import compute_compact_loss
 
 # F8: Optional memory diagnostics
@@ -374,11 +380,12 @@ def _process_chunk_step(
     if loss.dim() > 0:
         loss = loss.mean()
 
-    def _to_scalar(v):
-        if isinstance(v, torch.Tensor):
-            return v.mean().item()
-        return float(v)
-    loss_dict = {k: _to_scalar(v) for k, v in outputs["loss_dict"].items()}
+    loss_dict = {
+        key: value.mean().detach()
+        if isinstance(value, torch.Tensor)
+        else float(value)
+        for key, value in outputs["loss_dict"].items()
+    }
 
     # Detach new memory before returning — values carry forward, not gradients
     new_mem = [m.detach() if detach and isinstance(m, torch.Tensor) else m
@@ -495,7 +502,10 @@ def train_one_epoch(
             # Average loss dict across steps
             loss_dict = {}
             for k in last_loss_dict:
-                loss_dict[k] = sum(d[k] for d in all_loss_dicts) / valid_step_count
+                averaged_value = (
+                    sum(d[k] for d in all_loss_dicts) / valid_step_count
+                )
+                loss_dict[k] = _scalar(averaged_value)
 
             accumulation_divisor = min(
                 accum_steps,
@@ -553,6 +563,9 @@ def train_one_epoch(
                 memory_states,
                 variance_states,
             )
+            loss_dict = {
+                key: _scalar(value) for key, value in loss_dict.items()
+            }
             accumulation_divisor = min(
                 accum_steps,
                 total_steps - (step // accum_steps) * accum_steps,
@@ -740,16 +753,21 @@ def validate(
                         chunk_nll += loss_dict.get("nll", 0.0)
 
                 # Average over steps in chunk
-                total_loss += chunk_loss / valid_step_count
-                total_action_loss += chunk_action / valid_step_count
-                total_mem_loss += chunk_mem / valid_step_count
-                total_obs_loss += chunk_obs / valid_step_count
-                total_nll_loss += chunk_nll / valid_step_count
+                chunk_loss = _scalar(chunk_loss / valid_step_count)
+                chunk_action = _scalar(chunk_action / valid_step_count)
+                chunk_mem = _scalar(chunk_mem / valid_step_count)
+                chunk_obs = _scalar(chunk_obs / valid_step_count)
+                chunk_nll = _scalar(chunk_nll / valid_step_count)
+                total_loss += chunk_loss
+                total_action_loss += chunk_action
+                total_mem_loss += chunk_mem
+                total_obs_loss += chunk_obs
+                total_nll_loss += chunk_nll
                 num_batches += 1
 
                 if show_progress:
                     pbar.set_postfix({
-                        "val_loss": f"{chunk_loss / valid_step_count:.4f}"
+                        "val_loss": f"{chunk_loss:.4f}"
                     })
 
             else:
@@ -802,6 +820,9 @@ def validate(
                     memory_states,
                     variance_states,
                 )
+                loss_dict = {
+                    key: _scalar(value) for key, value in loss_dict.items()
+                }
 
                 total_loss += loss_dict["total"]
                 total_action_loss += loss_dict["action"]
@@ -1148,24 +1169,24 @@ def main():
             train_dataset,
             chunk_size=config.chunk_size,
             coverage_weight_eta=config.coverage_weight_eta,
-            pad_to_chunk_size=args.fsdp,
+            pad_dropped_steps=args.fsdp,
         )
         val_dataset = SessionChunkDataset(
             val_dataset,
             chunk_size=config.chunk_size,
             coverage_weight_eta=config.coverage_weight_eta,
-            pad_to_chunk_size=args.fsdp,
+            pad_dropped_steps=args.fsdp,
         )
         chunk_batch_size = 1
         if args.fsdp:
-            train_sampler = DistributedSampler(
+            train_sampler = SynchronizedChunkDistributedSampler(
                 train_dataset,
                 num_replicas=world_size,
                 rank=_rank(),
                 shuffle=True,
                 seed=config.seed,
             )
-            val_sampler = DistributedSampler(
+            val_sampler = SynchronizedChunkDistributedSampler(
                 val_dataset,
                 num_replicas=world_size,
                 rank=_rank(),
@@ -1294,7 +1315,7 @@ def main():
     best_val_loss = float('inf')
 
     for epoch in range(config.max_epochs):
-        if isinstance(train_sampler, DistributedSampler):
+        if hasattr(train_sampler, "set_epoch"):
             train_sampler.set_epoch(epoch)
         if _is_main_process():
             print(f"\n{'='*60}")

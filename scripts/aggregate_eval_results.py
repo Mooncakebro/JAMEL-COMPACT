@@ -7,12 +7,33 @@ aggregate_eval_results.py
     python aggregate_eval_results.py --base_dir /home/songyuebing/JAMEL-DeltaState/outputs/ --prefix eval_hybrid8_test10
 """
 
-import os
-import json
 import argparse
-import numpy as np
-import matplotlib.pyplot as plt
+import json
+import math
+import os
 from collections import defaultdict
+
+import matplotlib
+import numpy as np
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+
+RESULT_FILENAMES = ("aggregate_results.json", "eval_summary.json")
+
+
+def _contains_result_file(folder_path):
+    return any(os.path.isfile(os.path.join(folder_path, name)) for name in RESULT_FILENAMES)
+
+
+def _find_result_folders(run_root):
+    result_folders = []
+    for current_root, dirnames, _ in os.walk(run_root):
+        dirnames.sort()
+        if _contains_result_file(current_root):
+            result_folders.append(current_root)
+    return result_folders
 
 
 def find_matching_folders(base_dir, prefix):
@@ -22,16 +43,23 @@ def find_matching_folders(base_dir, prefix):
     - 旧版 JAMEL: aggregate_results.json (per_app[].env_id / cumulative_reward)
     - 新版 JAMEL-COMPACT: eval_summary.json (results[].app / total_reward)
     """
+    base_dir = os.path.abspath(base_dir)
+    if not os.path.isdir(base_dir):
+        raise FileNotFoundError(f"结果根目录不存在或不是文件夹: {base_dir}")
+
+    if os.path.basename(os.path.normpath(base_dir)).startswith(prefix):
+        run_roots = [base_dir]
+    else:
+        run_roots = [
+            os.path.join(base_dir, item)
+            for item in sorted(os.listdir(base_dir))
+            if item.startswith(prefix) and os.path.isdir(os.path.join(base_dir, item))
+        ]
+
     matched = []
-    for item in sorted(os.listdir(base_dir)):
-        full_path = os.path.join(base_dir, item)
-        if os.path.isdir(full_path) and item.startswith(prefix):
-            # 检查是否包含任一格式的结果文件
-            for fname in ("aggregate_results.json", "eval_summary.json"):
-                if os.path.exists(os.path.join(full_path, fname)):
-                    matched.append(full_path)
-                    break
-    return matched
+    for run_root in run_roots:
+        matched.extend(_find_result_folders(run_root))
+    return sorted(set(matched))
 
 
 def load_aggregate_results(folder_path):
@@ -47,22 +75,35 @@ def load_aggregate_results(folder_path):
     old_path = os.path.join(folder_path, "aggregate_results.json")
     new_path = os.path.join(folder_path, "eval_summary.json")
 
-    if os.path.exists(old_path):
+    if os.path.isfile(old_path):
         with open(old_path, "r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
+        per_app = data.get("per_app")
+        if not isinstance(per_app, list):
+            raise ValueError(f"{old_path} 缺少列表字段 'per_app'")
+        return {"per_app": per_app, "source_path": old_path}
 
     # JAMEL-COMPACT 格式: 转换为统一结构
+    if not os.path.isfile(new_path):
+        expected = " 或 ".join(RESULT_FILENAMES)
+        raise FileNotFoundError(f"{folder_path} 中未找到 {expected}")
     with open(new_path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
+    results = data.get("results")
+    if not isinstance(results, list):
+        raise ValueError(f"{new_path} 缺少列表字段 'results'")
+
     per_app = []
-    for entry in data.get("results", []):
+    for entry in results:
+        if not isinstance(entry, dict):
+            continue
         per_app.append({
-            "env_id": entry.get("app", "unknown"),
-            "cumulative_reward": entry.get("total_reward", 0.0),
-            "session_idx": entry.get("session_idx", 0),
+            "env_id": entry.get("app"),
+            "cumulative_reward": entry.get("total_reward"),
+            "session_idx": entry.get("session_idx"),
         })
-    return {"per_app": per_app}
+    return {"per_app": per_app, "source_path": new_path}
 
 
 def collect_rewards_by_app(folders):
@@ -78,17 +119,49 @@ def collect_rewards_by_app(folders):
     app_rewards = defaultdict(list)
     app_order = []  # 保持app出现的顺序
 
+    skipped_entries = []
+    loaded_folders = 0
     for folder in folders:
-        data = load_aggregate_results(folder)
+        try:
+            data = load_aggregate_results(folder)
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            print(f"警告: 跳过无法读取的结果目录 {folder}: {exc}")
+            continue
+
+        loaded_folders += 1
         per_app = data.get("per_app", [])
-        for app_info in per_app:
-            env_id = app_info.get("env_id", "unknown")
-            cumulative_reward = app_info.get("cumulative_reward", 0.0)
+        for entry_idx, app_info in enumerate(per_app):
+            if not isinstance(app_info, dict):
+                skipped_entries.append(f"{data['source_path']} entry {entry_idx}: 不是对象")
+                continue
+
+            env_id = app_info.get("env_id")
+            cumulative_reward = app_info.get("cumulative_reward")
+            if not isinstance(env_id, str) or not env_id.strip():
+                skipped_entries.append(f"{data['source_path']} entry {entry_idx}: 缺少 app/env_id")
+                continue
+            try:
+                cumulative_reward = float(cumulative_reward)
+            except (TypeError, ValueError):
+                skipped_entries.append(
+                    f"{data['source_path']} entry {entry_idx}: reward 不是数字"
+                )
+                continue
+            if not math.isfinite(cumulative_reward):
+                skipped_entries.append(
+                    f"{data['source_path']} entry {entry_idx}: reward 不是有限值"
+                )
+                continue
+
+            env_id = env_id.strip()
             if env_id not in app_rewards:
                 app_order.append(env_id)
             app_rewards[env_id].append(cumulative_reward)
 
-    return app_rewards, app_order
+    for warning in skipped_entries:
+        print(f"警告: 跳过无效结果: {warning}")
+
+    return app_rewards, app_order, loaded_folders, len(skipped_entries)
 
 
 def compute_statistics(app_rewards, app_order):
@@ -98,7 +171,7 @@ def compute_statistics(app_rewards, app_order):
     """
     stats = {}
     for app_name in app_order:
-        rewards = np.array(app_rewards[app_name])
+        rewards = np.asarray(app_rewards[app_name], dtype=np.float64)
         stats[app_name] = {
             "mean": np.mean(rewards),
             "std": np.std(rewards, ddof=1) if len(rewards) > 1 else 0.0,
@@ -109,7 +182,7 @@ def compute_statistics(app_rewards, app_order):
     return stats
 
 
-def plot_results(stats, app_order, prefix, save_dir):
+def plot_results(stats, app_order, prefix, save_dir, num_result_folders, skipped_entries):
     """绘制结果图表"""
     n_apps = len(app_order)
     x = np.arange(n_apps)
@@ -170,8 +243,10 @@ def plot_results(stats, app_order, prefix, save_dir):
     ax.set_xticks(x)
     ax.set_xticklabels(app_order, rotation=30, ha="right", fontsize=10)
     ax.set_ylabel("Cumulative Reward", fontsize=13, fontweight="bold")
+    sample_counts = [stats[app]["n"] for app in app_order]
+    count_label = str(sample_counts[0]) if len(set(sample_counts)) == 1 else f"{min(sample_counts)}–{max(sample_counts)}"
     ax.set_title(
-        f"Per-App Reward Statistics (Prefix: {prefix}, {stats[app_order[0]]['n'] if app_order else 0} runs)",
+        f"Per-App Reward Statistics (Prefix: {prefix}, {count_label} samples/app)",
         fontsize=14, fontweight="bold",
     )
     ax.legend(loc="upper right", fontsize=11)
@@ -184,7 +259,7 @@ def plot_results(stats, app_order, prefix, save_dir):
 
     # 在图上添加整体统计信息文本框
     textstr = (
-        f"Overall (10 apps summed):\n"
+        f"Overall ({n_apps} apps summed):\n"
         f"  Max Reward:   {overall_max:.1f}\n"
         f"  Min Reward:   {overall_min:.1f}\n"
         f"  Mean Reward:  {overall_mean:.1f}\n"
@@ -211,8 +286,20 @@ def plot_results(stats, app_order, prefix, save_dir):
     json_save_path = os.path.join(save_dir, f"{prefix}_aggregate_stats.json")
     summary = {
         "prefix": prefix,
-        "num_runs": len(stats[app_order[0]]) if app_order else 0,
-        "per_app_stats": {app: {k: float(v) for k, v in s.items()} for app, s in stats.items()},
+        "num_runs": num_result_folders,
+        "num_result_folders": num_result_folders,
+        "num_samples": int(sum(s["n"] for s in stats.values())),
+        "skipped_entries": skipped_entries,
+        "per_app_stats": {
+            app: {
+                "mean": float(s["mean"]),
+                "std": float(s["std"]),
+                "min": float(s["min"]),
+                "max": float(s["max"]),
+                "n": int(s["n"]),
+            }
+            for app, s in stats.items()
+        },
         "overall": {
             "max_sum": float(overall_max),
             "min_sum": float(overall_min),
@@ -251,11 +338,14 @@ def main():
 
     # 1. 查找匹配的文件夹
     print(f"在 {base_dir} 中查找前缀为 '{prefix}' 的文件夹...")
-    matched_folders = find_matching_folders(base_dir, prefix)
+    try:
+        matched_folders = find_matching_folders(base_dir, prefix)
+    except FileNotFoundError as exc:
+        parser.error(str(exc))
 
     if not matched_folders:
         print(f"未找到任何以 '{prefix}' 开头的文件夹，请检查路径和前缀。")
-        return
+        raise SystemExit(1)
 
     print(f"找到 {len(matched_folders)} 个匹配文件夹:")
     for f in matched_folders:
@@ -263,11 +353,11 @@ def main():
 
     # 2. 收集每个app的reward
     print("\n正在收集各app的reward数据...")
-    app_rewards, app_order = collect_rewards_by_app(matched_folders)
+    app_rewards, app_order, loaded_folders, skipped_entries = collect_rewards_by_app(matched_folders)
 
     if not app_order:
-        print("未找到任何app数据，请检查aggregate_results.json格式。")
-        return
+        print("未找到有效app数据，请检查 aggregate_results.json / eval_summary.json 格式。")
+        raise SystemExit(1)
 
     print(f"共发现 {len(app_order)} 个app: {app_order}")
 
@@ -276,11 +366,14 @@ def main():
 
     # 打印统计摘要
     print("\n" + "=" * 70)
-    print(f"{'App':<20} {'Mean':>8} {'Std':>8} {'Min':>8} {'Max':>8} {'Runs':>6}")
+    print(f"{'App':<20} {'Mean':>8} {'Std':>8} {'Min':>8} {'Max':>8} {'Samples':>8}")
     print("-" * 70)
     for app in app_order:
         s = stats[app]
-        print(f"{app:<20} {s['mean']:>8.2f} {s['std']:>8.2f} {s['min']:>8.1f} {s['max']:>8.1f} {s['n']:>6d}")
+        print(
+            f"{app:<20} {s['mean']:>8.2f} {s['std']:>8.2f} "
+            f"{s['min']:>8.1f} {s['max']:>8.1f} {s['n']:>8d}"
+        )
     print("=" * 70)
 
     overall_max = sum(stats[app]["max"] for app in app_order)
@@ -291,7 +384,14 @@ def main():
 
     # 4. 绘图并保存
     print("\n正在绘图...")
-    plot_results(stats, app_order, prefix, base_dir)
+    plot_results(
+        stats,
+        app_order,
+        prefix,
+        base_dir,
+        num_result_folders=loaded_folders,
+        skipped_entries=skipped_entries,
+    )
 
     print("\n完成！")
 
