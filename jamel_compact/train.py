@@ -77,8 +77,10 @@ except ImportError:
 try:
     from torch.utils.tensorboard import SummaryWriter
     _TB_AVAILABLE = True
-except ImportError:
+    _TB_IMPORT_ERROR = None
+except ImportError as exc:
     _TB_AVAILABLE = False
+    _TB_IMPORT_ERROR = exc
     SummaryWriter = None
 
 from .config import CompactConfig
@@ -1344,15 +1346,26 @@ def main():
 
     # ── TensorBoard (optional) ──
     if _TB_AVAILABLE and _is_main_process():
-        writer = SummaryWriter(log_dir=config.tb_log_dir)
-        print(f"[train] TensorBoard logging to {config.tb_log_dir}")
-        print(f"  Run: tensorboard --logdir {config.tb_log_dir}")
+        tb_log_dir = Path(config.tb_log_dir).expanduser().resolve()
+        tb_log_dir.mkdir(parents=True, exist_ok=True)
+        writer = SummaryWriter(log_dir=str(tb_log_dir), flush_secs=30)
+        print(f"[train] TensorBoard logging to {tb_log_dir}")
+        print(f"  Run: tensorboard --logdir {tb_log_dir}")
         for k, v in config.to_dict().items():
             writer.add_text("config", f"{k}: {v}")
+        writer.flush()
     elif _is_main_process():
         writer = None
-        print("[train] TensorBoard not available (pip install tensorboard)")
-        print(f"[train] Logs will go to stdout only")
+        print(
+            "[train] WARNING: TensorBoard logging is disabled because "
+            f"SummaryWriter could not be imported: {_TB_IMPORT_ERROR}",
+            file=sys.stderr,
+        )
+        print(
+            "[train] Install training dependencies with: uv sync --extra train",
+            file=sys.stderr,
+        )
+        print("[train] Logs will go to stdout only", file=sys.stderr)
     else:
         writer = None
 

@@ -58,8 +58,10 @@ except ImportError:
 try:
     from torch.utils.tensorboard import SummaryWriter
     _TB_AVAILABLE = True
-except ImportError:
+    _TB_IMPORT_ERROR = None
+except ImportError as exc:
     _TB_AVAILABLE = False
+    _TB_IMPORT_ERROR = exc
     SummaryWriter = None
 
 from .data import CompactDataset, collate_fn
@@ -622,12 +624,27 @@ def main():
 
     # ── TensorBoard ──
     if _TB_AVAILABLE:
-        writer = SummaryWriter(log_dir=args.tb_log_dir)
-        print(f"[baseline] TensorBoard logging to {args.tb_log_dir}")
-        print(f"  Run: tensorboard --logdir {args.tb_log_dir}")
+        tb_log_dir = Path(args.tb_log_dir).expanduser().resolve()
+        tb_log_dir.mkdir(parents=True, exist_ok=True)
+        writer = SummaryWriter(log_dir=str(tb_log_dir), flush_secs=30)
+        print(f"[baseline] TensorBoard logging to {tb_log_dir}")
+        print(f"  Run: tensorboard --logdir {tb_log_dir}")
+        writer.add_text(
+            "config",
+            "\n".join(f"{key}: {value}" for key, value in vars(args).items()),
+        )
+        writer.flush()
     else:
         writer = None
-        print("[baseline] TensorBoard not available (pip install tensorboard)")
+        print(
+            "[baseline] WARNING: TensorBoard logging is disabled because "
+            f"SummaryWriter could not be imported: {_TB_IMPORT_ERROR}",
+            file=sys.stderr,
+        )
+        print(
+            "[baseline] Install training dependencies with: uv sync --extra train",
+            file=sys.stderr,
+        )
 
     # ── Training loop ──
     global_step = 0

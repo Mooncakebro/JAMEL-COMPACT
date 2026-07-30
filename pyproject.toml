@@ -55,6 +55,7 @@ train = [
     "hydra-core",
     "peft>=0.19.1",
     "ray[default]",
+    "tensorboard>=2.14.0",
     "tensordict<=0.6.2",
     "torchdata",
     "wandb",
