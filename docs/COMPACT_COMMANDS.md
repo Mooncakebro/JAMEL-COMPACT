@@ -129,6 +129,40 @@ data/compact_sft_data/
 > `COVERAGE_WEIGHT_ETA=0.0`. The pretrained backbone is frozen unless
 > full-model fine-tuning is explicitly enabled.
 
+### Choosing a training mode
+
+The exact shell variable is `FREEZE_BASE` (not `FREEZE_BASEMODEL`). The
+following settings are the supported combinations:
+
+| Goal | `FREEZE_BASE` | LoRA | `MODEL_PARALLEL` | `FSDP` | Notes |
+|---|---:|---:|---|---|---|
+| Train only COMPACT memory/action modules | `1` | disabled (`LORA_RANK=0`) | `auto` or `1` for large models | `0`/`auto` | Recommended low-cost mode |
+| Train memory modules plus base LoRA adapters | `1` | enabled (`LORA_RANK>0`, `LORA_ALPHA>0`) | `auto` or `1` for large models | `0`/`auto` | Dense base remains frozen |
+| Dense full SFT plus COMPACT modules | `0` | disabled (`LORA_RANK=0`) | `0`/ignored | `auto` or `1` on multiple GPUs | Use FSDP for 4B/8B models |
+| Debug or small-model single-GPU training | `1` or `0` | optional | `0` | `0` | No sharding is needed |
+
+Definitions:
+
+- `FREEZE_BASE=1` freezes the pretrained Qwen weights. COMPACT side-memory
+  and action modules still train; LoRA adapters also train if enabled.
+- `FREEZE_BASE=0` trains the dense pretrained model and COMPACT modules. LoRA
+  is rejected in this mode because LoRA and dense base SFT are alternatives.
+- `LORA_RANK=0` disables LoRA. To enable it, set both `LORA_RANK>0` and
+  `LORA_ALPHA>0`; keep `FREEZE_BASE=1`.
+- `MODEL_PARALLEL=1` loads a frozen base model with a Transformers/Accelerate
+  device map across GPUs inside one process. It is useful for large frozen
+  models and cannot be combined with FSDP.
+- `MODEL_PARALLEL=0` selects legacy batch-splitting DataParallel. It is only
+  appropriate for small models or `CHUNK_SIZE=1`; chunked `BATCH_SIZE=1`
+  cannot be usefully split and leaves only the first GPU doing the work.
+- `FSDP=1` launches one torchrun process per selected GPU and shards dense
+  parameters, gradients, and optimizer state. `FSDP=auto` enables this only
+  for `FREEZE_BASE=0` with multiple GPUs. FSDP disables model parallelism.
+
+Use `GRAD_ACCUM` to increase the effective batch without increasing the
+per-GPU activation memory. When `CHUNK_SIZE>1`, the launcher forces
+`BATCH_SIZE=1` because one batch is one recurrent session chunk.
+
 ### 2a. Train v2 on GPUs 6,7 (★ recommended)
 
 ```bash
@@ -233,7 +267,6 @@ GPU_IDS=5,6,7 \
 FREEZE_BASE=0 \
 FSDP=1 \
 NPROC_PER_NODE=3 \
-MODEL_PARALLEL=0 \
 MAX_LENGTH=4096 \
 CHUNK_SIZE=8 \
 BATCH_SIZE=1 \
@@ -698,14 +731,14 @@ python scripts/snapshots_to_mp4.py outputs/compact_eval/weibo/session0/ \
 | `GRAD_ACCUM` | `16` | Gradient accumulation steps; use this to increase effective batch size in chunked mode |
 | `LR` | `2e-5` | Dense base-model learning rate for full SFT, or LoRA-adapter learning rate when LoRA is enabled |
 | `MEMORY_LR` | `5e-6` | Learning rate for side-memory and action modules |
-| `FREEZE_BASE` | `1` | `1` freezes dense base weights and trains COMPACT modules plus optional LoRA adapters; `0` enables dense full SFT |
+| `FREEZE_BASE` | `1` | `1` passes `--freeze-base`; `0` passes `--train-base` for dense full SFT |
 | `LORA_RANK` | `0` | LoRA rank; `0` disables LoRA and preserves existing behavior |
 | `LORA_ALPHA` | `0` | LoRA scaling alpha; must be greater than `0` when `LORA_RANK>0` |
 | `LORA_DROPOUT` | `0.0` | Dropout applied in LoRA branches |
 | `LORA_TARGET_MODULES` | `q_proj,...,down_proj` | Comma-separated target suffixes, or `all-linear` |
 | `LORA_BIAS` | `none` | PEFT bias mode: `none`, `all`, or `lora_only` |
-| `MODEL_PARALLEL` | `auto` | Auto-shards frozen chunked B=1 runs; `1` forces sharding and `0` forces DataParallel |
-| `FSDP` | `auto` | Auto-enables torchrun `FULL_SHARD` when `FREEZE_BASE=0` and multiple GPUs are selected; set `1` to force it |
+| `MODEL_PARALLEL` | `auto` | `auto` shards frozen chunked B=1 runs; `1` forces model sharding; `0` forces legacy DataParallel |
+| `FSDP` | `auto` | `auto` enables torchrun `FULL_SHARD` only for dense multi-GPU SFT (`FREEZE_BASE=0`); `1` forces it |
 | `NPROC_PER_NODE` | selected GPU count | Number of FSDP worker processes; normally one per selected GPU |
 | `LOG_STEPS` | `10` | TensorBoard logging frequency |
 | `SAVE_STEPS` | `500` | Checkpoint save frequency |

@@ -48,6 +48,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from torch.nn.parallel.scatter_gather import gather as _data_parallel_gather
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
@@ -229,6 +230,24 @@ def _ensure_batch_dim(value):
     if isinstance(value, torch.Tensor) and value.dim() == 0:
         return value.unsqueeze(0)
     return value
+
+
+class _CompactDataParallel(torch.nn.DataParallel):
+    """Avoid gathering unused full-vocabulary logits onto GPU 0."""
+
+    def gather(self, outputs, output_device):
+        if not outputs:
+            return {}
+        gathered = {}
+        for key in outputs[0]:
+            if key == "logits":
+                continue
+            gathered[key] = _data_parallel_gather(
+                [output[key] for output in outputs],
+                output_device,
+                dim=0,
+            )
+        return gathered
 
 
 def _validate_and_save_best(
@@ -1142,7 +1161,7 @@ def main():
     # Wrap with DataParallel for multi-GPU training
     if use_data_parallel:
         device_ids = list(range(num_gpus))
-        model = torch.nn.DataParallel(model, device_ids=device_ids)
+        model = _CompactDataParallel(model, device_ids=device_ids)
         print(f"[train] DataParallel active on {num_gpus} GPUs: {device_ids}")
 
     raw_model = _unwrap(model)
