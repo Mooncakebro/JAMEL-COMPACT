@@ -267,12 +267,19 @@ def train_one_epoch(
         # Same trick as JAMEL-COMPACT: process images on the main device to
         # avoid visual encoder issues under DataParallel scatter.
         # Qwen3-VL nests the visual tower under .model.visual, so check both.
+        #
+        # FSDP: Cannot pre-compute embeddings here because FSDP shards the
+        # embedding weight into a 1-D flat tensor — calling embed_layer(ids)
+        # raises "'weight' must be 2-D".  Instead, pass pixel_values directly
+        # to the model forward and let FSDP's all-gather reconstruct the
+        # full weight inside the forward pass.
+        fsdp_active = _is_fsdp(model)
         inputs_embeds = None
         has_visual = (
             hasattr(raw_model, "visual")
             or (hasattr(raw_model, "model") and hasattr(raw_model.model, "visual"))
         )
-        if pixel_values is not None and has_visual:
+        if not fsdp_active and pixel_values is not None and has_visual:
             embed_layer = raw_model.get_input_embeddings()
             h_embed = embed_layer(input_ids)
             inputs_embeds = _inject_visual_features(
@@ -405,12 +412,15 @@ def validate(model, dataloader, device, raw_model):
         if image_grid_thw is not None and isinstance(image_grid_thw, torch.Tensor):
             image_grid_thw = image_grid_thw.to(device)
 
+        # FSDP: Cannot pre-compute embeddings (sharded weight is 1-D).
+        # Pass pixel_values to the model forward instead.
+        fsdp_active = _is_fsdp(model)
         inputs_embeds = None
         has_visual = (
             hasattr(raw_model, "visual")
             or (hasattr(raw_model, "model") and hasattr(raw_model.model, "visual"))
         )
-        if pixel_values is not None and has_visual:
+        if not fsdp_active and pixel_values is not None and has_visual:
             embed_layer = raw_model.get_input_embeddings()
             h_embed = embed_layer(input_ids)
             inputs_embeds = _inject_visual_features(
