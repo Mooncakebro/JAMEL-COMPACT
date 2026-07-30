@@ -41,6 +41,8 @@ LOG_STEPS=${LOG_STEPS:-10}
 SAVE_STEPS=${SAVE_STEPS:-500}
 VAL_STEPS=${VAL_STEPS:-200}
 GPU_IDS=${GPU_IDS:-}
+FSDP=${FSDP:-auto}                # auto, 1 = torchrun FULL_SHARD, 0 = DataParallel
+NPROC_PER_NODE=${NPROC_PER_NODE:-}
 
 if ! [[ "$LORA_RANK" =~ ^[0-9]+$ && "$LORA_ALPHA" =~ ^[0-9]+$ ]]; then
     echo "ERROR: LORA_RANK and LORA_ALPHA must be non-negative integers." >&2
@@ -71,6 +73,50 @@ if [[ -n "$GPU_IDS" ]]; then
     GPU_ARG="--gpu-ids $GPU_IDS"
 fi
 
+if [[ -z "$NPROC_PER_NODE" ]]; then
+    if [[ -n "$GPU_IDS" ]]; then
+        IFS=',' read -r -a _selected_gpus <<< "$GPU_IDS"
+        NPROC_PER_NODE=${#_selected_gpus[@]}
+    elif command -v nvidia-smi >/dev/null 2>&1; then
+        NPROC_PER_NODE=$(nvidia-smi --list-gpus | wc -l)
+    else
+        NPROC_PER_NODE=1
+    fi
+fi
+
+FSDP_ACTIVE=0
+if [[ "$FSDP" == "1" ]]; then
+    FSDP_ACTIVE=1
+elif [[ "$FSDP" == "auto" && "$NPROC_PER_NODE" -gt 1 ]]; then
+    FSDP_ACTIVE=1
+fi
+if [[ "$FSDP_ACTIVE" == "1" && "$NPROC_PER_NODE" -lt 2 ]]; then
+    echo "ERROR: FSDP requires at least two selected GPUs." >&2
+    exit 2
+fi
+if [[ "$FSDP_ACTIVE" == "1" && -n "$GPU_IDS" \
+      && "$NPROC_PER_NODE" -ne "${#_selected_gpus[@]}" ]]; then
+    echo "ERROR: NPROC_PER_NODE=$NPROC_PER_NODE must equal the " \
+         "${#_selected_gpus[@]} entries in GPU_IDS=$GPU_IDS." >&2
+    exit 2
+fi
+if [[ "$FSDP_ACTIVE" == "1" ]] && ! command -v torchrun >/dev/null 2>&1; then
+    echo "ERROR: torchrun was not found in PATH." >&2
+    exit 2
+fi
+
+LAUNCH=(python -m jamel_compact.baseline_train)
+FSDP_ARG=()
+if [[ "$FSDP_ACTIVE" == "1" ]]; then
+    LAUNCH=(
+        torchrun
+        --standalone
+        --nproc-per-node "$NPROC_PER_NODE"
+        --module jamel_compact.baseline_train
+    )
+    FSDP_ARG=(--fsdp)
+fi
+
 echo "=== Baseline Qwen3-VL SFT Training ==="
 echo "  Base model:  $BASE_MODEL"
 echo "  Train file:  $TRAIN_FILE"
@@ -84,9 +130,10 @@ echo "  Batch:       $BATCH_SIZE × $GRAD_ACCUM (accum)"
 echo "  LR:          $LR"
 echo "  LoRA:        rank=$LORA_RANK alpha=$LORA_ALPHA dropout=$LORA_DROPOUT"
 echo "  LoRA targets: $LORA_TARGET_MODULES"
+echo "  FSDP:        $FSDP_ACTIVE ($NPROC_PER_NODE processes)"
 echo ""
 
-exec python -m jamel_compact.baseline_train \
+exec "${LAUNCH[@]}" \
     --train-file "$TRAIN_FILE" \
     --val-file "$VAL_FILE" \
     --base-model "$BASE_MODEL" \
@@ -105,5 +152,6 @@ exec python -m jamel_compact.baseline_train \
     --log-steps "$LOG_STEPS" \
     --save-steps "$SAVE_STEPS" \
     --val-steps "$VAL_STEPS" \
+    "${FSDP_ARG[@]}" \
     $GPU_ARG \
     "$@"

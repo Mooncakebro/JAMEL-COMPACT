@@ -740,6 +740,8 @@ python scripts/snapshots_to_mp4.py outputs/compact_eval/weibo/session0/ \
 | `OUTPUT_DIR` | `outputs/baseline_ckpt` | Checkpoint output directory |
 | `TB_LOG_DIR` | `outputs/baseline_tb` | TensorBoard log directory |
 | `GPU_IDS` | (empty = all) | Comma-separated GPU IDs (e.g. `6,7`) |
+| `FSDP` | `auto` | `auto`/`1` uses torchrun FSDP FULL_SHARD on multiple GPUs; `0` keeps legacy DataParallel |
+| `NPROC_PER_NODE` | selected GPU count | Number of FSDP processes; normally one per selected GPU |
 | `MAX_LENGTH` | `8192` | Max token length |
 | `MAX_EPOCHS` | `2` | Number of training epochs |
 | `BATCH_SIZE` | `1` | Per-device batch size |
@@ -753,6 +755,24 @@ python scripts/snapshots_to_mp4.py outputs/compact_eval/weibo/session0/ \
 | `LOG_STEPS` | `10` | TensorBoard logging frequency |
 | `SAVE_STEPS` | `500` | Checkpoint save frequency |
 | `VAL_STEPS` | `200` | Validation frequency |
+
+For full SFT of a large baseline model, use FSDP rather than legacy
+DataParallel. FSDP shards parameters, gradients, and optimizer state across
+the selected GPUs:
+
+```bash
+TRAIN_FILE=data/compact_sft_data/compact_train.parquet \
+VAL_FILE=data/compact_sft_data/compact_val.parquet \
+BASE_MODEL=/path/to/Qwen3-VL-4B-Instruct \
+OUTPUT_DIR=outputs/baseline_4b \
+TB_LOG_DIR=outputs/baseline_4b_tb \
+GPU_IDS=0,1,2,3,4,5,6,7 \
+FSDP=1 \
+BATCH_SIZE=1 \
+GRAD_ACCUM=2 \
+MAX_LENGTH=8192 \
+bash shell/run_baseline_train.sh
+```
 
 ### Baseline Evaluation (`run_baseline_eval.sh`)
 

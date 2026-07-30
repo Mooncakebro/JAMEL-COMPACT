@@ -40,13 +40,30 @@ import argparse
 import math
 import random
 import time
+from functools import partial
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+
+try:
+    from torch.distributed.fsdp import (
+        FullStateDictConfig,
+        FullyShardedDataParallel as FSDP,
+        MixedPrecision,
+        ShardingStrategy,
+        StateDictType,
+    )
+    from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+    _FSDP_AVAILABLE = True
+except ImportError:
+    FSDP = None
+    _FSDP_AVAILABLE = False
 
 try:
     from tqdm import tqdm
@@ -84,15 +101,113 @@ def set_seed(seed: int):
 
 
 def _unwrap(model):
-    """Get the underlying model from DataParallel wrapper."""
+    """Get the underlying model from a parallel wrapper."""
     while hasattr(model, "module"):
         model = model.module
     return model
 
 
+def _distributed_active() -> bool:
+    return dist.is_available() and dist.is_initialized()
+
+
+def _is_main_process() -> bool:
+    return not _distributed_active() or dist.get_rank() == 0
+
+
+def _is_fsdp(model) -> bool:
+    return _FSDP_AVAILABLE and isinstance(model, FSDP)
+
+
+def _find_decoder_layers(model):
+    model_candidates = [model]
+    base_model = getattr(model, "base_model", None)
+    if base_model is not None:
+        model_candidates.append(base_model)
+        nested_base = getattr(base_model, "model", None)
+        if nested_base is not None:
+            model_candidates.append(nested_base)
+    candidates = []
+    for candidate_model in model_candidates:
+        candidates.extend(
+            (
+                getattr(getattr(candidate_model, "model", None), "language_model", None),
+                getattr(candidate_model, "language_model", None),
+                getattr(candidate_model, "model", None),
+                getattr(candidate_model, "transformer", None),
+                getattr(candidate_model, "gpt_neox", None),
+            )
+        )
+    for candidate in candidates:
+        layers = getattr(candidate, "layers", None)
+        if layers is None:
+            layers = getattr(candidate, "h", None)
+        if layers is not None and len(layers) > 0:
+            return list(layers)
+    return []
+
+
+def _wrap_fsdp_model(model, device: torch.device, bf16: bool):
+    decoder_layers = _find_decoder_layers(model)
+    if not decoder_layers:
+        raise RuntimeError(
+            "Could not find decoder layers for baseline FSDP wrapping."
+        )
+    auto_wrap_policy = partial(
+        transformer_auto_wrap_policy,
+        transformer_layer_cls={decoder_layers[0].__class__},
+    )
+    mixed_precision = None
+    if bf16:
+        mixed_precision = MixedPrecision(
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.bfloat16,
+            buffer_dtype=torch.bfloat16,
+        )
+    return FSDP(
+        model,
+        auto_wrap_policy=auto_wrap_policy,
+        mixed_precision=mixed_precision,
+        sharding_strategy=ShardingStrategy.FULL_SHARD,
+        device_id=device,
+        use_orig_params=True,
+        limit_all_gathers=True,
+    )
+
+
+def _all_reduce_validation(total_loss: float, num_batches: int):
+    if not _distributed_active():
+        return total_loss, num_batches
+    stats = torch.tensor(
+        [total_loss, float(num_batches)],
+        dtype=torch.float64,
+        device=torch.device("cuda", torch.cuda.current_device()),
+    )
+    dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+    return stats[0].item(), int(stats[1].item())
+
+
+class _LossOnlyDataParallel(torch.nn.DataParallel):
+    """Avoid gathering huge logits when training only needs ``outputs.loss``."""
+
+    def gather(self, outputs, output_device):
+        losses = [output.loss for output in outputs]
+        gathered_losses = [loss.to(output_device) for loss in losses]
+        return type("LossOutput", (), {"loss": torch.stack(gathered_losses)})()
+
+
 def _save_baseline_model(model, save_directory: str | Path, lora_active: bool) -> None:
-    model.save_pretrained(save_directory)
-    if lora_active:
+    raw_model = _unwrap(model)
+    if _is_fsdp(model):
+        save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, save_policy):
+            state_dict = model.state_dict()
+        if _is_main_process():
+            raw_model.save_pretrained(save_directory, state_dict=state_dict)
+        dist.barrier()
+    elif _is_main_process():
+        raw_model.save_pretrained(save_directory)
+    if lora_active and _is_main_process():
         validate_lora_adapter_path(save_directory)
 
 
@@ -228,15 +343,16 @@ def train_one_epoch(
             # ── Mid-epoch checkpoint save ──
             if config_save_steps > 0 and global_step % config_save_steps == 0:
                 ckpt_dir = Path(config_output_dir) / f"global_step_{global_step}"
-                _save_baseline_model(raw_model, ckpt_dir, lora_active)
-                if tokenizer is not None:
+                _save_baseline_model(model, ckpt_dir, lora_active)
+                if tokenizer is not None and _is_main_process():
                     tokenizer.save_pretrained(ckpt_dir)
-                if processor is not None:
+                if processor is not None and _is_main_process():
                     try:
                         processor.save_pretrained(ckpt_dir)
                     except Exception:
                         pass
-                print(f"  [checkpoint] Saved to {ckpt_dir}")
+                if _is_main_process():
+                    print(f"  [checkpoint] Saved to {ckpt_dir}")
 
             # ── Mid-epoch validation ──
             if config_val_steps > 0 and global_step % config_val_steps == 0:
@@ -246,15 +362,16 @@ def train_one_epoch(
                 if val_loss < best_val_loss_tracker[0]:
                     best_val_loss_tracker[0] = val_loss
                     best_dir = Path(config_output_dir) / "best"
-                    _save_baseline_model(raw_model, best_dir, lora_active)
-                    if tokenizer is not None:
+                    _save_baseline_model(model, best_dir, lora_active)
+                    if tokenizer is not None and _is_main_process():
                         tokenizer.save_pretrained(best_dir)
-                    if processor is not None:
+                    if processor is not None and _is_main_process():
                         try:
                             processor.save_pretrained(best_dir)
                         except Exception:
                             pass
-                    print(f"  [best] New best val loss: {val_loss:.4f}")
+                    if _is_main_process():
+                        print(f"  [best] New best val loss: {val_loss:.4f}")
 
         # ── Periodic cache cleanup ──
         if step % 50 == 0:
@@ -324,6 +441,7 @@ def validate(model, dataloader, device, raw_model):
         if _TQDM_AVAILABLE:
             pbar.set_postfix({"val_loss": f"{total_loss / num_batches:.4f}"})
 
+    total_loss, num_batches = _all_reduce_validation(total_loss, num_batches)
     avg_loss = total_loss / max(num_batches, 1)
     print(f"  [val] avg loss: {avg_loss:.4f}")
     return avg_loss
@@ -452,6 +570,10 @@ def main():
     parser.add_argument("--bf16", action="store_true", default=True)
     parser.add_argument("--gpu-ids", type=str, default="",
                         help="Comma-separated GPU IDs (e.g. '0,1,2'). Empty = all.")
+    parser.add_argument(
+        "--fsdp", action="store_true",
+        help="Use torchrun + FSDP FULL_SHARD for sharded multi-GPU SFT.",
+    )
     parser.add_argument("--image-resize-w", type=int, default=640)
     parser.add_argument("--image-resize-h", type=int, default=360)
     args = parser.parse_args()
@@ -474,18 +596,42 @@ def main():
     else:
         print("[baseline] GPU_IDS not set — using all visible GPUs")
 
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    if world_size > 1:
+        args.fsdp = True
+    if args.fsdp and not _FSDP_AVAILABLE:
+        parser.error("This PyTorch build does not provide FSDP.")
+    if args.fsdp and world_size < 2:
+        parser.error(
+            "--fsdp requires torchrun with at least two processes. "
+            "Use shell/run_baseline_train.sh with FSDP=1."
+        )
+    if args.fsdp and not torch.cuda.is_available():
+        parser.error("FSDP multi-GPU training requires CUDA.")
+
+    if args.fsdp:
+        if not dist.is_initialized():
+            dist.init_process_group(backend="nccl")
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     set_seed(args.seed)
 
-    num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
-    use_data_parallel = num_gpus > 1
+    visible_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    num_gpus = world_size if args.fsdp else visible_gpus
+    use_data_parallel = num_gpus > 1 and not args.fsdp
 
-    print(f"[baseline] device={device}, GPUs visible={num_gpus}, "
-          f"DataParallel={'YES' if use_data_parallel else 'NO'}")
-    if torch.cuda.is_available():
+    if _is_main_process():
+        mode = "FSDP_FULL_SHARD" if args.fsdp else (
+            "DATA_PARALLEL" if use_data_parallel else "SINGLE_DEVICE"
+        )
+        print(f"[baseline] device={device}, world_size={world_size}, mode={mode}")
+    if torch.cuda.is_available() and _is_main_process():
         for i in range(num_gpus):
             print(f"  GPU {i}: {torch.cuda.get_device_name(i)} "
                   f"({torch.cuda.get_device_properties(i).total_memory / 1e9:.1f}GB)")
@@ -546,12 +692,19 @@ def main():
             enable_lora_gradient_checkpointing(model)
         print("[baseline] Gradient checkpointing enabled")
 
-    model = model.to(device)
+    if args.fsdp:
+        model = _wrap_fsdp_model(model, device, args.bf16)
+        if _is_main_process():
+            print(f"[baseline] FSDP FULL_SHARD active on {world_size} GPUs")
+    else:
+        model = model.to(device)
 
-    # Wrap with DataParallel for multi-GPU
+    # Legacy DataParallel remains available for non-FSDP runs. Return only
+    # the scalar loss from each replica to avoid gathering 8K × vocab logits
+    # onto GPU 0.
     if use_data_parallel:
         device_ids = list(range(num_gpus))
-        model = torch.nn.DataParallel(model, device_ids=device_ids)
+        model = _LossOnlyDataParallel(model, device_ids=device_ids)
         print(f"[baseline] DataParallel active on {num_gpus} GPUs: {device_ids}")
 
     raw_model = _unwrap(model)
@@ -584,14 +737,24 @@ def main():
     )
 
     # DataLoader — standard collate (no chunking for baseline)
-    effective_batch = args.batch_size * max(num_gpus, 1)
-    print(f"[baseline] Per-GPU batch size: {args.batch_size}"
-          f" × {max(num_gpus, 1)} GPUs = effective batch {effective_batch}")
+    if args.fsdp:
+        train_sampler = DistributedSampler(train_dataset, shuffle=True)
+        val_sampler = DistributedSampler(val_dataset, shuffle=False)
+        effective_batch = args.batch_size
+    else:
+        train_sampler = None
+        val_sampler = None
+        effective_batch = args.batch_size * max(num_gpus, 1)
+    if _is_main_process():
+        print(f"[baseline] Per-GPU batch size: {args.batch_size}"
+              f" × {max(num_gpus, 1)} GPUs = effective batch "
+              f"{args.batch_size * max(num_gpus, 1)}")
     pad_token_id = tokenizer.pad_token_id or 0
     train_loader = DataLoader(
         train_dataset,
         batch_size=effective_batch,
-        shuffle=True,
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
         collate_fn=lambda b: collate_fn(b, pad_token_id),
         num_workers=2,
     )
@@ -599,6 +762,7 @@ def main():
         val_dataset,
         batch_size=effective_batch,
         shuffle=False,
+        sampler=val_sampler,
         collate_fn=lambda b: collate_fn(b, pad_token_id),
         num_workers=2,
     )
@@ -623,7 +787,7 @@ def main():
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     # ── TensorBoard ──
-    if _TB_AVAILABLE:
+    if _TB_AVAILABLE and _is_main_process():
         tb_log_dir = Path(args.tb_log_dir).expanduser().resolve()
         tb_log_dir.mkdir(parents=True, exist_ok=True)
         writer = SummaryWriter(log_dir=str(tb_log_dir), flush_secs=30)
@@ -636,15 +800,16 @@ def main():
         writer.flush()
     else:
         writer = None
-        print(
-            "[baseline] WARNING: TensorBoard logging is disabled because "
-            f"SummaryWriter could not be imported: {_TB_IMPORT_ERROR}",
-            file=sys.stderr,
-        )
-        print(
-            "[baseline] Install training dependencies with: uv sync --extra train",
-            file=sys.stderr,
-        )
+        if _is_main_process():
+            print(
+                "[baseline] WARNING: TensorBoard logging is disabled because "
+                f"SummaryWriter could not be imported: {_TB_IMPORT_ERROR}",
+                file=sys.stderr,
+            )
+            print(
+                "[baseline] Install training dependencies with: uv sync --extra train",
+                file=sys.stderr,
+            )
 
     # ── Training loop ──
     global_step = 0
@@ -653,9 +818,12 @@ def main():
     best_val_loss_tracker = [best_val_loss]
 
     for epoch in range(args.max_epochs):
-        print(f"\n{'='*60}")
-        print(f"Epoch {epoch + 1}/{args.max_epochs}")
-        print(f"{'='*60}")
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
+        if _is_main_process():
+            print(f"\n{'='*60}")
+            print(f"Epoch {epoch + 1}/{args.max_epochs}")
+            print(f"{'='*60}")
 
         global_step = train_one_epoch(
             model, train_loader, optimizer, None, writer,
@@ -687,45 +855,54 @@ def main():
             best_val_loss = val_loss
             best_dir = Path(args.output_dir) / "best"
             _save_baseline_model(
-                raw_model, best_dir, lora_enabled(args.lora_rank),
+                model, best_dir, lora_enabled(args.lora_rank),
             )
-            tokenizer.save_pretrained(best_dir)
-            if processor is not None:
+            if _is_main_process():
+                tokenizer.save_pretrained(best_dir)
+            if processor is not None and _is_main_process():
                 try:
                     processor.save_pretrained(best_dir)
                 except Exception:
                     pass
-            print(f"  [best] New best val loss: {best_val_loss:.4f}")
+            if _is_main_process():
+                print(f"  [best] New best val loss: {best_val_loss:.4f}")
 
         # Save checkpoint per epoch
         ckpt_dir = Path(args.output_dir) / f"epoch{epoch}"
         _save_baseline_model(
-            raw_model, ckpt_dir, lora_enabled(args.lora_rank),
+            model, ckpt_dir, lora_enabled(args.lora_rank),
         )
-        tokenizer.save_pretrained(ckpt_dir)
-        if processor is not None:
+        if _is_main_process():
+            tokenizer.save_pretrained(ckpt_dir)
+        if processor is not None and _is_main_process():
             try:
                 processor.save_pretrained(ckpt_dir)
             except Exception:
                 pass
-        print(f"  [checkpoint] Saved to {ckpt_dir}")
+        if _is_main_process():
+            print(f"  [checkpoint] Saved to {ckpt_dir}")
 
     # ── Save final model ──
     final_dir = Path(args.output_dir) / "final"
     _save_baseline_model(
-        raw_model, final_dir, lora_enabled(args.lora_rank),
+        model, final_dir, lora_enabled(args.lora_rank),
     )
-    tokenizer.save_pretrained(final_dir)
-    if processor is not None:
+    if _is_main_process():
+        tokenizer.save_pretrained(final_dir)
+    if processor is not None and _is_main_process():
         try:
             processor.save_pretrained(final_dir)
         except Exception:
             pass
-    print(f"\n[baseline] Final model saved to {final_dir}")
+    if _is_main_process():
+        print(f"\n[baseline] Final model saved to {final_dir}")
 
     if writer is not None:
         writer.close()
-    print("[baseline] Done.")
+    if _is_main_process():
+        print("[baseline] Done.")
+    if _distributed_active():
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
