@@ -53,7 +53,7 @@ train = [
     "accelerate",
     "datasets",
     "hydra-core",
-    "peft",
+    "peft>=0.19.1",
     "ray[default]",
     "tensordict<=0.6.2",
     "torchdata",

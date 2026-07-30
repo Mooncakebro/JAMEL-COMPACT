@@ -63,6 +63,14 @@ except ImportError:
     SummaryWriter = None
 
 from .data import CompactDataset, collate_fn
+from .lora import (
+    DEFAULT_LORA_TARGET_MODULES_CSV,
+    configure_lora,
+    enable_lora_gradient_checkpointing,
+    lora_enabled,
+    validate_lora_adapter_path,
+    validate_lora_settings,
+)
 
 
 def set_seed(seed: int):
@@ -78,6 +86,12 @@ def _unwrap(model):
     while hasattr(model, "module"):
         model = model.module
     return model
+
+
+def _save_baseline_model(model, save_directory: str | Path, lora_active: bool) -> None:
+    model.save_pretrained(save_directory)
+    if lora_active:
+        validate_lora_adapter_path(save_directory)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -105,6 +119,7 @@ def train_one_epoch(
     best_val_loss_tracker=None,
     scheduler=None,
     tokenizer=None,
+    lora_active: bool = False,
 ):
     """Standard SFT training epoch — pure cross-entropy loss."""
     model.train()
@@ -211,7 +226,7 @@ def train_one_epoch(
             # ── Mid-epoch checkpoint save ──
             if config_save_steps > 0 and global_step % config_save_steps == 0:
                 ckpt_dir = Path(config_output_dir) / f"global_step_{global_step}"
-                raw_model.save_pretrained(ckpt_dir)
+                _save_baseline_model(raw_model, ckpt_dir, lora_active)
                 if tokenizer is not None:
                     tokenizer.save_pretrained(ckpt_dir)
                 if processor is not None:
@@ -229,7 +244,7 @@ def train_one_epoch(
                 if val_loss < best_val_loss_tracker[0]:
                     best_val_loss_tracker[0] = val_loss
                     best_dir = Path(config_output_dir) / "best"
-                    raw_model.save_pretrained(best_dir)
+                    _save_baseline_model(raw_model, best_dir, lora_active)
                     if tokenizer is not None:
                         tokenizer.save_pretrained(best_dir)
                     if processor is not None:
@@ -411,6 +426,19 @@ def main():
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--grad-accum", type=int, default=16)
     parser.add_argument("--lr", type=float, default=2e-5)
+    parser.add_argument("--lora-rank", type=int, default=0,
+                        help="LoRA rank for base-model layers. 0 disables LoRA.")
+    parser.add_argument("--lora-alpha", type=int, default=0,
+                        help="LoRA alpha; must be >0 when --lora-rank >0.")
+    parser.add_argument("--lora-dropout", type=float, default=0.0)
+    parser.add_argument(
+        "--lora-target-modules",
+        default=DEFAULT_LORA_TARGET_MODULES_CSV,
+        help="Comma-separated module suffixes, or 'all-linear'.",
+    )
+    parser.add_argument(
+        "--lora-bias", choices=["none", "all", "lora_only"], default="none",
+    )
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--warmup-ratio", type=float, default=0.05)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
@@ -425,6 +453,17 @@ def main():
     parser.add_argument("--image-resize-w", type=int, default=640)
     parser.add_argument("--image-resize-h", type=int, default=360)
     args = parser.parse_args()
+
+    try:
+        validate_lora_settings(
+            rank=args.lora_rank,
+            alpha=args.lora_alpha,
+            dropout=args.lora_dropout,
+            target_modules=args.lora_target_modules,
+            bias=args.lora_bias,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
 
     # ── GPU selection ──
     if args.gpu_ids:
@@ -477,6 +516,21 @@ def main():
     except Exception:
         processor = None
 
+    model = configure_lora(
+        model,
+        rank=args.lora_rank,
+        alpha=args.lora_alpha,
+        dropout=args.lora_dropout,
+        target_modules=args.lora_target_modules,
+        bias=args.lora_bias,
+    )
+    if lora_enabled(args.lora_rank):
+        print(
+            f"[baseline] LoRA enabled: rank={args.lora_rank}, "
+            f"alpha={args.lora_alpha}, dropout={args.lora_dropout}, "
+            f"targets={args.lora_target_modules}"
+        )
+
     # Store tokenizer reference for visual feature injection
     model._tokenizer = tokenizer
 
@@ -486,6 +540,8 @@ def main():
         # use_cache MUST be False when gradient checkpointing is enabled
         if hasattr(model, 'config'):
             model.config.use_cache = False
+        if lora_enabled(args.lora_rank):
+            enable_lora_gradient_checkpointing(model)
         print("[baseline] Gradient checkpointing enabled")
 
     model = model.to(device)
@@ -502,7 +558,9 @@ def main():
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"[baseline] Total params:     {total_params / 1e9:.2f}B")
-    print(f"[baseline] Trainable params: {trainable_params / 1e9:.2f}B")
+    trainable_scale = 1e6 if lora_enabled(args.lora_rank) else 1e9
+    trainable_unit = "M" if lora_enabled(args.lora_rank) else "B"
+    print(f"[baseline] Trainable params: {trainable_params / trainable_scale:.2f}{trainable_unit}")
 
     # ── Build dataset ──
     print(f"[baseline] Loading data: {args.train_file}")
@@ -597,6 +655,7 @@ def main():
             best_val_loss_tracker=best_val_loss_tracker,
             scheduler=scheduler,
             tokenizer=tokenizer,
+            lora_active=lora_enabled(args.lora_rank),
         )
         # Sync back from the mutable tracker
         best_val_loss = best_val_loss_tracker[0]
@@ -610,7 +669,9 @@ def main():
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             best_dir = Path(args.output_dir) / "best"
-            raw_model.save_pretrained(best_dir)
+            _save_baseline_model(
+                raw_model, best_dir, lora_enabled(args.lora_rank),
+            )
             tokenizer.save_pretrained(best_dir)
             if processor is not None:
                 try:
@@ -621,7 +682,9 @@ def main():
 
         # Save checkpoint per epoch
         ckpt_dir = Path(args.output_dir) / f"epoch{epoch}"
-        raw_model.save_pretrained(ckpt_dir)
+        _save_baseline_model(
+            raw_model, ckpt_dir, lora_enabled(args.lora_rank),
+        )
         tokenizer.save_pretrained(ckpt_dir)
         if processor is not None:
             try:
@@ -632,7 +695,9 @@ def main():
 
     # ── Save final model ──
     final_dir = Path(args.output_dir) / "final"
-    raw_model.save_pretrained(final_dir)
+    _save_baseline_model(
+        raw_model, final_dir, lora_enabled(args.lora_rank),
+    )
     tokenizer.save_pretrained(final_dir)
     if processor is not None:
         try:

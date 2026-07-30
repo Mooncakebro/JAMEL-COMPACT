@@ -91,6 +91,11 @@ from .data import (
     session_collate_fn,
 )
 from .loss import compute_compact_loss
+from .lora import (
+    DEFAULT_LORA_TARGET_MODULES_CSV,
+    lora_enabled,
+    validate_lora_settings,
+)
 
 # F8: Optional memory diagnostics
 try:
@@ -907,9 +912,22 @@ def main():
     )
     parser.add_argument("--grad-accum", type=int, default=16)
     parser.add_argument("--lr", type=float, default=2e-5,
-                        help="Base-model learning rate when --train-base is enabled.")
+                        help="Base-model or LoRA-adapter learning rate.")
     parser.add_argument("--memory-lr", type=float, default=5e-6,
                         help="Learning rate for side-memory and action modules.")
+    parser.add_argument("--lora-rank", type=int, default=0,
+                        help="LoRA rank for base-model layers. 0 disables LoRA.")
+    parser.add_argument("--lora-alpha", type=int, default=0,
+                        help="LoRA alpha; must be >0 when --lora-rank >0.")
+    parser.add_argument("--lora-dropout", type=float, default=0.0)
+    parser.add_argument(
+        "--lora-target-modules",
+        default=DEFAULT_LORA_TARGET_MODULES_CSV,
+        help="Comma-separated module suffixes, or 'all-linear'.",
+    )
+    parser.add_argument(
+        "--lora-bias", choices=["none", "all", "lora_only"], default="none",
+    )
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--warmup-ratio", type=float, default=0.05)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
@@ -960,6 +978,22 @@ def main():
                         help="F7: Coverage-weighted SFT. 0 = off; >0 upweights "
                              "samples with high coverage delta (novelty).")
     args = parser.parse_args()
+
+    try:
+        validate_lora_settings(
+            rank=args.lora_rank,
+            alpha=args.lora_alpha,
+            dropout=args.lora_dropout,
+            target_modules=args.lora_target_modules,
+            bias=args.lora_bias,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+    if lora_enabled(args.lora_rank) and not args.freeze_base:
+        parser.error(
+            "LoRA cannot be combined with --train-base. Use --freeze-base so "
+            "the dense base stays frozen and only adapters are trained."
+        )
 
     if (
         args.chunk_size > 1
@@ -1077,6 +1111,11 @@ def main():
         lambda_nll=args.lambda_nll,
         freeze_base=args.freeze_base,
         model_parallel=args.model_parallel,
+        lora_rank=args.lora_rank,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
+        lora_target_modules=args.lora_target_modules,
+        lora_bias=args.lora_bias,
         gradient_checkpointing=not args.no_grad_checkpoint,
         bf16=args.bf16,
         seed=args.seed,
@@ -1107,6 +1146,13 @@ def main():
     raw_model = _unwrap(model)
     if _is_main_process():
         print(f"[train] Base params:   {param_info['base'] / 1e9:.2f}B")
+        print(f"[train] Memory params: {param_info['memory'] / 1e6:.1f}M")
+        if lora_enabled(config.lora_rank):
+            print(f"[train] LoRA params:   {param_info['lora'] / 1e6:.1f}M")
+            print(
+                f"[train] LoRA: rank={config.lora_rank}, alpha={config.lora_alpha}, "
+                f"dropout={config.lora_dropout}, targets={config.lora_target_modules}"
+            )
         print(f"[train] New params:    {param_info['new'] / 1e6:.1f}M")
         print(f"[train] Total:         {param_info['total'] / 1e9:.2f}B")
         print(f"[train] Overhead:      {param_info['overhead_pct']:.1f}%")

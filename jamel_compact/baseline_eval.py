@@ -48,6 +48,25 @@ from PIL import Image
 from jamel.core.env.web.coverage import start_coverage, save_coverage
 from jamel.core.reward.web.utils import compute_monocart_coverage_reward_details
 from jamel.coverage_artifact import build_coverage_artifact_fields
+from .lora import load_lora_adapter, read_lora_adapter_config
+
+
+def _load_baseline_checkpoint(model_class, checkpoint: str, load_kwargs: dict):
+    adapter_config_path = Path(checkpoint) / "adapter_config.json"
+    if not adapter_config_path.is_file():
+        return model_class.from_pretrained(checkpoint, **load_kwargs), None
+
+    adapter_config = read_lora_adapter_config(checkpoint)
+    base_model_name = adapter_config.get("base_model_name_or_path")
+    if not base_model_name:
+        raise ValueError(
+            f"LoRA checkpoint is missing base_model_name_or_path: {adapter_config_path}"
+        )
+
+    model = model_class.from_pretrained(base_model_name, **load_kwargs)
+    model = load_lora_adapter(model, checkpoint, is_trainable=False)
+    print(f"[agent] Loaded LoRA adapter over base model {base_model_name}")
+    return model, base_model_name
 
 
 # ── Action / think parsing (same as compact eval) ──
@@ -132,16 +151,17 @@ class BaselineAgent:
         if device.startswith("cuda") and torch.cuda.is_available():
             _load_kwargs["device_map"] = {"": device}
 
+        adapter_base_model = None
         try:
-            self.model = AutoModelForImageTextToText.from_pretrained(
-                checkpoint, **_load_kwargs,
+            self.model, adapter_base_model = _load_baseline_checkpoint(
+                AutoModelForImageTextToText, checkpoint, _load_kwargs,
             )
         except Exception as e:
             print(f"[agent] AutoModelForImageTextToText failed ({e}), "
                   f"trying AutoModelForCausalLM...")
             from transformers import AutoModelForCausalLM
-            self.model = AutoModelForCausalLM.from_pretrained(
-                checkpoint, **_load_kwargs,
+            self.model, adapter_base_model = _load_baseline_checkpoint(
+                AutoModelForCausalLM, checkpoint, _load_kwargs,
             )
 
         # Only .to(device) if device_map wasn't used (CPU fallback path)
@@ -164,13 +184,28 @@ class BaselineAgent:
         torch.cuda.empty_cache()
 
         self.device = torch.device(device)
-        self.tokenizer = AutoTokenizer.from_pretrained(checkpoint, trust_remote_code=True)
+        asset_source = checkpoint
         try:
-            self.processor = AutoProcessor.from_pretrained(checkpoint, trust_remote_code=True)
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                asset_source, trust_remote_code=True,
+            )
         except Exception:
-            self.processor = None
-            print("[agent] WARNING: AutoProcessor failed to load from checkpoint. "
-                  "Image processing will not work correctly.")
+            if adapter_base_model is None:
+                raise
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                adapter_base_model, trust_remote_code=True,
+            )
+        try:
+            self.processor = AutoProcessor.from_pretrained(asset_source, trust_remote_code=True)
+        except Exception:
+            if adapter_base_model is not None:
+                self.processor = AutoProcessor.from_pretrained(
+                    adapter_base_model, trust_remote_code=True,
+                )
+            else:
+                self.processor = None
+                print("[agent] WARNING: AutoProcessor failed to load from checkpoint. "
+                      "Image processing will not work correctly.")
 
         self.temperature = temperature
         self.top_p = top_p

@@ -23,6 +23,12 @@ import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoProcessor, AutoTokenizer
 
 from .config import CompactConfig
+from .lora import (
+    configure_lora,
+    enable_lora_gradient_checkpointing,
+    lora_enabled,
+    validate_lora_adapter_path,
+)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -361,9 +367,20 @@ class JAMELCompactWrapper(nn.Module):
     side-memory-only checkpoints.
     """
 
-    def __init__(self, config: CompactConfig):
+    def __init__(
+        self,
+        config: CompactConfig,
+        lora_adapter_path: str | Path | None = None,
+        lora_is_trainable: bool = True,
+    ):
         super().__init__()
         self.config = config
+
+        if lora_enabled(config.lora_rank) and not config.freeze_base:
+            raise ValueError(
+                "COMPACT LoRA requires freeze_base=True because dense base weights "
+                "remain frozen while LoRA adapters are trained"
+            )
 
         # ── Load pretrained LLM ──
         # Qwen3-VL is a multimodal model — AutoModelForCausalLM won't work.
@@ -452,9 +469,22 @@ class JAMELCompactWrapper(nn.Module):
             for param in self.llm.parameters():
                 param.requires_grad = False
 
+        self.llm = configure_lora(
+            self.llm,
+            rank=config.lora_rank,
+            alpha=config.lora_alpha,
+            dropout=config.lora_dropout,
+            target_modules=config.lora_target_modules,
+            bias=config.lora_bias,
+            adapter_path=lora_adapter_path,
+            is_trainable=lora_is_trainable,
+        )
+
         if config.gradient_checkpointing:
             self.llm.gradient_checkpointing_enable()
             self.llm.config.use_cache = False
+            if lora_enabled(config.lora_rank) and lora_is_trainable:
+                enable_lora_gradient_checkpointing(self.llm)
 
     # ── Architecture helpers ──
 
@@ -1496,8 +1526,15 @@ class JAMELCompactWrapper(nn.Module):
             json.dumps(config_dict, indent=2, ensure_ascii=False)
         )
 
-        # Save base LLM (or just reference if frozen)
-        if self.config.freeze_base:
+        # Save base LLM, a LoRA adapter, or just a frozen-base reference.
+        if lora_enabled(self.config.lora_rank):
+            (save_path / "base_model_ref.txt").write_text(self.config.base_model_name)
+            self.llm.save_pretrained(
+                save_path / "base_model_lora",
+                state_dict=llm_state,
+            )
+            validate_lora_adapter_path(save_path / "base_model_lora")
+        elif self.config.freeze_base:
             # Only save a reference to the base model
             (save_path / "base_model_ref.txt").write_text(self.config.base_model_name)
         else:
@@ -1543,13 +1580,23 @@ class JAMELCompactWrapper(nn.Module):
         # Check for base model reference (frozen) or saved base model
         base_ref_path = load_path / "base_model_ref.txt"
         base_model_dir = load_path / "base_model"
+        lora_adapter_dir = load_path / "base_model_lora"
         if base_ref_path.exists():
             config.base_model_name = base_ref_path.read_text().strip()
         elif base_model_dir.exists():
             config.base_model_name = str(base_model_dir)
 
+        if lora_enabled(config.lora_rank) and not lora_adapter_dir.exists():
+            raise FileNotFoundError(
+                f"Checkpoint enables LoRA but adapter directory is missing: {lora_adapter_dir}"
+            )
+
         # Create model
-        model = cls(config)
+        model = cls(
+            config,
+            lora_adapter_path=lora_adapter_dir if lora_enabled(config.lora_rank) else None,
+            lora_is_trainable=False,
+        )
 
         # ── Reload tokenizer/processor from the checkpoint top-level dir ──
         # save_pretrained() saves tokenizer + processor to the top-level
@@ -1595,12 +1642,21 @@ class JAMELCompactWrapper(nn.Module):
 
     def count_parameters(self) -> dict:
         """Return parameter counts: base, new, total."""
-        base_params = sum(p.numel() for p in self.llm.parameters())
-        new_params = sum(p.numel() for p in self.side_memories.parameters())
-        new_params += sum(p.numel() for p in self.action_embed.parameters())
+        llm_params = sum(p.numel() for p in self.llm.parameters())
+        lora_params = 0
+        if lora_enabled(self.config.lora_rank):
+            lora_params = sum(
+                p.numel() for p in self.llm.parameters() if p.requires_grad
+            )
+        base_params = llm_params - lora_params
+        memory_params = sum(p.numel() for p in self.side_memories.parameters())
+        memory_params += sum(p.numel() for p in self.action_embed.parameters())
+        new_params = memory_params + lora_params
         return {
             "base": base_params,
             "new": new_params,
-            "total": base_params + new_params,
+            "memory": memory_params,
+            "lora": lora_params,
+            "total": llm_params + memory_params,
             "overhead_pct": new_params / base_params * 100,
         }

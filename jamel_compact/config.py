@@ -20,6 +20,13 @@ class CompactConfig:
     freeze_base: bool = True          # freeze pretrained LLM weights by default
     model_parallel: bool = False      # shard frozen base layers across visible GPUs
     num_act_tokens: int = 1           # action tokens in input sequence
+    lora_rank: int = 0                # 0 = disabled; >0 enables base-model LoRA
+    lora_alpha: int = 0               # must be >0 when lora_rank > 0
+    lora_dropout: float = 0.0
+    lora_target_modules: str = (
+        "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj"
+    )
+    lora_bias: str = "none"
 
     # ── Model version (for checkpoint compatibility) ──
     model_version: int = 2            # v1=1, v2=2 (U1/U2 change side_memories.pt keys)

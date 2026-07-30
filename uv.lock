@@ -1710,7 +1710,7 @@ requires-dist = [
     { name = "numpy" },
     { name = "openai", specifier = ">=1.0.0" },
     { name = "pandas" },
-    { name = "peft", marker = "extra == 'train'" },
+    { name = "peft", marker = "extra == 'train'", specifier = ">=0.19.1" },
     { name = "pillow", specifier = ">=10.0.0" },
     { name = "playwright", specifier = ">=1.40.0" },
     { name = "pyarrow" },

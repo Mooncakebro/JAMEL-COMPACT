@@ -249,7 +249,64 @@ bash shell/run_compact_train.sh
 `FSDP=auto`. FSDP runs one process per GPU, shards parameters, gradients, and
 optimizer state, and synchronizes validation/checkpointing across ranks.
 
-### 2f. Opt into full-model fine-tuning
+### 2f. Train COMPACT with Qwen3-VL-4B using LoRA
+
+`LORA_RANK=0` is the default and preserves the existing frozen-base or full-SFT
+behavior. LoRA is enabled only when `LORA_RANK>0` and `LORA_ALPHA>0` are both
+set. COMPACT LoRA also requires `FREEZE_BASE=1`: dense base weights stay frozen,
+while LoRA adapters and the COMPACT side-memory modules are trained.
+
+```bash
+TRAIN_FILE=data/compact_sft_data/compact_train.parquet \
+VAL_FILE=data/compact_sft_data/compact_val.parquet \
+BASE_MODEL=Qwen/Qwen3-VL-4B-Instruct \
+OUTPUT_DIR=outputs/compact_ckpt_4b_lora \
+TB_LOG_DIR=outputs/compact_tb_4b_lora \
+GPU_IDS=5,6 \
+FREEZE_BASE=1 \
+MODEL_PARALLEL=auto \
+FSDP=0 \
+MAX_LENGTH=4096 \
+CHUNK_SIZE=8 \
+BATCH_SIZE=1 \
+GRAD_ACCUM=16 \
+LR=1e-4 \
+MEMORY_LR=5e-6 \
+LORA_RANK=16 \
+LORA_ALPHA=32 \
+LORA_DROPOUT=0.05 \
+LORA_TARGET_MODULES=q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj \
+LORA_BIAS=none \
+bash shell/run_compact_train.sh
+```
+
+### 2g. Train COMPACT with Qwen3-VL-8B using LoRA and model sharding
+
+```bash
+TRAIN_FILE=data/compact_sft_data/compact_train.parquet \
+VAL_FILE=data/compact_sft_data/compact_val.parquet \
+BASE_MODEL=Qwen/Qwen3-VL-8B-Instruct \
+OUTPUT_DIR=outputs/compact_ckpt_8b_lora \
+TB_LOG_DIR=outputs/compact_tb_8b_lora \
+GPU_IDS=5,6,7 \
+FREEZE_BASE=1 \
+MODEL_PARALLEL=1 \
+FSDP=0 \
+MAX_LENGTH=4096 \
+CHUNK_SIZE=8 \
+BATCH_SIZE=1 \
+GRAD_ACCUM=16 \
+LR=1e-4 \
+MEMORY_LR=5e-6 \
+LORA_RANK=16 \
+LORA_ALPHA=32 \
+LORA_DROPOUT=0.05 \
+LORA_TARGET_MODULES=q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj \
+LORA_BIAS=none \
+bash shell/run_compact_train.sh
+```
+
+### 2h. Opt into full-model fine-tuning
 
 ```bash
 TRAIN_FILE=data/compact_sft_data/compact_train.parquet \
@@ -265,7 +322,7 @@ CHUNK_SIZE=8 \
 bash shell/run_compact_train.sh
 ```
 
-### 2g. Monitor training with TensorBoard
+### 2i. Monitor training with TensorBoard
 
 Open a separate terminal:
 
@@ -286,7 +343,9 @@ tensorboard --logdir outputs/compact_tb_v2 --port 6006
 ```
 outputs/compact_ckpt/
 ├── global_step_500/
-│   ├── base_model/  (or base_model_ref.txt if frozen)
+│   ├── base_model/       (full SFT only)
+│   ├── base_model_ref.txt (frozen base or LoRA)
+│   ├── base_model_lora/  (LoRA adapter only, when enabled)
 │   ├── side_memory/
 │   │   ├── side_memories.pt
 │   │   └── action_embed.pt
@@ -338,7 +397,34 @@ LR=1e-5 \
 bash shell/run_baseline_train.sh
 ```
 
-### 2B-c. Monitor baseline training with TensorBoard
+### 2B-c. Train baseline Qwen3-VL-4B or 8B using LoRA
+
+The baseline has no side-memory modules. With LoRA enabled, only the adapter
+parameters are optimized and each checkpoint stores the adapter plus tokenizer
+and processor files; evaluation automatically reloads the referenced base model.
+
+```bash
+# Use Qwen/Qwen3-VL-8B-Instruct here for the 8B run.
+TRAIN_FILE=data/compact_sft_data/compact_train.parquet \
+VAL_FILE=data/compact_sft_data/compact_val.parquet \
+BASE_MODEL=Qwen/Qwen3-VL-4B-Instruct \
+OUTPUT_DIR=outputs/baseline_ckpt_4b_lora \
+TB_LOG_DIR=outputs/baseline_tb_4b_lora \
+GPU_IDS=5 \
+MAX_LENGTH=4096 \
+MAX_EPOCHS=3 \
+BATCH_SIZE=1 \
+GRAD_ACCUM=16 \
+LR=1e-4 \
+LORA_RANK=16 \
+LORA_ALPHA=32 \
+LORA_DROPOUT=0.05 \
+LORA_TARGET_MODULES=q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj \
+LORA_BIAS=none \
+bash shell/run_baseline_train.sh
+```
+
+### 2B-d. Monitor baseline training with TensorBoard
 
 ```bash
 tensorboard --logdir outputs/baseline_tb --port 6007
@@ -610,9 +696,14 @@ python scripts/snapshots_to_mp4.py outputs/compact_eval/weibo/session0/ \
 | `MAX_EPOCHS` | `3` | Number of training epochs |
 | `BATCH_SIZE` | `1` | Per-device batch size in single-step mode; fixed to `1` when `CHUNK_SIZE>1` because each batch is one recurrent session chunk |
 | `GRAD_ACCUM` | `16` | Gradient accumulation steps; use this to increase effective batch size in chunked mode |
-| `LR` | `2e-5` | Base-model learning rate; used only when `FREEZE_BASE=0` |
+| `LR` | `2e-5` | Dense base-model learning rate for full SFT, or LoRA-adapter learning rate when LoRA is enabled |
 | `MEMORY_LR` | `5e-6` | Learning rate for side-memory and action modules |
-| `FREEZE_BASE` | `1` | `1` trains only COMPACT modules; `0` also fine-tunes the base model |
+| `FREEZE_BASE` | `1` | `1` freezes dense base weights and trains COMPACT modules plus optional LoRA adapters; `0` enables dense full SFT |
+| `LORA_RANK` | `0` | LoRA rank; `0` disables LoRA and preserves existing behavior |
+| `LORA_ALPHA` | `0` | LoRA scaling alpha; must be greater than `0` when `LORA_RANK>0` |
+| `LORA_DROPOUT` | `0.0` | Dropout applied in LoRA branches |
+| `LORA_TARGET_MODULES` | `q_proj,...,down_proj` | Comma-separated target suffixes, or `all-linear` |
+| `LORA_BIAS` | `none` | PEFT bias mode: `none`, `all`, or `lora_only` |
 | `MODEL_PARALLEL` | `auto` | Auto-shards frozen chunked B=1 runs; `1` forces sharding and `0` forces DataParallel |
 | `FSDP` | `auto` | Auto-enables torchrun `FULL_SHARD` when `FREEZE_BASE=0` and multiple GPUs are selected; set `1` to force it |
 | `NPROC_PER_NODE` | selected GPU count | Number of FSDP worker processes; normally one per selected GPU |
@@ -654,6 +745,11 @@ python scripts/snapshots_to_mp4.py outputs/compact_eval/weibo/session0/ \
 | `BATCH_SIZE` | `1` | Per-device batch size |
 | `GRAD_ACCUM` | `16` | Gradient accumulation steps |
 | `LR` | `2e-5` | Learning rate |
+| `LORA_RANK` | `0` | LoRA rank; `0` keeps standard full SFT |
+| `LORA_ALPHA` | `0` | LoRA scaling alpha; required when rank is enabled |
+| `LORA_DROPOUT` | `0.0` | Dropout applied in LoRA branches |
+| `LORA_TARGET_MODULES` | `q_proj,...,down_proj` | Comma-separated target suffixes, or `all-linear` |
+| `LORA_BIAS` | `none` | PEFT bias mode: `none`, `all`, or `lora_only` |
 | `LOG_STEPS` | `10` | TensorBoard logging frequency |
 | `SAVE_STEPS` | `500` | Checkpoint save frequency |
 | `VAL_STEPS` | `200` | Validation frequency |
