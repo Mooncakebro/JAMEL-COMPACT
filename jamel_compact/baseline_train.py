@@ -256,6 +256,9 @@ def train_one_epoch(
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
         labels = batch["labels"].to(device)
+        mm_token_type_ids = batch.get("mm_token_type_ids")
+        if mm_token_type_ids is not None:
+            mm_token_type_ids = mm_token_type_ids.to(device)
         pixel_values = batch.get("pixel_values")
         if pixel_values is not None and isinstance(pixel_values, torch.Tensor):
             pixel_values = pixel_values.to(device)
@@ -291,12 +294,14 @@ def train_one_epoch(
             outputs = model(
                 inputs_embeds=inputs_embeds,
                 attention_mask=attention_mask,
+                mm_token_type_ids=mm_token_type_ids,
                 labels=labels,
             )
         else:
             outputs = model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
+                mm_token_type_ids=mm_token_type_ids,
                 labels=labels,
                 pixel_values=pixel_values,
                 image_grid_thw=image_grid_thw,
@@ -405,6 +410,9 @@ def validate(model, dataloader, device, raw_model):
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
         labels = batch["labels"].to(device)
+        mm_token_type_ids = batch.get("mm_token_type_ids")
+        if mm_token_type_ids is not None:
+            mm_token_type_ids = mm_token_type_ids.to(device)
         pixel_values = batch.get("pixel_values")
         if pixel_values is not None and isinstance(pixel_values, torch.Tensor):
             pixel_values = pixel_values.to(device)
@@ -431,12 +439,14 @@ def validate(model, dataloader, device, raw_model):
             outputs = model(
                 inputs_embeds=inputs_embeds,
                 attention_mask=attention_mask,
+                mm_token_type_ids=mm_token_type_ids,
                 labels=labels,
             )
         else:
             outputs = model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
+                mm_token_type_ids=mm_token_type_ids,
                 labels=labels,
                 pixel_values=pixel_values,
                 image_grid_thw=image_grid_thw,
