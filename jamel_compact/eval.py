@@ -17,28 +17,20 @@ from __future__ import annotations
 
 import argparse
 import gc
-import io
 import json
 import os
 import re
-import signal
 import sys
-import threading
-import time
-from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional
 
 from .gpu import configure_cuda_visibility
 
 configure_cuda_visibility()
 
 import numpy as np
-import pandas as pd
 import torch
 from PIL import Image
 
-from .config import CompactConfig
 from .model import JAMELCompactWrapper
 
 # F8: Linear probe for memory diagnostics
@@ -50,12 +42,6 @@ try:
     from scripts.probe_memory import LinearProbeMemory
 except ImportError:
     LinearProbeMemory = None
-
-# ── Coverage imports (same modules as original JAMEL eval) ──
-from jamel.core.env.web.coverage import start_coverage, save_coverage
-from jamel.core.reward.web.utils import compute_monocart_coverage_reward_details
-from jamel.coverage_artifact import build_coverage_artifact_fields
-
 
 # ── Action / think parsing ──
 
@@ -73,33 +59,6 @@ def parse_action(response: str) -> tuple[str, str]:
     action = action_m.group(1).strip().split("\n")[0] if action_m else ""
     think = think_m.group(1).strip() if think_m else ""
     return action, think
-
-
-# ── Helper functions (same pattern as original JAMEL eval) ──
-
-def _obs_to_bytes(obs: dict | None, key: str) -> bytes | None:
-    """Encode screenshot numpy array → PNG bytes."""
-    if obs is None:
-        return None
-    arr = obs.get(key)
-    if arr is None:
-        return None
-    buf = io.BytesIO()
-    Image.fromarray(arr.astype(np.uint8)).save(buf, format="PNG")
-    return buf.getvalue()
-
-
-def _compute_coverage_details(
-    current_path: Path | None,
-    history_paths: list[Path],
-    previous_score: int = 0,
-) -> dict:
-    """Compute reward through the shared Monocart cumulative coverage interface."""
-    return compute_monocart_coverage_reward_details(
-        current_path=current_path,
-        baseline_paths=history_paths,
-        previous_score=previous_score,
-    )
 
 
 # ── JAMEL-COMPACT Agent ──
@@ -268,12 +227,9 @@ class CompactAgent:
         # Get action embedding
         action_embed_input = self._get_action_embedding()
 
-        # Generate with 180s kill timer (same as original JAMEL eval)
-        _kill_timer = threading.Timer(180, lambda: os.kill(os.getpid(), signal.SIGKILL))
-        _kill_timer.daemon = True
-        _kill_timer.start()
-        try:
-            outputs = self.model.generate(
+        # Do not kill the whole evaluator from a background timer.  A slow
+        # generation should be handled by the per-session error boundary.
+        outputs = self.model.generate(
                 input_ids=inputs["input_ids"],
                 attention_mask=inputs.get("attention_mask"),
                 action_embed_input=action_embed_input,
@@ -288,8 +244,6 @@ class CompactAgent:
                 e_prev_list=self._e_prev_list,
                 freeze_memory=self._freeze_memory,
             )
-        finally:
-            _kill_timer.cancel()
 
         # Update memory states
         self._memory_states = outputs["new_memory"]
@@ -335,36 +289,30 @@ def run_eval(
     port: int = 8790,
     seed: int = 42,
     freeze_memory_init: bool = False,
+    browser_timeout_ms: int = 30_000,
+    reset_retries: int = 3,
+    max_input_tokens: int = 8192,
+    max_new_tokens: int = 256,
+    save_screenshots: bool = False,
+    enable_linear_probe: bool = False,
 ):
-    """
-    Run JAMEL-COMPACT evaluation on ScaleWoB apps.
+    """Run JAMEL-COMPACT evaluation with per-session crash recovery."""
+    from .eval_browser import run_browser_evaluation
 
-    For each app, runs `num_sessions` sessions of `max_steps` steps each.
-    Memory is maintained across episodes within a session (not reset on reset()).
-
-    Reward is computed from JS coverage (same as original JAMEL eval), NOT
-    from env.step() reward (which is always 0 for ScaleWoBTask).
-    """
-    from browsergym.core.env import BrowserEnv
-    from jamel.utils.eval.eval_memory_aug_episode import ScaleWoBTask
-
-    output_path = Path(output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
-
-    # Initialize agent once (model stays loaded across all sessions)
     agent = CompactAgent(
         checkpoint=checkpoint,
         device=device,
         temperature=temperature,
         top_p=top_p,
+        max_input_tokens=max_input_tokens,
+        max_new_tokens=max_new_tokens,
     )
     agent._freeze_memory = freeze_memory_init
     if freeze_memory_init:
         print("[eval] WARNING: --freeze-memory-init is active. Memory will NOT update during eval.")
 
-    # F8: Initialize linear probe for memory diagnostics
     probe = None
-    if LinearProbeMemory is not None:
+    if enable_linear_probe and LinearProbeMemory is not None:
         probe = LinearProbeMemory(
             num_layers=agent.model.num_layers,
             mem_dim=agent.model.mem_dim,
@@ -372,310 +320,52 @@ def run_eval(
             num_apps=len(apps),
             max_steps=max_steps,
         )
-        print(f"[eval] F8 linear probe initialized: {agent.model.num_layers} layers, "
-              f"d_mem={agent.model.mem_dim}, N_m={agent.model.num_mem}")
-    else:
-        print("[eval] F8 linear probe not available (scripts.probe_memory import failed)")
+        print(
+            f"[eval] F8 linear probe initialized: {agent.model.num_layers} layers, "
+            f"d_mem={agent.model.mem_dim}, N_m={agent.model.num_mem}"
+        )
+    elif enable_linear_probe:
+        print("[eval] F8 linear probe unavailable (scripts.probe_memory import failed)")
 
-    # Map app names to integer IDs for the probe
-    app_id_map = {app: i for i, app in enumerate(apps)}
+    app_id_map = {app: index for index, app in enumerate(apps)}
 
-    all_results = []
-
-    for app in apps:
-        print(f"\n{'='*60}")
-        print(f"App: {app}")
-        print(f"{'='*60}")
-
-        target_url = f"http://127.0.0.1:{port}/{app}/index.html"
-        start_url = target_url
-
-        for session_idx in range(num_sessions):
-            print(f"\n  Session {session_idx + 1}/{num_sessions}")
-
-            # Reset session memory
-            agent.reset_session()
-
-            # Create browser env with ScaleWoB task
-            # ScaleWoBTask manages its own static server internally
-            env = BrowserEnv(
-                task_entrypoint=ScaleWoBTask,
-                task_kwargs={
-                    "env_id": app,
-                    "port": port,
-                    "viewport_width": 1280,
-                    "viewport_height": 720,
-                    "scalewob_root": scalewob_root,
-                },
-                headless=headless,
-                viewport={"width": 1280, "height": 720},
+    def _collect_probe_snapshot(app: str, step_idx: int) -> None:
+        if probe is not None:
+            probe.add_snapshot(
+                agent.get_memory_snapshot(),
+                app_id=app_id_map[app],
+                step_idx=step_idx,
             )
 
-            # Per-session output directory and coverage directory
-            session_dir = output_path / app / f"session{session_idx}"
-            coverage_dir = session_dir / "coverage"
-            session_dir.mkdir(parents=True, exist_ok=True)
-            coverage_dir.mkdir(parents=True, exist_ok=True)
+    results = run_browser_evaluation(
+        agent=agent,
+        checkpoint=checkpoint,
+        apps=apps,
+        scalewob_root=scalewob_root,
+        max_steps=max_steps,
+        num_sessions=num_sessions,
+        output_dir=output_dir,
+        headless=headless,
+        port=port,
+        seed=seed,
+        model_type="jamel_compact",
+        summary_title="EVALUATION SUMMARY (JAMEL-COMPACT)",
+        browser_timeout_ms=browser_timeout_ms,
+        reset_retries=reset_retries,
+        save_screenshots=save_screenshots,
+        on_step_decision=_collect_probe_snapshot if probe is not None else None,
+    )
 
-            # Coverage tracking state
-            cdp_session = None
-
-            def _start_coverage_on_page():
-                nonlocal cdp_session
-                try:
-                    page = env.unwrapped.page
-                    cdp_session = start_coverage(page)
-                except Exception as e:
-                    print(f"  [coverage] Failed to start coverage: {e}")
-                    cdp_session = None
-
-            def _save_step_coverage(global_step: int) -> Path | None:
-                if cdp_session is None:
-                    return None
-                cov_path = coverage_dir / f"step_{global_step:04d}.json"
-                try:
-                    save_coverage(cdp_session, str(cov_path))
-                    return cov_path
-                except Exception as e:
-                    print(f"  [coverage] Save failed at step {global_step}: {e}")
-                    return None
-
-            def _reset_with_timeout(seed=None):
-                _kt = threading.Timer(600, lambda: os.kill(os.getpid(), signal.SIGKILL))
-                _kt.daemon = True
-                _kt.start()
-                try:
-                    result = env.reset(seed=seed)
-                finally:
-                    _kt.cancel()
-                return result
-
-            trajectory: list[dict] = []
-            cumulative_reward = 0.0
-            last_coverage_score = 0
-            history_cov_paths: list[Path] = []
-            episode_idx = 0
-            global_step = 0
-
-            try:
-                obs, info = _reset_with_timeout(seed=seed)
-                _start_coverage_on_page()
-                print(f"  [env] Reset done. Start URL: {target_url}\n")
-
-                for step_idx_in_session in range(max_steps):
-                    print(f"  ── Step {step_idx_in_session + 1}/{max_steps} (ep {episode_idx}) " + "─" * 30)
-                    ts = datetime.now().isoformat()
-
-                    # ── inference ──
-                    result = agent.decide_action(obs, target_url, start_url, max_steps)
-                    action_str = result["action"]
-                    think_str = result["think"]
-                    raw_resp = result["raw_response"]
-                    prompt_str = result["prompt"]
-
-                    # F8: Collect memory snapshot for linear probe
-                    if probe is not None:
-                        probe.add_snapshot(
-                            agent.get_memory_snapshot(),
-                            app_id=app_id_map[app],
-                            step_idx=step_idx_in_session,
-                        )
-
-                    print(f"    think:  {think_str[:120]}{'...' if len(think_str) > 120 else ''}")
-                    print(f"    action: {action_str}")
-
-                    if not action_str:
-                        print("    [WARN] Empty action, inserting noop()")
-                        action_str = "noop()"
-
-                    # ── reset() action: browser reset, memory retained ──
-                    if action_str.strip() == "reset()":
-                        print("    [reset] Browser reset — memory retained across episode boundary.")
-
-                        cov_path = _save_step_coverage(global_step)
-                        cov_artifact = build_coverage_artifact_fields(cov_path)
-
-                        row = {
-                            "step": global_step,
-                            "session_idx": session_idx,
-                            "episode_idx": episode_idx,
-                            "action": action_str,
-                            "think": think_str,
-                            "raw_response": raw_resp,
-                            "prompt": prompt_str,
-                            "reward": 0.0,
-                            "delta_score": 0,
-                            "previous_score": last_coverage_score,
-                            "current_score": last_coverage_score,
-                            "cumulative_reward": cumulative_reward,
-                            "coverage_path": str(cov_path) if cov_path else None,
-                            "target_url": target_url,
-                            "start_url": start_url,
-                            "timestamp": ts,
-                            "episode_boundary": True,
-                        }
-                        trajectory.append(row)
-
-                        before_bytes = _obs_to_bytes(obs, "screenshot")
-                        if before_bytes:
-                            (session_dir / f"step_{step_idx_in_session+1:03d}_before.png").write_bytes(before_bytes)
-
-                        global_step += 1
-                        episode_idx += 1
-                        obs, info = _reset_with_timeout(seed=seed)
-                        _start_coverage_on_page()
-                        print(f"    [reset] Done. Back at: {target_url}")
-                        continue
-
-                    # ── normal step ──
-                    before_bytes = _obs_to_bytes(obs, "screenshot")
-                    if before_bytes:
-                        (session_dir / f"step_{step_idx_in_session+1:03d}_before.png").write_bytes(before_bytes)
-
-                    try:
-                        _kt = threading.Timer(600, lambda: os.kill(os.getpid(), signal.SIGKILL))
-                        _kt.daemon = True
-                        _kt.start()
-                        try:
-                            next_obs, _raw_reward, terminated, truncated, next_info = env.step(action_str)
-                        finally:
-                            _kt.cancel()
-                    except Exception as e:
-                        print(f"    [ERROR] env.step failed: {e}")
-                        cov_path = _save_step_coverage(global_step)
-                        cov_artifact = build_coverage_artifact_fields(cov_path)
-                        row = {
-                            "step": global_step,
-                            "session_idx": session_idx,
-                            "episode_idx": episode_idx,
-                            "action": action_str,
-                            "think": think_str,
-                            "raw_response": raw_resp,
-                            "prompt": prompt_str,
-                            "reward": 0.0,
-                            "delta_score": 0,
-                            "previous_score": last_coverage_score,
-                            "current_score": last_coverage_score,
-                            "cumulative_reward": cumulative_reward,
-                            "coverage_path": str(cov_path) if cov_path else None,
-                            "target_url": target_url,
-                            "start_url": start_url,
-                            "timestamp": ts,
-                            "error": str(e),
-                        }
-                        trajectory.append(row)
-                        if cov_path and cov_path.exists():
-                            history_cov_paths.append(cov_path)
-                        global_step += 1
-                        continue
-
-                    # ── save coverage and compute reward ──
-                    cov_path = _save_step_coverage(global_step)
-                    cov_artifact = build_coverage_artifact_fields(cov_path)
-                    reward_details = _compute_coverage_details(
-                        cov_path,
-                        history_cov_paths,
-                        previous_score=last_coverage_score,
-                    )
-                    if cov_path and cov_path.exists():
-                        history_cov_paths.append(cov_path)
-                    reward = reward_details["reward"]
-                    cumulative_reward += reward
-                    last_coverage_score = int(reward_details.get("current_score", last_coverage_score) or 0)
-
-                    # after-screenshot
-                    after_bytes = _obs_to_bytes(next_obs, "screenshot")
-                    if after_bytes:
-                        (session_dir / f"step_{step_idx_in_session+1:03d}_after.png").write_bytes(after_bytes)
-
-                    print(f"    reward: {reward:+.4f}  Δcov={reward_details.get('delta_score', 0)}"
-                          f"  (cumulative: {cumulative_reward:.4f})")
-
-                    row = {
-                        "step": global_step,
-                        "session_idx": session_idx,
-                        "episode_idx": episode_idx,
-                        "action": action_str,
-                        "think": think_str,
-                        "raw_response": raw_resp,
-                        "prompt": prompt_str,
-                        "reward": reward,
-                        "delta_score": reward_details.get("delta_score", 0),
-                        "previous_score": reward_details.get("previous_score", 0),
-                        "current_score": reward_details.get("current_score", 0),
-                        "cumulative_reward": cumulative_reward,
-                        "coverage_path": str(cov_path) if cov_path else None,
-                        "terminated": terminated,
-                        "truncated": truncated,
-                        "target_url": target_url,
-                        "start_url": start_url,
-                        "timestamp": ts,
-                    }
-                    trajectory.append(row)
-
-                    obs, info = next_obs, next_info
-                    global_step += 1
-
-                    if terminated or truncated:
-                        print("\n    [env] Episode finished early (terminated/truncated).")
-                        break
-
-            finally:
-                env.close()
-
-            # ── save trajectory ──
-            ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-            traj_df = pd.DataFrame(trajectory)
-            traj_path = session_dir / f"trajectory_{app}_{ts_str}.parquet"
-            traj_df.to_parquet(traj_path)
-            print(f"\n  [save] Trajectory: {traj_path}  ({len(traj_df)} rows)")
-
-            session_result = {
-                "app": app,
-                "session_idx": session_idx,
-                "total_reward": cumulative_reward,
-                "num_steps": len(trajectory),
-                "num_episodes": episode_idx + 1,
-                "actions": [t["action"] for t in trajectory],
-                "rewards": [t["reward"] for t in trajectory],
-                "coverage_delta_scores": [t.get("delta_score", 0) for t in trajectory],
-                "trajectory_path": str(traj_path),
-            }
-            all_results.append(session_result)
-            print(f"  Session reward: {cumulative_reward:.4f}")
-
-    # ── save aggregate summary ──
-    summary_path = output_path / "eval_summary.json"
-    summary = {
-        "checkpoint": checkpoint,
-        "model_type": "jamel_compact",
-        "apps": apps,
-        "num_sessions": num_sessions,
-        "max_steps": max_steps,
-        "results": all_results,
-        "timestamp": datetime.now().isoformat(),
-    }
-    summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False))
-    print(f"\n[eval] Summary saved to {summary_path}")
-
-    # Print aggregate results
-    print(f"\n{'='*60}")
-    print("EVALUATION SUMMARY (JAMEL-COMPACT)")
-    print(f"{'='*60}")
-    for result in all_results:
-        print(f"  {result['app']:<20s} session {result['session_idx']}: "
-              f"reward={result['total_reward']:.4f}  steps={result['num_steps']}")
-
-    # F8: Train and evaluate linear probes on collected memory snapshots
     if probe is not None:
         probe_results = probe.train_and_eval()
         probe.print_results(probe_results)
-        # Save probe results
-        probe_path = output_path / "linear_probe_results.json"
+        probe_path = Path(output_dir) / "linear_probe_results.json"
         probe_path.write_text(json.dumps(
-            {str(k): v for k, v in probe_results.items()}, indent=2,
+            {str(key): value for key, value in probe_results.items()}, indent=2,
         ))
         print(f"\n[eval] Linear probe results saved to {probe_path}")
+
+    return results
 
 
 def main():
@@ -697,6 +387,16 @@ def main():
     parser.add_argument("--freeze-memory-init", action="store_true",
                         help="Freeze memory at initial state (ablation: tests "
                              "whether memory writes improve generation)")
+    parser.add_argument("--browser-timeout-ms", type=int, default=30000,
+                        help="Per-page navigation timeout; failed sessions are retried")
+    parser.add_argument("--reset-retries", type=int, default=3,
+                        help="Fresh-browser attempts for each reset")
+    parser.add_argument("--max-input-tokens", type=int, default=8192)
+    parser.add_argument("--max-new-tokens", type=int, default=256)
+    parser.add_argument("--save-screenshots", action="store_true",
+                        help="Save before/after screenshots (uses extra disk and CPU)")
+    parser.add_argument("--enable-linear-probe", action="store_true",
+                        help="Enable the optional memory probe; disabled by default")
     args = parser.parse_args()
 
     # Resolve apps
@@ -746,6 +446,12 @@ def main():
         port=args.port,
         seed=args.seed,
         freeze_memory_init=args.freeze_memory_init,
+        browser_timeout_ms=args.browser_timeout_ms,
+        reset_retries=args.reset_retries,
+        max_input_tokens=args.max_input_tokens,
+        max_new_tokens=args.max_new_tokens,
+        save_screenshots=args.save_screenshots,
+        enable_linear_probe=args.enable_linear_probe,
     )
 
 

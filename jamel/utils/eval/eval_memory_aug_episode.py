@@ -39,6 +39,7 @@ import re
 import signal as _signal
 import sys
 import threading
+import time
 from datetime import datetime
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -136,7 +137,10 @@ class ScaleWoBTask(AbstractBrowserTask):
 
     def __init__(self, seed: int, env_id: str, port: int = 8790,
                  viewport_width: int = 1280, viewport_height: int = 720,
-                 scalewob_root: str | Path | None = None) -> None:
+                 scalewob_root: str | Path | None = None,
+                 timeout: int = 30_000,
+                 navigation_retries: int = 2,
+                 settle_ms: int = 1_000) -> None:
         super().__init__(seed)
         self.env_id = env_id
         self.port = port
@@ -146,7 +150,9 @@ class ScaleWoBTask(AbstractBrowserTask):
         )
         self.viewport = {"width": viewport_width, "height": viewport_height}
         self.slow_mo = 0
-        self.timeout = 15_000
+        self.timeout = max(1_000, int(timeout))
+        self.navigation_retries = max(1, int(navigation_retries))
+        self.settle_ms = max(0, int(settle_ms))
 
     @property
     def start_url(self) -> str:
@@ -163,16 +169,44 @@ class ScaleWoBTask(AbstractBrowserTask):
                 route.continue_()
 
         page.route("**/*", _handle_route)
+        last_error = None
+        for attempt in range(1, self.navigation_retries + 1):
+            try:
+                page.goto(
+                    self.start_url,
+                    wait_until="commit",
+                    timeout=self.timeout,
+                )
+                last_error = None
+                break
+            except Exception as error:
+                last_error = error
+                print(
+                    f"[server] Navigation attempt {attempt}/{self.navigation_retries} "
+                    f"failed for {self.start_url}: {type(error).__name__}: {error}"
+                )
+                if attempt < self.navigation_retries:
+                    try:
+                        page.goto("about:blank", wait_until="commit", timeout=5_000)
+                    except Exception:
+                        pass
+                    time.sleep(0.5 * attempt)
+        if last_error is not None:
+            raise RuntimeError(f"Could not load ScaleWoB app: {self.start_url}") from last_error
+
         try:
-            page.goto(self.start_url, wait_until="load", timeout=self.timeout)
-        except Exception:
-            # Some apps never fire "load" (e.g. dongchedi, zol); fall back to domcontentloaded
-            page.goto(self.start_url, wait_until="domcontentloaded", timeout=self.timeout)
+            page.wait_for_load_state("domcontentloaded", timeout=min(self.timeout, 10_000))
+        except Exception as error:
+            print(
+                f"[server] DOMContentLoaded did not finish for {self.start_url}; "
+                f"continuing with the committed page: {type(error).__name__}: {error}"
+            )
         try:
-            page.wait_for_load_state("networkidle", timeout=self.timeout)
+            page.wait_for_load_state("networkidle", timeout=min(self.timeout, 5_000))
         except Exception:
             pass
-        page.wait_for_timeout(2000)
+        if self.settle_ms:
+            page.wait_for_timeout(self.settle_ms)
 
         goal = f"Explore the {self.env_id} web app to maximize novel JavaScript execution coverage."
         return goal, {"env_id": self.env_id, "start_url": self.start_url}

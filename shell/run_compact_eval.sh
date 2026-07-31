@@ -27,6 +27,12 @@ TEMPERATURE=${TEMPERATURE:-0.8}
 TOP_P=${TOP_P:-0.9}
 GPU_IDS=${GPU_IDS:-}              # e.g. "0" or "1" (empty = all)
 FREEZE_MEMORY_INIT=${FREEZE_MEMORY_INIT:-0}  # F5 ablation: 1=never write memory back
+BROWSER_TIMEOUT_MS=${BROWSER_TIMEOUT_MS:-30000}
+RESET_RETRIES=${RESET_RETRIES:-3}
+MAX_INPUT_TOKENS=${MAX_INPUT_TOKENS:-8192}
+MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-256}
+SAVE_SCREENSHOTS=${SAVE_SCREENSHOTS:-0}
+ENABLE_LINEAR_PROBE=${ENABLE_LINEAR_PROBE:-0}
 
 if [[ ! -d "$CHECKPOINT" ]]; then
     echo "ERROR: Checkpoint not found: $CHECKPOINT" >&2
@@ -38,11 +44,21 @@ if [[ ! -d "$SCALEWOB_ROOT" ]]; then
     exit 2
 fi
 
-EXTRA_ARGS=""
+EXTRA_ARGS=()
 if [[ -n "$APPS" ]]; then
-    EXTRA_ARGS="--apps $APPS"
+    EXTRA_ARGS+=(--apps "$APPS")
 else
-    EXTRA_ARGS="--apps-mode $APPS_MODE"
+    EXTRA_ARGS+=(--apps-mode "$APPS_MODE")
+fi
+OPTIONAL_ARGS=()
+if [[ "$FREEZE_MEMORY_INIT" == "1" ]]; then
+    OPTIONAL_ARGS+=(--freeze-memory-init)
+fi
+if [[ "$SAVE_SCREENSHOTS" == "1" ]]; then
+    OPTIONAL_ARGS+=(--save-screenshots)
+fi
+if [[ "$ENABLE_LINEAR_PROBE" == "1" ]]; then
+    OPTIONAL_ARGS+=(--enable-linear-probe)
 fi
 
 echo "=== JAMEL-COMPACT Evaluation ==="
@@ -54,6 +70,11 @@ echo "  Sessions:     $NUM_SESSIONS"
 echo "  Output:       $EVAL_OUTPUT"
 echo "  GPU:          ${GPU_IDS:-all}"
 echo "  Freeze mem:   ${FREEZE_MEMORY_INIT}"
+echo "  Reset retries: $RESET_RETRIES"
+echo "  Browser ms:   $BROWSER_TIMEOUT_MS"
+echo "  Input tokens: $MAX_INPUT_TOKENS"
+echo "  New tokens:   $MAX_NEW_TOKENS"
+echo "  Linear probe: $ENABLE_LINEAR_PROBE"
 
 # Set CUDA_VISIBLE_DEVICES in the shell BEFORE Python launches.
 if [[ -n "$GPU_IDS" ]]; then
@@ -63,7 +84,7 @@ fi
 
 python -m jamel_compact.eval \
     --checkpoint "$CHECKPOINT" \
-    $EXTRA_ARGS \
+    "${EXTRA_ARGS[@]}" \
     --scalewob-root "$SCALEWOB_ROOT" \
     --max-steps "$MAX_STEPS" \
     --num-sessions "$NUM_SESSIONS" \
@@ -72,5 +93,9 @@ python -m jamel_compact.eval \
     --temperature "$TEMPERATURE" \
     --top-p "$TOP_P" \
     --gpu-ids "$GPU_IDS" \
-    $([[ "$FREEZE_MEMORY_INIT" == "1" ]] && echo "--freeze-memory-init") \
+    --browser-timeout-ms "$BROWSER_TIMEOUT_MS" \
+    --reset-retries "$RESET_RETRIES" \
+    --max-input-tokens "$MAX_INPUT_TOKENS" \
+    --max-new-tokens "$MAX_NEW_TOKENS" \
+    "${OPTIONAL_ARGS[@]}" \
     "$@"

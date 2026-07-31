@@ -23,31 +23,19 @@ from __future__ import annotations
 
 import argparse
 import gc
-import io
-import json
 import os
 import re
-import signal
 import sys
-import threading
-import time
-from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional
 
 from .gpu import configure_cuda_visibility
 
 configure_cuda_visibility()
 
 import numpy as np
-import pandas as pd
 import torch
 from PIL import Image
 
-# ── Coverage imports (same modules as original JAMEL eval) ──
-from jamel.core.env.web.coverage import start_coverage, save_coverage
-from jamel.core.reward.web.utils import compute_monocart_coverage_reward_details
-from jamel.coverage_artifact import build_coverage_artifact_fields
 from .lora import load_lora_adapter, read_lora_adapter_config
 
 
@@ -64,7 +52,14 @@ def _load_baseline_checkpoint(model_class, checkpoint: str, load_kwargs: dict):
         )
 
     model = model_class.from_pretrained(base_model_name, **load_kwargs)
-    model = load_lora_adapter(model, checkpoint, is_trainable=False)
+    try:
+        model = load_lora_adapter(model, checkpoint, is_trainable=False)
+    except Exception:
+        model = None
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        raise
     print(f"[agent] Loaded LoRA adapter over base model {base_model_name}")
     return model, base_model_name
 
@@ -85,33 +80,6 @@ def parse_action(response: str) -> tuple[str, str]:
     action = action_m.group(1).strip().split("\n")[0] if action_m else ""
     think = think_m.group(1).strip() if think_m else ""
     return action, think
-
-
-# ── Helper functions (same pattern as original JAMEL eval) ──
-
-def _obs_to_bytes(obs: dict | None, key: str) -> bytes | None:
-    """Encode screenshot numpy array → PNG bytes."""
-    if obs is None:
-        return None
-    arr = obs.get(key)
-    if arr is None:
-        return None
-    buf = io.BytesIO()
-    Image.fromarray(arr.astype(np.uint8)).save(buf, format="PNG")
-    return buf.getvalue()
-
-
-def _compute_coverage_details(
-    current_path: Path | None,
-    history_paths: list[Path],
-    previous_score: int = 0,
-) -> dict:
-    """Compute reward through the shared Monocart cumulative coverage interface."""
-    return compute_monocart_coverage_reward_details(
-        current_path=current_path,
-        baseline_paths=history_paths,
-        previous_score=previous_score,
-    )
 
 
 # ── Baseline Agent (pure Qwen3-VL, no memory) ──
@@ -142,14 +110,19 @@ class BaselineAgent:
         # Loading to CPU then .to(device) temporarily holds 2× the weights
         # in system RAM. On memory-constrained servers this causes OOM-kill
         # when the browser environment (Chromium) starts afterwards.
-        # device_map={"": device} loads weights straight onto the target GPU.
+        # Keep weights off CPU after loading. With multiple visible GPUs,
+        # distribute the model instead of forcing every layer onto cuda:0.
         _load_kwargs = dict(
             torch_dtype=torch.bfloat16,
             trust_remote_code=True,
             low_cpu_mem_usage=True,
+            offload_state_dict=True,
         )
         if device.startswith("cuda") and torch.cuda.is_available():
-            _load_kwargs["device_map"] = {"": device}
+            if torch.cuda.device_count() > 1:
+                _load_kwargs["device_map"] = "balanced"
+            else:
+                _load_kwargs["device_map"] = {"": device}
 
         adapter_base_model = None
         try:
@@ -159,6 +132,8 @@ class BaselineAgent:
         except Exception as e:
             print(f"[agent] AutoModelForImageTextToText failed ({e}), "
                   f"trying AutoModelForCausalLM...")
+            gc.collect()
+            torch.cuda.empty_cache()
             from transformers import AutoModelForCausalLM
             self.model, adapter_base_model = _load_baseline_checkpoint(
                 AutoModelForCausalLM, checkpoint, _load_kwargs,
@@ -183,29 +158,29 @@ class BaselineAgent:
         gc.collect()
         torch.cuda.empty_cache()
 
-        self.device = torch.device(device)
+        input_embedding = self.model.get_input_embeddings()
+        self.device = next(input_embedding.parameters()).device
         asset_source = checkpoint
         try:
-            self.tokenizer = AutoTokenizer.from_pretrained(
+            self.processor = AutoProcessor.from_pretrained(
                 asset_source, trust_remote_code=True,
             )
-        except Exception:
-            if adapter_base_model is None:
-                raise
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                adapter_base_model, trust_remote_code=True,
-            )
-        try:
-            self.processor = AutoProcessor.from_pretrained(asset_source, trust_remote_code=True)
         except Exception:
             if adapter_base_model is not None:
                 self.processor = AutoProcessor.from_pretrained(
                     adapter_base_model, trust_remote_code=True,
                 )
             else:
-                self.processor = None
-                print("[agent] WARNING: AutoProcessor failed to load from checkpoint. "
-                      "Image processing will not work correctly.")
+                raise RuntimeError(
+                    f"AutoProcessor failed to load from checkpoint: {checkpoint}"
+                )
+        self.tokenizer = getattr(self.processor, "tokenizer", None)
+        if self.tokenizer is None:
+            tokenizer_source = adapter_base_model or asset_source
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                tokenizer_source, trust_remote_code=True,
+            )
+        gc.collect()
 
         self.temperature = temperature
         self.top_p = top_p
@@ -291,12 +266,9 @@ class BaselineAgent:
                     inputs[k] = inputs[k][..., -self.max_input_tokens:]
 
         # ── Generate (standard HF generate, no memory) ──
-        # 180s kill timer (same as original JAMEL eval)
-        _kill_timer = threading.Timer(180, lambda: os.kill(os.getpid(), signal.SIGKILL))
-        _kill_timer.daemon = True
-        _kill_timer.start()
-        try:
-            generated_ids = self.model.generate(
+        # Do not kill the whole evaluator from a background timer.  A slow
+        # generation should be handled by the per-session error boundary.
+        generated_ids = self.model.generate(
                 **inputs,
                 max_new_tokens=self.max_new_tokens,
                 do_sample=self.temperature > 0,
@@ -304,8 +276,6 @@ class BaselineAgent:
                 top_p=self.top_p if self.temperature > 0 else None,
                 pad_token_id=self.tokenizer.pad_token_id or self.tokenizer.eos_token_id,
             )
-        finally:
-            _kill_timer.cancel()
 
         # Decode only the newly generated tokens — batch_decode matches original JAMEL eval
         input_len = inputs["input_ids"].shape[1]
@@ -340,304 +310,40 @@ def run_eval(
     headless: bool = True,
     port: int = 8790,
     seed: int = 42,
+    browser_timeout_ms: int = 30_000,
+    reset_retries: int = 3,
+    max_input_tokens: int = 8192,
+    max_new_tokens: int = 256,
+    save_screenshots: bool = False,
 ):
-    """
-    Run baseline Qwen3-VL evaluation on ScaleWoB apps.
+    """Run baseline Qwen3-VL evaluation with per-session crash recovery."""
+    from .eval_browser import run_browser_evaluation
 
-    For each app, runs `num_sessions` sessions of `max_steps` steps each.
-    No memory is maintained — each step is independent.
-
-    Reward is computed from JS coverage (same as original JAMEL eval), NOT
-    from env.step() reward (which is always 0 for ScaleWoBTask).
-    """
-    from browsergym.core.env import BrowserEnv
-    from jamel.utils.eval.eval_memory_aug_episode import ScaleWoBTask
-
-    output_path = Path(output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
-
-    # Initialize agent once (model stays loaded across all sessions)
     agent = BaselineAgent(
         checkpoint=checkpoint,
         device=device,
         temperature=temperature,
         top_p=top_p,
+        max_input_tokens=max_input_tokens,
+        max_new_tokens=max_new_tokens,
     )
-
-    all_results = []
-
-    for app in apps:
-        print(f"\n{'='*60}")
-        print(f"App: {app}")
-        print(f"{'='*60}")
-
-        target_url = f"http://127.0.0.1:{port}/{app}/index.html"
-        start_url = target_url
-
-        for session_idx in range(num_sessions):
-            print(f"\n  Session {session_idx + 1}/{num_sessions}")
-
-            agent.reset_session()
-
-            # Create browser env with ScaleWoB task
-            env = BrowserEnv(
-                task_entrypoint=ScaleWoBTask,
-                task_kwargs={
-                    "env_id": app,
-                    "port": port,
-                    "viewport_width": 1280,
-                    "viewport_height": 720,
-                    "scalewob_root": scalewob_root,
-                },
-                headless=headless,
-                viewport={"width": 1280, "height": 720},
-            )
-
-            # Per-session output directory and coverage directory
-            session_dir = output_path / app / f"session{session_idx}"
-            coverage_dir = session_dir / "coverage"
-            session_dir.mkdir(parents=True, exist_ok=True)
-            coverage_dir.mkdir(parents=True, exist_ok=True)
-
-            # Coverage tracking state
-            cdp_session = None
-
-            def _start_coverage_on_page():
-                nonlocal cdp_session
-                try:
-                    page = env.unwrapped.page
-                    cdp_session = start_coverage(page)
-                except Exception as e:
-                    print(f"  [coverage] Failed to start coverage: {e}")
-                    cdp_session = None
-
-            def _save_step_coverage(global_step: int) -> Path | None:
-                if cdp_session is None:
-                    return None
-                cov_path = coverage_dir / f"step_{global_step:04d}.json"
-                try:
-                    save_coverage(cdp_session, str(cov_path))
-                    return cov_path
-                except Exception as e:
-                    print(f"  [coverage] Save failed at step {global_step}: {e}")
-                    return None
-
-            def _reset_with_timeout(seed=None):
-                _kt = threading.Timer(600, lambda: os.kill(os.getpid(), signal.SIGKILL))
-                _kt.daemon = True
-                _kt.start()
-                try:
-                    result = env.reset(seed=seed)
-                finally:
-                    _kt.cancel()
-                return result
-
-            trajectory: list[dict] = []
-            cumulative_reward = 0.0
-            last_coverage_score = 0
-            history_cov_paths: list[Path] = []
-            episode_idx = 0
-            global_step = 0
-
-            try:
-                obs, info = _reset_with_timeout(seed=seed)
-                _start_coverage_on_page()
-                print(f"  [env] Reset done. Start URL: {target_url}\n")
-
-                for step_idx_in_session in range(max_steps):
-                    print(f"  ── Step {step_idx_in_session + 1}/{max_steps} (ep {episode_idx}) " + "─" * 30)
-                    ts = datetime.now().isoformat()
-
-                    # ── inference ──
-                    result = agent.decide_action(obs, target_url, start_url, max_steps)
-                    action_str = result["action"]
-                    think_str = result["think"]
-                    raw_resp = result["raw_response"]
-                    prompt_str = result["prompt"]
-
-                    print(f"    think:  {think_str[:120]}{'...' if len(think_str) > 120 else ''}")
-                    print(f"    action: {action_str}")
-
-                    if not action_str:
-                        print("    [WARN] Empty action, inserting noop()")
-                        action_str = "noop()"
-
-                    # ── reset() action: browser reset ──
-                    if action_str.strip() == "reset()":
-                        print("    [reset] Browser reset.")
-
-                        cov_path = _save_step_coverage(global_step)
-                        cov_artifact = build_coverage_artifact_fields(cov_path)
-
-                        row = {
-                            "step": global_step,
-                            "session_idx": session_idx,
-                            "episode_idx": episode_idx,
-                            "action": action_str,
-                            "think": think_str,
-                            "raw_response": raw_resp,
-                            "prompt": prompt_str,
-                            "reward": 0.0,
-                            "delta_score": 0,
-                            "previous_score": last_coverage_score,
-                            "current_score": last_coverage_score,
-                            "cumulative_reward": cumulative_reward,
-                            "coverage_path": str(cov_path) if cov_path else None,
-                            "target_url": target_url,
-                            "start_url": start_url,
-                            "timestamp": ts,
-                            "episode_boundary": True,
-                        }
-                        trajectory.append(row)
-
-                        before_bytes = _obs_to_bytes(obs, "screenshot")
-                        if before_bytes:
-                            (session_dir / f"step_{step_idx_in_session+1:03d}_before.png").write_bytes(before_bytes)
-
-                        global_step += 1
-                        episode_idx += 1
-                        obs, info = _reset_with_timeout(seed=seed)
-                        _start_coverage_on_page()
-                        print(f"    [reset] Done. Back at: {target_url}")
-                        continue
-
-                    # ── normal step ──
-                    before_bytes = _obs_to_bytes(obs, "screenshot")
-                    if before_bytes:
-                        (session_dir / f"step_{step_idx_in_session+1:03d}_before.png").write_bytes(before_bytes)
-
-                    try:
-                        _kt = threading.Timer(600, lambda: os.kill(os.getpid(), signal.SIGKILL))
-                        _kt.daemon = True
-                        _kt.start()
-                        try:
-                            next_obs, _raw_reward, terminated, truncated, next_info = env.step(action_str)
-                        finally:
-                            _kt.cancel()
-                    except Exception as e:
-                        print(f"    [ERROR] env.step failed: {e}")
-                        cov_path = _save_step_coverage(global_step)
-                        cov_artifact = build_coverage_artifact_fields(cov_path)
-                        row = {
-                            "step": global_step,
-                            "session_idx": session_idx,
-                            "episode_idx": episode_idx,
-                            "action": action_str,
-                            "think": think_str,
-                            "raw_response": raw_resp,
-                            "prompt": prompt_str,
-                            "reward": 0.0,
-                            "delta_score": 0,
-                            "previous_score": last_coverage_score,
-                            "current_score": last_coverage_score,
-                            "cumulative_reward": cumulative_reward,
-                            "coverage_path": str(cov_path) if cov_path else None,
-                            "target_url": target_url,
-                            "start_url": start_url,
-                            "timestamp": ts,
-                            "error": str(e),
-                        }
-                        trajectory.append(row)
-                        if cov_path and cov_path.exists():
-                            history_cov_paths.append(cov_path)
-                        global_step += 1
-                        continue
-
-                    # ── save coverage and compute reward ──
-                    cov_path = _save_step_coverage(global_step)
-                    cov_artifact = build_coverage_artifact_fields(cov_path)
-                    reward_details = _compute_coverage_details(
-                        cov_path,
-                        history_cov_paths,
-                        previous_score=last_coverage_score,
-                    )
-                    if cov_path and cov_path.exists():
-                        history_cov_paths.append(cov_path)
-                    reward = reward_details["reward"]
-                    cumulative_reward += reward
-                    last_coverage_score = int(reward_details.get("current_score", last_coverage_score) or 0)
-
-                    after_bytes = _obs_to_bytes(next_obs, "screenshot")
-                    if after_bytes:
-                        (session_dir / f"step_{step_idx_in_session+1:03d}_after.png").write_bytes(after_bytes)
-
-                    print(f"    reward: {reward:+.4f}  Δcov={reward_details.get('delta_score', 0)}"
-                          f"  (cumulative: {cumulative_reward:.4f})")
-
-                    row = {
-                        "step": global_step,
-                        "session_idx": session_idx,
-                        "episode_idx": episode_idx,
-                        "action": action_str,
-                        "think": think_str,
-                        "raw_response": raw_resp,
-                        "prompt": prompt_str,
-                        "reward": reward,
-                        "delta_score": reward_details.get("delta_score", 0),
-                        "previous_score": reward_details.get("previous_score", 0),
-                        "current_score": reward_details.get("current_score", 0),
-                        "cumulative_reward": cumulative_reward,
-                        "coverage_path": str(cov_path) if cov_path else None,
-                        "terminated": terminated,
-                        "truncated": truncated,
-                        "target_url": target_url,
-                        "start_url": start_url,
-                        "timestamp": ts,
-                    }
-                    trajectory.append(row)
-
-                    obs, info = next_obs, next_info
-                    global_step += 1
-
-                    if terminated or truncated:
-                        print("\n    [env] Episode finished early (terminated/truncated).")
-                        break
-
-            finally:
-                env.close()
-
-            # ── save trajectory ──
-            ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-            traj_df = pd.DataFrame(trajectory)
-            traj_path = session_dir / f"trajectory_{app}_{ts_str}.parquet"
-            traj_df.to_parquet(traj_path)
-            print(f"\n  [save] Trajectory: {traj_path}  ({len(traj_df)} rows)")
-
-            session_result = {
-                "app": app,
-                "session_idx": session_idx,
-                "total_reward": cumulative_reward,
-                "num_steps": len(trajectory),
-                "num_episodes": episode_idx + 1,
-                "actions": [t["action"] for t in trajectory],
-                "rewards": [t["reward"] for t in trajectory],
-                "coverage_delta_scores": [t.get("delta_score", 0) for t in trajectory],
-                "trajectory_path": str(traj_path),
-            }
-            all_results.append(session_result)
-            print(f"  Session reward: {cumulative_reward:.4f}")
-
-    # ── save aggregate summary ──
-    summary_path = output_path / "eval_summary.json"
-    summary = {
-        "checkpoint": checkpoint,
-        "model_type": "baseline_qwen3vl_sft",
-        "apps": apps,
-        "num_sessions": num_sessions,
-        "max_steps": max_steps,
-        "results": all_results,
-        "timestamp": datetime.now().isoformat(),
-    }
-    summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False))
-    print(f"\n[eval] Summary saved to {summary_path}")
-
-    # Print aggregate results
-    print(f"\n{'='*60}")
-    print("BASELINE EVALUATION SUMMARY (Pure Qwen3-VL SFT)")
-    print(f"{'='*60}")
-    for result in all_results:
-        print(f"  {result['app']:<20s} session {result['session_idx']}: "
-              f"reward={result['total_reward']:.4f}  steps={result['num_steps']}")
+    return run_browser_evaluation(
+        agent=agent,
+        checkpoint=checkpoint,
+        apps=apps,
+        scalewob_root=scalewob_root,
+        max_steps=max_steps,
+        num_sessions=num_sessions,
+        output_dir=output_dir,
+        headless=headless,
+        port=port,
+        seed=seed,
+        model_type="baseline_qwen3vl_sft",
+        summary_title="BASELINE EVALUATION SUMMARY (Pure Qwen3-VL SFT)",
+        browser_timeout_ms=browser_timeout_ms,
+        reset_retries=reset_retries,
+        save_screenshots=save_screenshots,
+    )
 
 
 def main():
@@ -657,6 +363,14 @@ def main():
     parser.add_argument("--seed", type=int, default=42, help="Random seed for env.reset()")
     parser.add_argument("--no-headless", action="store_true")
     parser.add_argument("--gpu-ids", default="", help="Comma-separated GPU IDs (e.g. '0' or '0,1')")
+    parser.add_argument("--browser-timeout-ms", type=int, default=30000,
+                        help="Per-page navigation timeout; failed sessions are retried")
+    parser.add_argument("--reset-retries", type=int, default=3,
+                        help="Fresh-browser attempts for each reset")
+    parser.add_argument("--max-input-tokens", type=int, default=8192)
+    parser.add_argument("--max-new-tokens", type=int, default=256)
+    parser.add_argument("--save-screenshots", action="store_true",
+                        help="Save before/after screenshots (uses extra disk and CPU)")
     args = parser.parse_args()
 
     # Resolve apps
@@ -684,7 +398,7 @@ def main():
 
     print(f"[eval] Apps: {apps}")
     print(f"[eval] Checkpoint: {args.checkpoint}")
-    print(f"[eval] Model type: baseline (pure Qwen3-VL SFT, no memory)")
+    print("[eval] Model type: baseline (pure Qwen3-VL SFT, no memory)")
     print(f"[eval] Max steps: {args.max_steps}")
     print(f"[eval] Sessions: {args.num_sessions}")
     visible_gpu_ids = os.environ.get("CUDA_VISIBLE_DEVICES", "")
@@ -706,6 +420,11 @@ def main():
         headless=not args.no_headless,
         port=args.port,
         seed=args.seed,
+        browser_timeout_ms=args.browser_timeout_ms,
+        reset_retries=args.reset_retries,
+        max_input_tokens=args.max_input_tokens,
+        max_new_tokens=args.max_new_tokens,
+        save_screenshots=args.save_screenshots,
     )
 
 

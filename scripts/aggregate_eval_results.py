@@ -102,6 +102,7 @@ def load_aggregate_results(folder_path):
             "env_id": entry.get("app"),
             "cumulative_reward": entry.get("total_reward"),
             "session_idx": entry.get("session_idx"),
+            "status": entry.get("status"),
         })
     return {"per_app": per_app, "source_path": new_path}
 
@@ -137,6 +138,11 @@ def collect_rewards_by_app(folders):
 
             env_id = app_info.get("env_id")
             cumulative_reward = app_info.get("cumulative_reward")
+            if app_info.get("status") == "failed":
+                skipped_entries.append(
+                    f"{data['source_path']} entry {entry_idx}: eval session failed"
+                )
+                continue
             if not isinstance(env_id, str) or not env_id.strip():
                 skipped_entries.append(f"{data['source_path']} entry {entry_idx}: 缺少 app/env_id")
                 continue

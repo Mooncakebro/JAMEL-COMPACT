@@ -175,7 +175,17 @@ def compute_monocart_coverage_reward_details(
 
 
 def _coverage_report_output_dir(resolved_paths: list[str]) -> Path:
-    digest = hashlib.sha256("\0".join(resolved_paths).encode("utf-8")).hexdigest()[:16]
+    fingerprints = []
+    for resolved_path in resolved_paths:
+        path = Path(resolved_path)
+        try:
+            stat = path.stat()
+            fingerprints.append(
+                f"{resolved_path}\0{stat.st_size}\0{stat.st_mtime_ns}"
+            )
+        except OSError:
+            fingerprints.append(resolved_path)
+    digest = hashlib.sha256("\0".join(fingerprints).encode("utf-8")).hexdigest()[:16]
     last_file_stem = Path(resolved_paths[-1]).stem or "coverage"
     return REPO_ROOT / "data" / "coverage-report" / f"{last_file_stem}_{digest}"
 
@@ -229,8 +239,28 @@ def generate_cumulative_coverage_summary(coverage_paths: tuple[str, ...]) -> dic
                 )
                 if npm_root.returncode == 0 and npm_root.stdout.strip():
                     env["NODE_PATH"] = npm_root.stdout.strip()
+            command = [
+                "node",
+                str(GENERATE_REPORT_SCRIPT),
+                "--output-dir",
+                str(output_dir),
+                "--summary-only",
+            ]
+            if len(resolved_paths) > 1:
+                previous_output_dir = _coverage_report_output_dir(resolved_paths[:-1])
+                previous_istanbul = previous_output_dir / "coverage-final.json"
+                if previous_istanbul.is_file():
+                    command.extend([
+                        "--baseline-istanbul",
+                        str(previous_istanbul),
+                        resolved_paths[-1],
+                    ])
+                else:
+                    command.extend(resolved_paths)
+            else:
+                command.extend(resolved_paths)
             subprocess.run(
-                ["node", str(GENERATE_REPORT_SCRIPT), "--output-dir", str(output_dir), *resolved_paths],
+                command,
                 cwd=str(REPO_ROOT),
                 check=True,
                 capture_output=True,

@@ -148,27 +148,27 @@ Design Philosophy — What Makes a Memory "Good"?
 
 - 常见答案：**对决策有用** —— 优化动作 ≈ 优化记忆（$\mathcal{L}_{act}$）
   → 必要但不充分：只服务下一步动作的"投机特征"，无法跨步积累
-- 我们的三个判据（**按记忆生命周期排序：形态 → 更新 → 使用**，与模块①②③一一对应）：
-  1. **Faithful**：固定容量下忠实压缩历史（→ 形态）
-  2. **Predictive**：给定动作 $a_t$，能**预期**下一帧观测 $O_{t+1}$（→ 更新）
-  3. **Useful**：被决策真正消费（→ 使用）
+- 我们的三个判据：
+  1. **Faithful**：固定容量下忠实压缩历史
+  2. **Predictive**：给定动作 $a_t$，能**预期**下一帧观测 $O_{t+1}$
+  3. **Useful**：被决策真正消费
 - 桥接方法（判据如何推出性质）：对每个判据问一句 **"什么情况算违反它？"** —— 违反的方式，就是它强加的工程约束：
 
-| 判据 | "违反它长什么样" ⟹ 推导 | 兑现的性质（页 2 评分表） | 落成的模块 |
+| 判据 | "违反它长什么样" ⟹ 推导 | 兑现的性质（页 2 评分表） | 落成的模块（按流水线 ①→②→③） |
 |---|---|---|---|
-| **Faithful** | bank 涨爆后截断（JAMEL）、或被剪枝删除（SnapKV）= 不忠实 ⟹ 形态本身必须有界 | 【固定容量】 | ① Compact State Formation |
-| **Predictive** | 预期必然有时出错；**错了却不知道**比没有预期更危险 ⟹ "信记忆还是信观测"必须可计算 ⟹ $K=\hat P/(\hat P+R)$，且只写预期之差 | 【$O(1)$ 更新】【按需查询】【按需遗忘】 | ② Anticipate–Correct Update |
+| **Predictive** | 预期必然有时出错；**错了却不知道**比没有预期更危险 ⟹ 需要显式预期 + "信谁"可计算 ⟹ $K=\hat P/(\hat P+R)$ | 【按需查询】【按需遗忘】 | ① Predict（预期产生）+ ② Correct（预期校验） |
+| **Faithful** | bank 涨爆后截断（JAMEL）、或被剪枝删除（SnapKV）= 不忠实 ⟹ 形态有界（前提）+ 写入最小代价（只写意外） | 【固定容量】【$O(1)$ 更新】 | 有界形态（页 6 交代）+ ② Correct 残差写入 |
 | **Useful** | 记忆不被读（v1 推理旁路）或读了毁掉基座 = 没用 ⟹ 注入必须可门控、零初始化 | 训练-推理一致 | ③ Zero-Born Steering |
 
-- Predictive 内部为何再分 Predict / Correct 两步：先显式预期（动作作控制量），再**只按"意外"校正** —— 解耦是为了让校正只响应预测之外的新息 $\Delta M$，这正是 $O(1)$ 残差更新的来源。
-- 为什么监督落在预测步：$\mathcal{L}_{act}$ 只担保 Useful（还会学成投机特征）；**Predictive 判据它管不到** ⟹ $\mathcal{L}_{obs}$ 强迫记忆学会预期；置信度的"声称"要兑现 ⟹ $\mathcal{L}_{nll}$ 校准。
-- 点睛句：**Faithful 决定记忆长什么样，Predictive 决定记忆怎么动，Useful 决定记忆怎么用——三个判据各管一段生命周期，三个模块各兑现一个判据。**
+- 模块①②是 Predictive 的一体两面：先显式预期（动作作控制量），再**只按"意外"校正** —— 解耦让校正只响应预测之外的新息 $\Delta M$，这正是 $O(1)$ 残差更新的来源；② 的残差写入同时兑现 Faithful 的写入要求。
+- 损失各有归属（页 7-9 页顶标注）：$\mathcal{L}_{obs}$ 监督①的预测质量；$\mathcal{L}_{nll}$ 校准②的 $R$；$\mathcal{L}_{mem}$ 约束②产出的 $M'$；$\mathcal{L}_{act}$ 是③注入通路的唯一主流监督。
+- 点睛句：**先预期、再对账、后导引——Predictive 驱动①②，Faithful 沉淀在②的残差里，Useful 落地在③。**
 
 **金句（页底居中）**
 > 我们不为"记住过去"而设计记忆，而为"预期未来"而设计记忆 —— **记忆即世界模型**。
 
 **转场句**
-> "这套哲学落到架构上，就是一张数据流图——三个模块已经按'形态、更新、使用'在图上各就各位。"
+> "这套哲学落到架构上，就是层内三步流水线：Predict → Observe+Correct → Inject。"
 
 **图来源**
 - AI prompt（三柱图）：
@@ -182,100 +182,114 @@ Design Philosophy — What Makes a Memory "Good"?
 Overview — One Pass Through COMPACT
 
 **文案**
-- 每步输入：指令 + 当前观测（+上一步动作 $a_{t-1}$）→ 上下文恒定 $O(1)$
-- 每层解码器外挂侧边记忆，三模块按判据各就各位：
-  - **① Compact State Formation** — 记忆长什么样（兑现 **Faithful** →【固定容量】）
-  - **② Anticipate–Correct Update** — 记忆怎么动（兑现 **Predictive** →【$O(1)$ 更新】【按需查询】【按需遗忘】）
-  - **③ Zero-Born Steering** — 记忆怎么用（兑现 **Useful** → 训练-推理一致）
+- 每步输入：指令 + 当前观测（+上一步动作 $a_{t-1}$，独立 side 输入）→ 上下文恒定 $O(1)$
+- 每层解码器外挂侧边记忆（固定 16 槽，**有界形态是 Faithful 的前提**），层内三步流水线：
+  - **① Anticipative Transition（预期式状态转移）** — 状态怎么转移：动作作控制输入，先"预期"世界（Predictive 前半，引入 $P$ 轨，$\mathcal{L}_{obs}$）
+  - **② Calibrated Memory Update（校准式记忆更新）** — 观测怎么入账：与预期对账、按置信度残差写入（Predictive 后半 + Faithful，$\mathcal{L}_{nll}$、$\mathcal{L}_{mem}$）
+  - **③ Zero-Born Steering（零起点记忆导引）** — 记忆怎么用：导引向量注入，零初始化（Useful，$\mathcal{L}_{act}$）
 - $(M_t, P_t, e_t)$ 跨步携带；动作由记忆条件化生成（KV-cache 预填充）
 
 **转场句**
-> "接下来三页按判据顺序各放大一个模块——页顶灰字标明它兑现哪个判据、哪几条性质。"
+> "接下来三页按层内计算顺序（Predict → Observe+Correct → Inject）各放大一步，页顶灰字标明兑现的判据与相关损失。"
 
 **图来源**
 - draw.io：`docs/compact_v2/method_overall_dataflow.drawio`（整体数据流，①②③ zoom 徽章已标注；含跨步携带回路、动作反馈回路、总损失条）
+- token 级细节图：`docs/compact_v2/layer_l_token_flow.drawio`（序列分段 + 掩码 + 层内五步，见附录页 11）
 - 可参考：`docs/compact_v2/fig3_session_loop_v2.png`（session loop 现成图）
 
 ---
 
-## 页 7：模块 ① Compact State Formation（紧致记忆形态）
+## 页 7：模块 ① Anticipative Transition（预期式状态转移，4a Predict）
 
-**页顶回扣行（灰字）**：兑现判据 **Faithful** → 性质【固定容量】（记忆"长什么样"）
+**页顶回扣行（灰字）**：兑现判据 **Predictive（前半：预期的产生）**；引入不确定度轨 $P$；相关损失 $\mathcal{L}_{obs}$
 
 **挑战**（引用页 4 的具体缺陷）
-append 式（JAMEL）bank 线性增长、溢出即截断；剪枝式（SnapKV）直接删除历史 —— 形态本身无界、或可被外力破坏，"忠实"无从谈起
+append 式记忆（JAMEL）只是"过去的堆积"：不知道"我做了什么、世界因此变成什么样" —— 无因果、无预期；无条件的 RNN 转移则让动作与状态演化脱钩
 
-**我们的方法**
-把记忆做成一个**天生有界、不受外力裁剪**的压缩状态：
-- 每层外挂固定 **16 槽 × 512 维**内容轨 $M_l$，bank 大小与步数无关
-- 可学习初始化 $\sim\mathcal{N}(0, 0.02^2)$：从零学起但不随机扰动主干
-- 逐层挂载 + 层级化分工：浅层记 UI 细节，深层记任务逻辑
-- 参数开销 ≈12%（2B）/ ≈6%（8B）
+**我们的方法**：动作条件下的先验状态推演（action-conditioned prior transition）
+
+1. **动作条件化的状态转移**：上一步动作经独立嵌入通路（side input，不进入主序列）生成控制向量，以 FiLM 调制 GRU 完成先验推演 $\hat M = \mathrm{GRU}(W_a a_\downarrow,\ \gamma \odot M + \beta)$，$\hat M\ [B,16,512]$ —— 显式建立"动作 → 状态演化"的因果联系
+   ↩ 回应"动作与状态演化脱钩"
+2. **不确定度的同步推演**：逐槽方差轨 $P$ 与内容轨联合更新，$\hat P = \sigma(\lambda_l)\odot P + \mathrm{softplus}(Q_\theta(a_\downarrow)) + \gamma_e \bar e$；含层级化时间常数（浅 0.70 / 中 0.85 / 深 0.95）与 surprise 反馈项，使预测置信度成为可计算量
+   ↩ 回应"无因果、无预期"
+3. **预测能力的显式监督**：观测预测头 $\hat Z = g_\phi(\bar{\hat M})$ 以 $\mathcal{L}_{obs}$ 直接优化；预测残差定义为 surprise $e = \|\hat Z - \bar Z_t\|^2$，并反馈驱动下一步的不确定度膨胀
+   ↩ 预测能力不依赖 $\mathcal{L}_{act}$ 间接获得
 
 **一句话**
-形态本身有界，忠实才有可能。
+状态转移由动作显式驱动，且其预测质量受到直接监督 —— 记忆由此具备"预期"的语义。
 
 **转场句**
-> "形态只回答了'装得下'。静止的记忆还不是世界模型——它必须每步向前'动'，而且要会预期。"
+> "预期有了，接下来让真实观测进场——和预期对账。"
 
 **图来源**
-- draw.io：`docs/compact_v2/method_modules_zoom.drawio` 第 1 页（locator 红框 + 内容轨与层级化分工；$P$ 轨不在此页，留给模块②按需引入）
+- draw.io：`docs/compact_v2/method_modules_zoom.drawio` 第 1 页（locator 红圈标 Predict + FiLM-GRU / $P$ 轨 / $\mathcal{L}_{obs}$ 细节）
 - AI prompt（split-view zoom 图，备选）：
-  > Split-view academic diagram. Left: a small simplified overview of a transformer stack with a side memory box highlighted by a red zoom circle. Right: magnified detail of the side memory: a fixed rack with exactly 16 glowing slots labeled "fixed 16-slot content track M", with a "bounded by design" badge; shallow-layer slots hold small UI-element icons, deep-layer slots hold goal/chess icons. Flat vector, white background, blue/green palette, minimal text.
+  > Split-view academic diagram. Left: small overview of a transformer layer with the state-transition step highlighted by a red zoom circle. Right: magnified view of an "anticipation" module: a mouse-click action icon enters as a control knob (FiLM) on a GRU gear, rolling a memory rack (16 slots) forward into a dashed "predicted" state; beside it a row of small gauge icons labeled "uncertainty track P" inflating after a spark labeled "surprise e". Flat vector, white background, blue/orange palette, minimal text.
 
 ---
 
-## 页 8：模块 ② Anticipate–Correct Update（预期-校正更新）
+## 页 8：模块 ② Calibrated Memory Update（校准式记忆更新，4c Observe + 4d Correct）
 
-**页顶回扣行（灰字）**：兑现判据 **Predictive** → 性质【$O(1)$ 更新】【按需查询】【按需遗忘】（记忆"怎么动"）
+**页顶回扣行（灰字）**：兑现 **Predictive（后半：校正）+ Faithful（残差写入）** → 性质【$O(1)$ 更新】【按需查询】【按需遗忘】；相关损失 $\mathcal{L}_{nll}$、$\mathcal{L}_{mem}$
 
 **挑战**
-好记忆必须能预期未来；但预期**必然有时出错** —— 一个会预期却没有置信度的系统，比没有预期更危险（错误记忆污染决策）。"这一步该不该改记忆、改多少"必须可计算
+观测如何进记忆？v1 退化成单向量 mean（16 槽收到同一更新，秩-1）；JAMEL 全量 attend（成本随 $t$ 膨胀）—— 共同病根：写入无选择、无量化依据
 
-**我们的方法**
-先预期，再按置信度校正；只对"意外"更新：
-- **引入不确定度轨 $P$**（按需出场）：逐槽方差，$P_0 = 0.5$，全程可学习 —— 预期会错，所以需要一杆秤
-- **Predict**（动作作控制量）：$\hat M = \mathrm{GRU}(W_a a_\downarrow,\; \gamma \odot M + \beta)$，$\hat P = \lambda \odot P + \mathrm{softplus}(W_q a_\downarrow) + \gamma_e \bar e$
-- **Observe**：掩码 AttnPool（$k{=}4$ queries）$\to Z_t$
-- **Correct**：$\Delta M = \mathrm{CrossAttn}(\hat M, Z_t)$，$K = \dfrac{\hat P}{\hat P + R}$，$M \leftarrow \hat M + K \odot \Delta M$，$P \leftarrow (1-K)\hat P$
-- **监督落在预测步**（兑现哲学页的承诺）：$\mathcal{L}_{obs}$ 让记忆学会预期；$\mathcal{L}_{nll}$ 校准 $R$；surprise $e_t$ 闭环反馈下一步 $\hat P$
+**我们的方法** —— *"Write only the surprise：对账式写入"*
+
+1. **只看该看的**：$k{=}4$ 个可学习 query 对 prompt 位做掩码 AttnPool，把当前观测萃取为 $Z_t\ [B,4,512]$ —— 排除 response：记忆不许偷看答案
+   ↩ 回应"秩-1 退化"：$k>1$，16 槽各自收到不同的修正
+2. **只记意外的**：新息 $\Delta M = \mathrm{CrossAttn}(\hat M, Z_t)$ 经增益 $K = \hat P/(\hat P{+}R)$ 按比例入账 —— $M' = \hat M + K\odot\Delta M$，$P' = (1-K)\hat P$
+   ↩ 回应"写入无选择、无量化依据"：改不改、改多少，由 $\hat P$ 与 $R$ 的博弈显式决定
+3. **让置信度兑现**：$\mathcal{L}_{nll}$ 强迫 $R$ 对齐真实误差，$\mathcal{L}_{mem}$ 保持 $M'$ 有界
+   ↩ 信任机制是训练出来的，不是手调规则
+4. **该稳则稳，该变则变**：平稳期 $K$ 小、观测只润色；界面突变时 surprise 顶高 $\hat P$、$K \to 0.93$ 瞬间重写
+   ↩ 评分表【按需查询】【按需遗忘】的落地形态
 
 **一句话**
-界面突变 → $e$ 飙升 → $\hat P$ 膨胀 → $K$ 跳到 0.93 → 新观测瞬间重写记忆。
+差额入账，比例由置信度说了算。
+
+**备询 Q&A**（大概率被问，可放附录）
+- **Q：$P$ 大 → $K$ 大？** A：对，$K=\hat P/(\hat P+R)$ 随 $\hat P$ 单调增 —— $\hat P$ 大 = 不信预测 → 多信观测。但 $K$ 是 $\hat P$ 与 $R$ 的**相对博弈**：观测噪声大时 $K$ 同样被压低。更新后 $P'=(1-K)\hat P$ 收缩（"刚校对过，比较有把握"），下一步 Predict 再经 $Q(a)$ 与 surprise 膨胀 —— 收缩-膨胀呼吸循环，见 `fig2_kf_dynamics_v2.png`。
+- **Q：层级化 $\lambda<1$，$P$ 每步衰减，与"久不观测则越不确定"矛盾吗？** A：不矛盾。$\hat P=\sigma(\lambda)P + \mathrm{softplus}(Q_\theta(a)) + \gamma_e\bar e$ 是 stable-KF 形式（收缩型转移 $FPF^\top{+}Q$，$\|F\|{<}1$）：GRU 有界激活使转移本身收缩，$\lambda$ 管"旧方差多快失效"（时间常数：浅层快 / 深层慢），"增长"由显式的 $Q(a)$ 与 surprise 反馈承担。若想要"久不观测单调增"，应改 $Q$ 项而非把 $\lambda$ 放到 1 以上（破坏稳定性）。$\lambda$ 可学习，层级值只是初始化。
 
 **转场句**
-> "记忆会动了，最后一步是让它回到主干、参与决策——而且不能碰坏预训练模型。"
+> "记忆更新完毕，最后一步是让它回到主干参与决策——而且不能碰坏预训练模型。"
 
 **图来源**
-- draw.io：`docs/compact_v2/method_modules_zoom.drawio` 第 2 页（locator 红圈标预测-校正循环；含 $P$ 轨引入 + 四步公式流）
+- draw.io：`docs/compact_v2/method_modules_zoom.drawio` 第 2 页（locator 红圈标 Observe+Correct + 掩码 / Kalman / 损失细节）
 - 现成仿真图：`docs/compact_v2/fig2_kf_dynamics_v2.png`（界面突变时 $K$ 跳至 0.93 再回落 —— 优先用真图）
 - AI prompt（split-view zoom 图，备选）：
-  > Split-view academic diagram. Left: small overview of the architecture with the memory-update cycle highlighted by a red zoom circle. Right: magnified circular flow with four stations — "Predict" (clock icon rolling a memory ball forward with a mouse-click arrow), "Observe" (eye icon reading the current screenshot), "Correct" (two arrows merging: prediction vs observation, a delta symbol between them, a dial labeled "gain K" controlled by a small scale icon labeled "uncertainty P"), and a "surprise e" spark icon feeding back to Predict. Flat vector, white background, blue/orange palette, minimal text.
+  > Split-view academic diagram. Left: small overview with the observe-and-correct step highlighted by a red zoom circle. Right: magnified view of an accounting scene: an eye icon (4 query tokens) reads the current screen into "observation Z", then a balance scale compares "prediction" vs "observation", the difference (delta) flows through a valve labeled "gain K = P/(P+R)" into the memory rack; a small gauge labeled "R, calibrated by NLL". Flat vector, white background, blue/green palette, minimal text.
 
 ---
 
-## 页 9：模块 ③ Zero-Born Steering（零起点记忆导引）
+## 页 9：模块 ③ Zero-Born Steering（零起点记忆导引，4e Inject）
 
-**页顶回扣行（灰字）**：兑现判据 **Useful** → 训练-推理一致（记忆"怎么用"；统一模型，呼应标题页）
+**页顶回扣行（灰字）**：兑现判据 **Useful** → 训练-推理一致；相关损失 $\mathcal{L}_{act}$
 
 **挑战**
 外挂记忆通路若随机初始化，第 0 步就扰动预训练模型；v1 甚至在推理时把记忆整体丢弃
 
-**我们的方法**
-记忆以 steering vector 方式被"按需查询"，从零出生、无损起步：
-- 注入即查询：$H = h + w_l \tanh(g_l)\, W_\uparrow\, \mathrm{CrossAttn}(Q{=}h_\downarrow,\, K,V{=}M)$
-- **零初始化** $W_\uparrow{=}0$ + 小门控 $g_l{=}0.1$ ⟹ 第 0 步 ≡ 预训练 LLM，梯度立即可训
-- 层级权重 $w_l$：浅层 0.8（细节）→ 深层 0.3（保留推理）
-- 推理闭环：记忆增强前向 → KV-cache 预填充 → 增量解码，动作**真正以记忆为条件**
+**我们的方法** —— *"Born zero, steer on demand：从零出生，按需导引"*
+
+1. **从零出生**：$W_\uparrow{=}0$ 零初始化 + 小门控 $g_l{=}0.1$ —— 第 0 步 ≡ 预训练 LLM，梯度却立即可训（$\tanh(g_l)\neq 0$）
+   ↩ 回应"扰动预训练模型"
+2. **按需导引**：记忆经 Cross-Attn 作为 steering vector 注入主干 —— $H = h + w_l \tanh(g_l)\, W_\uparrow\, \mathrm{CrossAttn}(Q{=}h_\downarrow,\, K,V{=}M)$；浅层强（0.8）深层弱（0.3）
+   ↩ 与页 7 的层级 $\lambda_l$ 首尾呼应：浅层管"看得清"，深层管"记得住"
+3. **全程在线**：推理时记忆增强前向 → KV-cache 预填充 → 增量解码，动作真正以记忆为条件
+   ↩ 回应"v1 推理丢弃记忆"：训练-推理一致，通路端到端闭环
+4. **一个目标收尾**：response 段 $\mathcal{L}_{act}$ 是注入通路的唯一主流监督；零起步保证它从"无害"开始学
+   ↩ Useful 判据的最终兑现
 
 **一句话**
 记忆不是硬拼接的上下文，而是可查询、可门控、从零长起的导引信号。
 
 **转场句**
-> "三模块合起来，Faithful、Predictive、Useful 各就各位，评分表全绿。但全绿不是嘴上说的——看实验。"
+> "三步合起来：先预期、再对账、后导引——Faithful、Predictive、Useful 各就各位。但全绿不是嘴上说的——看实验。"
 
 **图来源**
-- draw.io：`docs/compact_v2/method_modules_zoom.drawio` 第 3 页（locator 红箭头标注入通路 + 公式与推理闭环）
+- draw.io：`docs/compact_v2/method_modules_zoom.drawio` 第 3 页（locator 红箭头标注入通路 + 公式 / 推理闭环 / $\mathcal{L}_{act}$）
 - AI prompt（split-view zoom 图，备选）：
   > Split-view academic diagram. Left: small overview of the architecture with the injection arrow from memory into the transformer highlighted by a red zoom circle. Right: magnified view of the injection gate — a memory bank feeding through a faucet/valve icon labeled "learnable gate, zero at birth" into the main hidden-state stream as a steering current bending the flow; a small badge reads "step 0 = pretrained model". Flat vector, white background, purple/orange palette, minimal text.
 
@@ -298,12 +312,33 @@ append 式（JAMEL）bank 线性增长、溢出即截断；剪枝式（SnapKV）
 
 ---
 
+## 页 11（附录）：Token 级流程图（被追问实现细节时用）
+
+**标题**
+Appendix — Layer $l$ Token-level I/O Flow
+
+**内容要点**
+- 主序列 7 段解剖（指令+axtree / 图像 / 格式尾 / response）+ 两条掩码行（labels / obs_mask）
+- 层内五步 4a→4e 与张量形状（$H[B,N,2048]$、$M[B,16,512]$、$Z_t[B,4,512]$）
+- 损失作用位置（$\mathcal{L}_{act}$ 只算 response 段；$\mathcal{L}_{obs}$/$\mathcal{L}_{nll}$ 每层均值）
+
+**三个常见理解纠偏**（观众常问）：
+1. $a_{t-1}$ **不在序列里** —— 独立 side input（tokenize ≤32 → mean-pool + Linear → a_emb），只喂 Predict
+2. 记忆 token **从不拼进主序列** —— $M, P$ 是 per-layer side 张量，经 Cross-Attn 交互
+3. obs 池化覆盖**整个 prompt 段**（指令 + axtree + 图像），不只图像；response 段被排除（记忆不许偷看答案）
+
+**图来源**
+- draw.io：`docs/compact_v2/layer_l_token_flow.drawio`
+
+---
+
 ## 附：绘图资源索引
 
 | 资源 | 路径 |
 |---|---|
 | 整体数据流（页 6） | `docs/compact_v2/method_overall_dataflow.drawio` |
-| 三页 zoom 详图（页 7-9） | `docs/compact_v2/method_modules_zoom.drawio`（一个文件三页，底部切页签） |
+| 三页 zoom 详图（页 7-9：Predict / Observe+Correct / Inject） | `docs/compact_v2/method_modules_zoom.drawio`（一个文件三页，底部切页签） |
+| token 级流程图（页 11 附录） | `docs/compact_v2/layer_l_token_flow.drawio` |
 | 三形态分类图（页 3） | `docs/compact_v2/slide2_memory_taxonomy.drawio` |
 | latent 路线对比图（页 4） | `docs/compact_v2/slide3_latent_memory_compare.drawio` |
 | KF 动力学仿真（页 8/10） | `docs/compact_v2/fig2_kf_dynamics_v2.png` |
