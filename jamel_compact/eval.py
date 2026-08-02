@@ -32,6 +32,7 @@ import torch
 from PIL import Image
 
 from .model import JAMELCompactWrapper
+from .eval_reservation import reserve_eval_run
 
 # F8: Linear probe for memory diagnostics
 import sys as _sys
@@ -380,7 +381,8 @@ def main():
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--temperature", type=float, default=0.8)
     parser.add_argument("--top-p", type=float, default=0.9)
-    parser.add_argument("--port", type=int, default=8790, help="Port for ScaleWoB static server")
+    parser.add_argument("--port", type=int, default=0,
+                        help="ScaleWoB server port; 0 automatically reserves a free port")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for env.reset()")
     parser.add_argument("--no-headless", action="store_true")
     parser.add_argument("--gpu-ids", default="", help="Comma-separated GPU IDs (e.g. '0' or '0,1')")
@@ -422,37 +424,48 @@ def main():
             apps = ["vipshop", "alibaba", "expedia", "taobao", "pinduoduo",
                     "dongchedi", "youku", "keep", "meituan", "temu"]
 
+    try:
+        run_reservation = reserve_eval_run(args.port, args.eval_output)
+    except (OSError, RuntimeError, ValueError) as error:
+        print(f"[eval] ERROR: {error}", file=sys.stderr)
+        sys.exit(2)
+    args.port = run_reservation.port
+
     print(f"[eval] Apps: {apps}")
     print(f"[eval] Checkpoint: {args.checkpoint}")
     print(f"[eval] Max steps: {args.max_steps}")
     print(f"[eval] Sessions: {args.num_sessions}")
+    print(f"[eval] ScaleWoB port: {args.port}")
     visible_gpu_ids = os.environ.get("CUDA_VISIBLE_DEVICES", "")
     print(f"[eval] Physical GPU IDs visible: {visible_gpu_ids or 'all'}")
     if torch.cuda.is_available():
         print(f"[eval] Logical CUDA devices: {torch.cuda.device_count()} "
               f"(cuda:0 maps to physical GPU {(visible_gpu_ids.split(',')[0] if visible_gpu_ids else '0')})")
 
-    run_eval(
-        checkpoint=args.checkpoint,
-        apps=apps,
-        scalewob_root=args.scalewob_root,
-        max_steps=args.max_steps,
-        num_sessions=args.num_sessions,
-        output_dir=args.eval_output,
-        device=args.device,
-        temperature=args.temperature,
-        top_p=args.top_p,
-        headless=not args.no_headless,
-        port=args.port,
-        seed=args.seed,
-        freeze_memory_init=args.freeze_memory_init,
-        browser_timeout_ms=args.browser_timeout_ms,
-        reset_retries=args.reset_retries,
-        max_input_tokens=args.max_input_tokens,
-        max_new_tokens=args.max_new_tokens,
-        save_screenshots=args.save_screenshots,
-        enable_linear_probe=args.enable_linear_probe,
-    )
+    try:
+        run_eval(
+            checkpoint=args.checkpoint,
+            apps=apps,
+            scalewob_root=args.scalewob_root,
+            max_steps=args.max_steps,
+            num_sessions=args.num_sessions,
+            output_dir=args.eval_output,
+            device=args.device,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            headless=not args.no_headless,
+            port=args.port,
+            seed=args.seed,
+            freeze_memory_init=args.freeze_memory_init,
+            browser_timeout_ms=args.browser_timeout_ms,
+            reset_retries=args.reset_retries,
+            max_input_tokens=args.max_input_tokens,
+            max_new_tokens=args.max_new_tokens,
+            save_screenshots=args.save_screenshots,
+            enable_linear_probe=args.enable_linear_probe,
+        )
+    finally:
+        run_reservation.close()
 
 
 if __name__ == "__main__":

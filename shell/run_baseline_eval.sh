@@ -31,6 +31,7 @@ RESET_RETRIES=${RESET_RETRIES:-3}
 MAX_INPUT_TOKENS=${MAX_INPUT_TOKENS:-8192}
 MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-256}
 SAVE_SCREENSHOTS=${SAVE_SCREENSHOTS:-0}
+PORT=${PORT:-0}                  # 0 = automatically reserve a free port
 
 if [[ ! -d "$CHECKPOINT" ]]; then
     echo "ERROR: Checkpoint not found: $CHECKPOINT" >&2
@@ -65,6 +66,7 @@ echo "  Reset retries: $RESET_RETRIES"
 echo "  Browser ms:   $BROWSER_TIMEOUT_MS"
 echo "  Input tokens: $MAX_INPUT_TOKENS"
 echo "  New tokens:   $MAX_NEW_TOKENS"
+echo "  Port:         $([[ "$PORT" == "0" ]] && echo auto || echo "$PORT")"
 echo ""
 
 # Set CUDA_VISIBLE_DEVICES in the shell BEFORE Python launches.
@@ -84,6 +86,7 @@ python -m jamel_compact.baseline_eval \
     --temperature "$TEMPERATURE" \
     --top-p "$TOP_P" \
     --gpu-ids "$GPU_IDS" \
+    --port "$PORT" \
     --browser-timeout-ms "$BROWSER_TIMEOUT_MS" \
     --reset-retries "$RESET_RETRIES" \
     --max-input-tokens "$MAX_INPUT_TOKENS" \

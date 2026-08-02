@@ -33,6 +33,7 @@ MAX_INPUT_TOKENS=${MAX_INPUT_TOKENS:-8192}
 MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-256}
 SAVE_SCREENSHOTS=${SAVE_SCREENSHOTS:-0}
 ENABLE_LINEAR_PROBE=${ENABLE_LINEAR_PROBE:-0}
+PORT=${PORT:-0}                  # 0 = automatically reserve a free port
 
 if [[ ! -d "$CHECKPOINT" ]]; then
     echo "ERROR: Checkpoint not found: $CHECKPOINT" >&2
@@ -75,6 +76,7 @@ echo "  Browser ms:   $BROWSER_TIMEOUT_MS"
 echo "  Input tokens: $MAX_INPUT_TOKENS"
 echo "  New tokens:   $MAX_NEW_TOKENS"
 echo "  Linear probe: $ENABLE_LINEAR_PROBE"
+echo "  Port:         $([[ "$PORT" == "0" ]] && echo auto || echo "$PORT")"
 
 # Set CUDA_VISIBLE_DEVICES in the shell BEFORE Python launches.
 if [[ -n "$GPU_IDS" ]]; then
@@ -93,6 +95,7 @@ python -m jamel_compact.eval \
     --temperature "$TEMPERATURE" \
     --top-p "$TOP_P" \
     --gpu-ids "$GPU_IDS" \
+    --port "$PORT" \
     --browser-timeout-ms "$BROWSER_TIMEOUT_MS" \
     --reset-retries "$RESET_RETRIES" \
     --max-input-tokens "$MAX_INPUT_TOKENS" \
