@@ -144,6 +144,84 @@ def _write_summary(
     return summary_path
 
 
+def _checkpoint_identity(checkpoint: str) -> str:
+    try:
+        return str(Path(checkpoint).expanduser().resolve())
+    except OSError:
+        return checkpoint
+
+
+def _load_resume_state(
+    output_path: Path,
+    checkpoint: str,
+    model_type: str,
+    max_steps: int,
+    resume: bool,
+) -> tuple[dict[tuple[str, int], dict], list[tuple[str, int]], list[str]]:
+    if not resume:
+        return {}, [], []
+
+    summary_path = output_path / "eval_summary.json"
+    if not summary_path.is_file():
+        return {}, [], []
+    try:
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        print(f"[eval] Cannot resume from {summary_path}: {error}. Starting fresh.")
+        return {}, [], []
+
+    previous_model_type = summary.get("model_type")
+    if previous_model_type and previous_model_type != model_type:
+        raise RuntimeError(
+            f"Existing output was produced by '{previous_model_type}', not '{model_type}'. "
+            "Choose a different --eval-output directory."
+        )
+    previous_checkpoint = summary.get("checkpoint")
+    if previous_checkpoint and (
+        _checkpoint_identity(str(previous_checkpoint)) != _checkpoint_identity(checkpoint)
+    ):
+        raise RuntimeError(
+            "Existing output uses a different checkpoint. "
+            "Choose a different --eval-output directory."
+        )
+    previous_max_steps = summary.get("max_steps")
+    if previous_max_steps is not None and int(previous_max_steps) != max_steps:
+        raise RuntimeError(
+            f"Existing output uses max_steps={previous_max_steps}, but this run uses "
+            f"max_steps={max_steps}. Choose a different --eval-output directory."
+        )
+
+    result_map: dict[tuple[str, int], dict] = {}
+    result_order: list[tuple[str, int]] = []
+    for result in summary.get("results", []):
+        if not isinstance(result, dict):
+            continue
+        app = result.get("app")
+        session_idx = result.get("session_idx")
+        if not isinstance(app, str):
+            continue
+        try:
+            key = (app, int(session_idx))
+        except (TypeError, ValueError):
+            continue
+        if key not in result_map:
+            result_order.append(key)
+        result_map[key] = result
+
+    saved_apps = [app for app in summary.get("apps", []) if isinstance(app, str)]
+    print(f"[eval] Resuming {len(result_map)} recorded session(s) from {summary_path}")
+    return result_map, result_order, saved_apps
+
+
+def _session_reached_max_steps(result: dict | None, max_steps: int) -> bool:
+    if not result or result.get("status") == "failed":
+        return False
+    try:
+        return int(result.get("num_steps", -1)) == max_steps
+    except (TypeError, ValueError):
+        return False
+
+
 def run_browser_evaluation(
     *,
     agent: Any,
@@ -162,6 +240,7 @@ def run_browser_evaluation(
     reset_retries: int = 3,
     save_screenshots: bool = False,
     on_step_decision: Callable[[str, int], None] | None = None,
+    resume: bool = True,
 ) -> list[dict]:
     """Evaluate an agent while isolating failures to one session."""
     from browsergym.core.env import BrowserEnv
@@ -169,7 +248,19 @@ def run_browser_evaluation(
 
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
-    all_results: list[dict] = []
+    result_map, result_order, summary_apps = _load_resume_state(
+        output_path,
+        checkpoint,
+        model_type,
+        max_steps,
+        resume,
+    )
+    for app in apps:
+        if app not in summary_apps:
+            summary_apps.append(app)
+
+    def _ordered_results() -> list[dict]:
+        return [result_map[key] for key in result_order if key in result_map]
 
     for app in apps:
         print(f"\n{'=' * 60}")
@@ -180,6 +271,16 @@ def run_browser_evaluation(
 
         for session_idx in range(num_sessions):
             print(f"\n  Session {session_idx + 1}/{num_sessions}")
+            session_key = (app, session_idx)
+            previous_result = result_map.get(session_key)
+            if _session_reached_max_steps(previous_result, max_steps):
+                print(
+                    f"  [resume] Already completed {previous_result['num_steps']}/"
+                    f"{max_steps} steps; skipping."
+                )
+                continue
+            if previous_result is not None:
+                print("  [resume] Previous session was incomplete or failed; rerunning it.")
             agent.reset_session()
 
             session_dir = output_path / app / f"session{session_idx}"
@@ -418,26 +519,29 @@ def run_browser_evaluation(
                 "coverage_delta_scores": [row.get("delta_score", 0) for row in trajectory],
                 "trajectory_path": str(trajectory_path),
             }
-            all_results.append(session_result)
+            if session_key not in result_map:
+                result_order.append(session_key)
+            result_map[session_key] = session_result
             _write_summary(
                 output_path,
                 checkpoint,
                 model_type,
-                apps,
+                summary_apps,
                 num_sessions,
                 max_steps,
-                all_results,
+                _ordered_results(),
             )
             print(
                 f"  Session status: {session_result['status']}  "
                 f"reward: {cumulative_reward:.4f}"
             )
 
+    all_results = _ordered_results()
     summary_path = _write_summary(
         output_path,
         checkpoint,
         model_type,
-        apps,
+        summary_apps,
         num_sessions,
         max_steps,
         all_results,

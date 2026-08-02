@@ -316,6 +316,7 @@ def run_eval(
     max_input_tokens: int = 8192,
     max_new_tokens: int = 256,
     save_screenshots: bool = False,
+    resume: bool = True,
 ):
     """Run baseline Qwen3-VL evaluation with per-session crash recovery."""
     from .eval_browser import run_browser_evaluation
@@ -344,6 +345,7 @@ def run_eval(
         browser_timeout_ms=browser_timeout_ms,
         reset_retries=reset_retries,
         save_screenshots=save_screenshots,
+        resume=resume,
     )
 
 
@@ -373,6 +375,8 @@ def main():
     parser.add_argument("--max-new-tokens", type=int, default=256)
     parser.add_argument("--save-screenshots", action="store_true",
                         help="Save before/after screenshots (uses extra disk and CPU)")
+    parser.add_argument("--no-resume", action="store_true",
+                        help="Ignore prior eval_summary.json results and rerun all sessions")
     args = parser.parse_args()
 
     # Resolve apps
@@ -436,6 +440,7 @@ def main():
             max_input_tokens=args.max_input_tokens,
             max_new_tokens=args.max_new_tokens,
             save_screenshots=args.save_screenshots,
+            resume=not args.no_resume,
         )
     finally:
         run_reservation.close()

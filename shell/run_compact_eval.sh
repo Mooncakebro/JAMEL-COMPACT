@@ -34,6 +34,7 @@ MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-256}
 SAVE_SCREENSHOTS=${SAVE_SCREENSHOTS:-0}
 ENABLE_LINEAR_PROBE=${ENABLE_LINEAR_PROBE:-0}
 PORT=${PORT:-0}                  # 0 = automatically reserve a free port
+RESUME=${RESUME:-1}              # 1 = skip completed app/session entries
 
 if [[ ! -d "$CHECKPOINT" ]]; then
     echo "ERROR: Checkpoint not found: $CHECKPOINT" >&2
@@ -61,6 +62,9 @@ fi
 if [[ "$ENABLE_LINEAR_PROBE" == "1" ]]; then
     OPTIONAL_ARGS+=(--enable-linear-probe)
 fi
+if [[ "$RESUME" != "1" ]]; then
+    OPTIONAL_ARGS+=(--no-resume)
+fi
 
 echo "=== JAMEL-COMPACT Evaluation ==="
 echo "  Checkpoint:   $CHECKPOINT"
@@ -77,6 +81,7 @@ echo "  Input tokens: $MAX_INPUT_TOKENS"
 echo "  New tokens:   $MAX_NEW_TOKENS"
 echo "  Linear probe: $ENABLE_LINEAR_PROBE"
 echo "  Port:         $([[ "$PORT" == "0" ]] && echo auto || echo "$PORT")"
+echo "  Resume:       $RESUME"
 
 # Set CUDA_VISIBLE_DEVICES in the shell BEFORE Python launches.
 if [[ -n "$GPU_IDS" ]]; then

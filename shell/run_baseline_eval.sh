@@ -32,6 +32,7 @@ MAX_INPUT_TOKENS=${MAX_INPUT_TOKENS:-8192}
 MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-256}
 SAVE_SCREENSHOTS=${SAVE_SCREENSHOTS:-0}
 PORT=${PORT:-0}                  # 0 = automatically reserve a free port
+RESUME=${RESUME:-1}              # 1 = skip completed app/session entries
 
 if [[ ! -d "$CHECKPOINT" ]]; then
     echo "ERROR: Checkpoint not found: $CHECKPOINT" >&2
@@ -53,6 +54,9 @@ OPTIONAL_ARGS=()
 if [[ "$SAVE_SCREENSHOTS" == "1" ]]; then
     OPTIONAL_ARGS+=(--save-screenshots)
 fi
+if [[ "$RESUME" != "1" ]]; then
+    OPTIONAL_ARGS+=(--no-resume)
+fi
 
 echo "=== Baseline Qwen3-VL SFT Evaluation ==="
 echo "  Checkpoint:   $CHECKPOINT"
@@ -67,6 +71,7 @@ echo "  Browser ms:   $BROWSER_TIMEOUT_MS"
 echo "  Input tokens: $MAX_INPUT_TOKENS"
 echo "  New tokens:   $MAX_NEW_TOKENS"
 echo "  Port:         $([[ "$PORT" == "0" ]] && echo auto || echo "$PORT")"
+echo "  Resume:       $RESUME"
 echo ""
 
 # Set CUDA_VISIBLE_DEVICES in the shell BEFORE Python launches.

@@ -296,6 +296,7 @@ def run_eval(
     max_new_tokens: int = 256,
     save_screenshots: bool = False,
     enable_linear_probe: bool = False,
+    resume: bool = True,
 ):
     """Run JAMEL-COMPACT evaluation with per-session crash recovery."""
     from .eval_browser import run_browser_evaluation
@@ -311,6 +312,10 @@ def run_eval(
     agent._freeze_memory = freeze_memory_init
     if freeze_memory_init:
         print("[eval] WARNING: --freeze-memory-init is active. Memory will NOT update during eval.")
+
+    if enable_linear_probe and resume:
+        print("[eval] Linear probe requires every session; disabling resume.")
+        resume = False
 
     probe = None
     if enable_linear_probe and LinearProbeMemory is not None:
@@ -355,6 +360,7 @@ def run_eval(
         reset_retries=reset_retries,
         save_screenshots=save_screenshots,
         on_step_decision=_collect_probe_snapshot if probe is not None else None,
+        resume=resume,
     )
 
     if probe is not None:
@@ -399,6 +405,8 @@ def main():
                         help="Save before/after screenshots (uses extra disk and CPU)")
     parser.add_argument("--enable-linear-probe", action="store_true",
                         help="Enable the optional memory probe; disabled by default")
+    parser.add_argument("--no-resume", action="store_true",
+                        help="Ignore prior eval_summary.json results and rerun all sessions")
     args = parser.parse_args()
 
     # Resolve apps
@@ -463,6 +471,7 @@ def main():
             max_new_tokens=args.max_new_tokens,
             save_screenshots=args.save_screenshots,
             enable_linear_probe=args.enable_linear_probe,
+            resume=not args.no_resume,
         )
     finally:
         run_reservation.close()
