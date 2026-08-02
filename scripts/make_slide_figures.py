@@ -89,78 +89,61 @@ PER_APP_COMPACT_2B  = np.array([16.9, 19.1, 15.3, 18.2, 17.0,
 # ═════════════════════════════════════════════════════════════════════════════
 
 def make_main_results():
-    fig, ax = plt.subplots(figsize=(7.5, 4.6))
+    fig, ax = plt.subplots(figsize=(6.8, 4.2))
 
-    n = len(OUR_MODELS)
-    x = np.arange(n)
-    bar_w = 0.52
+    # ── Group by parameter size: 2B pair, then 4B pair ──
+    models  = ["Baseline-2B", "COMPACT-2B", "Baseline-4B", "COMPACT-4B"]
+    scores  = [15.9,          18.0,          15.8,          19.3]
+    params  = ["2.13B",       "2.13B\n+6.24M\n(+0.29%)",
+               "4.02B",       "4.02B\n+9.79M\n(+0.24%)"]
+    is_ours = [False,         True,          False,         True]
 
-    colors = [C_COMPACT if o else C_BASE for o in OUR_IS_OURS]
-    bars = ax.bar(x, OUR_SCORES, width=bar_w, color=colors,
+    # x positions with a visual gap between the two param-size groups
+    x = np.array([0, 1, 2.6, 3.6])
+    bar_w = 0.55
+
+    colors = [C_COMPACT if o else C_BASE for o in is_ours]
+    bars = ax.bar(x, scores, width=bar_w, color=colors,
                   edgecolor="white", linewidth=0.8, zorder=3)
 
-    # Hatch baselines
-    for i, is_ours in enumerate(OUR_IS_OURS):
-        if not is_ours:
+    # Hatch baselines to distinguish from COMPACT
+    for i, ours in enumerate(is_ours):
+        if not ours:
             bars[i].set_hatch("///")
             bars[i].set_edgecolor("#555555")
 
-    # Value labels
-    for i, (bar, sc) in enumerate(zip(bars, OUR_SCORES)):
+    # Value labels on top of bars
+    for bar, sc in zip(bars, scores):
         ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.2,
                 f"{sc:.1f}", ha="center", va="bottom",
                 fontsize=12, fontweight="bold", color="#222")
 
-    # Parameter labels below
-    for i, (bar, pl) in enumerate(zip(bars, OUR_PARAMS)):
-        ax.text(bar.get_x() + bar.get_width()/2, -0.7,
-                pl, ha="center", va="top", fontsize=7.5,
-                color="#555", linespacing=1.15)
-
-    # Delta arrows: COMPACT vs same-size baseline
-    for compact_idx, base_idx in [(2, 0), (3, 1)]:
-        delta = OUR_SCORES[compact_idx] - OUR_SCORES[base_idx]
-        y_lo, y_hi = OUR_SCORES[base_idx] + 0.4, OUR_SCORES[compact_idx] - 0.4
-        ax.annotate("", xy=(compact_idx, y_hi), xytext=(compact_idx, y_lo),
-                    arrowprops=dict(arrowstyle="<->", color=C_ACCENT, lw=1.6,
-                                    connectionstyle="bar,fraction=0.12"))
-        ax.text(compact_idx + 0.42, (y_lo + y_hi)/2,
-                f"+{delta:.1f}", ha="left", va="center",
-                fontsize=9, fontweight="bold", color=C_ACCENT)
-
-    # Reference baselines (dashed horizontal lines)
-    for name, score, param_str in REF_ENTRIES:
-        ax.axhline(y=score, color=C_REF, linestyle="--", lw=1.0,
-                   alpha=0.7, zorder=2)
-        # Label at right edge
-        ax.text(n - 0.32, score + 0.15, f"{name}  ({score:.1f})",
-                ha="right", va="bottom", fontsize=7.5,
-                color="#666", style="italic")
+    # Parameter labels centered inside the bar
+    for bar, pl in zip(bars, params):
+        cy = bar.get_height() / 2
+        ax.text(bar.get_x() + bar.get_width()/2, cy,
+                pl, ha="center", va="center",
+                fontsize=8, color="white", fontweight="bold",
+                linespacing=1.3, zorder=4)
 
     # Axes
     ax.set_xticks(x)
-    short_labels = [m.replace("-", "\n") for m in OUR_MODELS]
-    ax.set_xticklabels(short_labels, fontsize=9.5)
-    ax.set_ylabel("Avg. Cumulative Reward (test10)", fontsize=11, labelpad=8)
+    ax.set_xticklabels([m.replace("-", "\n") for m in models], fontsize=9.5)
+    ax.set_ylabel("Avg. Reward", fontsize=11, labelpad=8)
     ax.set_ylim(0, 24)
     ax.yaxis.set_major_locator(mticker.MultipleLocator(5))
     ax.grid(axis="y", linestyle="--", alpha=0.3, zorder=0)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
 
-    # Legend
+    # Legend (2 categories only — no JAMEL references)
     legend_elements = [
         Patch(facecolor=C_BASE, hatch="///", edgecolor="#555555",
-              label="Baseline (Qwen3-VL SFT)"),
+              label="Baseline"),
         Patch(facecolor=C_COMPACT, edgecolor="white", label="COMPACT (ours)"),
-        plt.Line2D([0], [0], color=C_REF, linestyle="--", lw=1.0,
-                   label="Reference (JAMEL paper)"),
     ]
     ax.legend(handles=legend_elements, loc="upper left",
               framealpha=0.92, edgecolor="#ccc", fontsize=8.5)
-
-    ax.set_title("Main Results — ScaleWoB test10 (Coverage Reward)",
-                 fontsize=13, fontweight="bold", pad=14)
 
     fig.tight_layout()
     for ext in ("pdf", "png"):
