@@ -144,8 +144,9 @@ still not influencing outputs — investigate).
 - Build action conditioning from the preceding session action $a_{t-1}$, with
   `noop()` at session start; mask action-token padding during pooling.
 - Split train/validation by complete `session_id`, never by individual rows.
-- Keep TBPTT-1 detach (`train.py:161-176`) for now; add `config.tbptt_detach`
-  (default True) so it can be ablated.
+- Use ordered stateful TBPTT: gradients remain connected inside each chunk;
+  detach and carry `(M, P, e)` into the next chunk of the same contiguous
+  session run. Shuffle complete runs, never dependent chunks.
 
 **Acceptance**: TensorBoard `memory/*` stats differ between chunk step 0 and step 7
 (memory actually evolves); every chunk has consecutive `session_step_idx`; train
@@ -277,7 +278,7 @@ Run after each phase:
 2. Coverage on `test10` (3 sessions × 50 steps): Phase-1 model ≥ baseline;
    U3 model > Phase-1 model.
 3. Ablation table (report all): full model / `--freeze-memory-init` /
-   `tbptt_detach=False` / `coverage_weight_eta=0`.
+   `chunk_size=1` / `coverage_weight_eta=0`.
 
 ## Suggested task order
 

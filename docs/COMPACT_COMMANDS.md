@@ -743,7 +743,7 @@ python scripts/snapshots_to_mp4.py outputs/compact_eval/weibo/session0/ \
 | `LOG_STEPS` | `10` | TensorBoard logging frequency |
 | `SAVE_STEPS` | `500` | Checkpoint save frequency |
 | `VAL_STEPS` | `200` | Validation frequency |
-| `CHUNK_SIZE` | `8` | v2: session-chunked training (1 = single-step, >1 = multi-step with memory carry-forward) |
+| `CHUNK_SIZE` | `8` | Stateful TBPTT length: gradients connect within each ordered chunk; detached memory/variance/surprise carry into the next chunk of the same session |
 | `COVERAGE_WEIGHT_ETA` | `0.0` | v2 F7: 0 = off; >0 upweights high-novelty samples by `1 + eta * max(coverage_delta, 0)` |
 
 ### Evaluation (`run_compact_eval.sh`)

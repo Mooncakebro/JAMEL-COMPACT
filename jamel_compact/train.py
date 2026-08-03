@@ -47,7 +47,6 @@ from typing import Optional
 import numpy as np
 import torch
 import torch.distributed as dist
-import torch.nn as nn
 from torch.nn.parallel.scatter_gather import gather as _data_parallel_gather
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
@@ -89,11 +88,11 @@ from .model import JAMELCompactWrapper
 from .data import (
     CompactDataset,
     SessionChunkDataset,
+    SessionChunkSampler,
     SynchronizedChunkDistributedSampler,
     collate_fn,
     session_collate_fn,
 )
-from .loss import compute_compact_loss
 from .lora import (
     DEFAULT_LORA_TARGET_MODULES_CSV,
     lora_enabled,
@@ -342,39 +341,12 @@ def _process_chunk_step(
                 h_embed, input_ids, pixel_values, image_grid_thw,
             )
 
-    # ── TBPTT-1: Detach memory states from the computation graph before
-    # passing to the model forward. This prevents full BPTT (backprop
-    # through time) which would retain all intermediate steps' graphs and
-    # cause OOM. Instead, the FiLM-GRU learns from the per-step loss signal
-    # only — memory carries forward VALUES but not GRADIENTS.
-    #
-    # This is truncated BPTT (TBPTT) with truncation length 1: each step's
-    # loss backprops only through that step's forward pass, but the memory
-    # VALUES (not gradients) carry forward across steps. This still trains
-    # the recurrent dynamics because each step sees a non-trivial memory
-    # state (not the zero-initialized state), so the inject/correct modules
-    # learn to use evolved memory.
-    #
-    # When config.tbptt_detach=False, states are NOT detached — enabling
-    # full BPTT for ablation experiments (much higher memory cost).
-    detach = config.tbptt_detach
-    if memory_states is None or variance_states is None:
-        mem_input = None
-        var_input = None
-        e_prev_input = None
-    else:
-        mem_input = [
-            m.detach() if detach and isinstance(m, torch.Tensor) else m
-            for m in memory_states
-        ]
-        var_input = [
-            c.detach() if detach and isinstance(c, torch.Tensor) else c
-            for c in variance_states
-        ]
-        e_prev_input = [
-            e.detach() if detach and isinstance(e, torch.Tensor) else e
-            for e in (e_prev_list or [None] * len(memory_states))
-        ]
+    # Memory remains connected across steps inside the current chunk.  The
+    # completed chunk state is detached by the outer training loop before it
+    # is cached for the next chunk, implementing TBPTT at chunk boundaries.
+    mem_input = memory_states
+    var_input = variance_states
+    e_prev_input = e_prev_list
 
     # Get sample weights (F7: coverage-weighted SFT)
     sample_weights = step_data.get("sample_weights")
@@ -413,15 +385,77 @@ def _process_chunk_step(
         for key, value in outputs["loss_dict"].items()
     }
 
-    # Detach new memory before returning — values carry forward, not gradients
-    new_mem = [m.detach() if detach and isinstance(m, torch.Tensor) else m
-               for m in outputs["new_memory"]]
-    new_var = [c.detach() if detach and isinstance(c, torch.Tensor) else c
-               for c in outputs["new_variance"]]
-    new_e_list = [e.detach() if detach and isinstance(e, torch.Tensor) else e
-                  for e in outputs.get("e_list", [None] * len(new_mem))]
+    new_mem = list(outputs["new_memory"])
+    new_var = list(outputs["new_variance"])
+    new_e_list = list(outputs.get("e_list", [None] * len(new_mem)))
 
     return loss, loss_dict, new_mem, new_var, new_e_list
+
+
+def _detach_recurrent_state(memory_states, variance_states, e_prev_list):
+    """Detach a completed chunk state before carrying it to the next chunk."""
+    detached_memory = [
+        state.detach() if isinstance(state, torch.Tensor) else state
+        for state in memory_states
+    ]
+    detached_variance = [
+        state.detach() if isinstance(state, torch.Tensor) else state
+        for state in variance_states
+    ]
+    detached_surprise = [
+        state.detach() if isinstance(state, torch.Tensor) else state
+        for state in (e_prev_list or [None] * len(detached_memory))
+    ]
+    return detached_memory, detached_variance, detached_surprise
+
+
+def _begin_ordered_chunk(model, raw_model, device, batch, state_cache):
+    """Load the predecessor state or initialize the first chunk of a run."""
+    state_id = str(batch["state_id"])
+    chunk_index = int(batch["chunk_index"])
+    is_first_chunk = bool(batch["is_first_chunk"])
+    is_dummy_chunk = bool(batch.get("is_dummy_chunk", False))
+
+    if is_dummy_chunk or is_first_chunk:
+        if not is_dummy_chunk and chunk_index != 0:
+            raise RuntimeError(
+                f"State sequence {state_id!r} starts at chunk {chunk_index}, not 0."
+            )
+        state_cache.pop(state_id, None)
+        if _is_fsdp(model):
+            memory_states, variance_states = None, None
+        else:
+            memory_states, variance_states = raw_model.init_memory(1, device)
+        e_prev_list = None
+    else:
+        cached_state = state_cache.pop(state_id, None)
+        if cached_state is None:
+            raise RuntimeError(
+                f"Missing recurrent state for {state_id!r} chunk {chunk_index}. "
+                "Chunks must be sampled in session order."
+            )
+        expected_chunk, memory_states, variance_states, e_prev_list = cached_state
+        if expected_chunk != chunk_index:
+            raise RuntimeError(
+                f"Out-of-order chunk for {state_id!r}: expected {expected_chunk}, "
+                f"received {chunk_index}."
+            )
+
+    return state_id, chunk_index, is_dummy_chunk, memory_states, variance_states, e_prev_list
+
+
+def _finish_ordered_chunk(
+    batch, state_cache, state_id, chunk_index, is_dummy_chunk,
+    memory_states, variance_states, e_prev_list,
+):
+    """Detach and cache state unless this chunk ends the contiguous run."""
+    if is_dummy_chunk or bool(batch["is_last_chunk"]):
+        state_cache.pop(state_id, None)
+        return
+    detached_state = _detach_recurrent_state(
+        memory_states, variance_states, e_prev_list,
+    )
+    state_cache[state_id] = (chunk_index + 1, *detached_state)
 
 
 def train_one_epoch(
@@ -439,9 +473,9 @@ def train_one_epoch(
 ) -> tuple[int, float, Optional[int]]:
     """Train for one epoch and track the best mid-epoch validation loss.
 
-    Supports both single-step (chunk_size=1) and session-chunked training
-    (chunk_size>1). In chunked mode, memory carries forward across steps
-    within each chunk, training the recurrent dynamics of the FiLM-GRU.
+    Supports both single-step (chunk_size=1) and stateful truncated BPTT.
+    In chunked mode, gradients connect all steps inside a chunk; the final
+    recurrent state is detached and carried into the next ordered chunk.
     """
     model.train()
     raw_model = _unwrap(model)
@@ -450,6 +484,7 @@ def train_one_epoch(
     use_chunking = config.chunk_size > 1
     optimizer.zero_grad()
     last_val_step = None
+    recurrent_state_cache = {}
 
     # Build progress bar
     show_progress = _TQDM_AVAILABLE and _is_main_process()
@@ -469,12 +504,16 @@ def train_one_epoch(
             # batch is a dict of lists (one entry per step in the chunk)
             chunk_size = batch["chunk_size"]
 
-            # Initialize memory and e_prev at the start of each chunk
-            if _is_fsdp(model):
-                memory_states, variance_states = None, None
-            else:
-                memory_states, variance_states = raw_model.init_memory(1, device)
-            e_prev_list = None  # None for first step in chunk
+            (
+                state_id,
+                chunk_index,
+                is_dummy_chunk,
+                memory_states,
+                variance_states,
+                e_prev_list,
+            ) = _begin_ordered_chunk(
+                model, raw_model, device, batch, recurrent_state_cache,
+            )
 
             total_chunk_loss = None
             last_loss_dict = {}
@@ -515,23 +554,37 @@ def train_one_epoch(
                 e_prev_list = e_list
 
                 step_is_valid = bool(step_valids[s])
-                step_loss = loss * float(step_is_valid) / valid_step_count
+                distributed_loss_scale = float(
+                    batch.get("distributed_loss_scale", 1.0)
+                )
+                step_loss = (
+                    loss * float(step_is_valid) * distributed_loss_scale
+                    / valid_step_count
+                )
                 total_chunk_loss = (
                     step_loss
                     if total_chunk_loss is None
                     else total_chunk_loss + step_loss
                 )
+                last_loss_dict = loss_dict
                 if step_is_valid:
-                    last_loss_dict = loss_dict
                     all_loss_dicts.append(loss_dict)
 
-            # Average loss dict across steps
-            loss_dict = {}
-            for k in last_loss_dict:
-                averaged_value = (
-                    sum(d[k] for d in all_loss_dicts) / valid_step_count
-                )
-                loss_dict[k] = _scalar(averaged_value)
+            _finish_ordered_chunk(
+                batch, recurrent_state_cache, state_id, chunk_index,
+                is_dummy_chunk, memory_states, variance_states, e_prev_list,
+            )
+
+            if all_loss_dicts:
+                loss_dict = {}
+                for key in last_loss_dict:
+                    averaged_value = (
+                        sum(values[key] for values in all_loss_dicts)
+                        / valid_step_count
+                    )
+                    loss_dict[key] = _scalar(averaged_value)
+            else:
+                loss_dict = {key: 0.0 for key in last_loss_dict}
 
             accumulation_divisor = min(
                 accum_steps,
@@ -717,6 +770,7 @@ def validate(
     total_nll_loss = 0.0
     num_batches = 0
     show_progress = _TQDM_AVAILABLE and _is_main_process()
+    recurrent_state_cache = {}
 
     with torch.no_grad():
         if show_progress:
@@ -729,17 +783,22 @@ def validate(
             if use_chunking:
                 # ── Session-chunked validation ──
                 chunk_size = batch["chunk_size"]
-                if _is_fsdp(model):
-                    memory_states, variance_states = None, None
-                else:
-                    memory_states, variance_states = raw_model.init_memory(1, device)
+                (
+                    state_id,
+                    chunk_index,
+                    is_dummy_chunk,
+                    memory_states,
+                    variance_states,
+                    e_prev_list,
+                ) = _begin_ordered_chunk(
+                    model, raw_model, device, batch, recurrent_state_cache,
+                )
 
                 chunk_loss = 0.0
                 chunk_action = 0.0
                 chunk_mem = 0.0
                 chunk_obs = 0.0
                 chunk_nll = 0.0
-                e_prev_list = None
                 step_valids = batch.get("step_valids", [True] * chunk_size)
                 valid_step_count = max(
                     sum(bool(value) for value in step_valids), 1
@@ -778,18 +837,23 @@ def validate(
                         chunk_obs += loss_dict.get("obs", 0.0)
                         chunk_nll += loss_dict.get("nll", 0.0)
 
-                # Average over steps in chunk
+                _finish_ordered_chunk(
+                    batch, recurrent_state_cache, state_id, chunk_index,
+                    is_dummy_chunk, memory_states, variance_states, e_prev_list,
+                )
+
                 chunk_loss = _scalar(chunk_loss / valid_step_count)
                 chunk_action = _scalar(chunk_action / valid_step_count)
                 chunk_mem = _scalar(chunk_mem / valid_step_count)
                 chunk_obs = _scalar(chunk_obs / valid_step_count)
                 chunk_nll = _scalar(chunk_nll / valid_step_count)
-                total_loss += chunk_loss
-                total_action_loss += chunk_action
-                total_mem_loss += chunk_mem
-                total_obs_loss += chunk_obs
-                total_nll_loss += chunk_nll
-                num_batches += 1
+                if not is_dummy_chunk:
+                    total_loss += chunk_loss
+                    total_action_loss += chunk_action
+                    total_mem_loss += chunk_mem
+                    total_obs_loss += chunk_obs
+                    total_nll_loss += chunk_nll
+                    num_batches += 1
 
                 if show_progress:
                     pbar.set_postfix({
@@ -1236,13 +1300,13 @@ def main():
             train_dataset,
             chunk_size=config.chunk_size,
             coverage_weight_eta=config.coverage_weight_eta,
-            pad_dropped_steps=args.fsdp,
+            pad_to_chunk_size=args.fsdp,
         )
         val_dataset = SessionChunkDataset(
             val_dataset,
             chunk_size=config.chunk_size,
             coverage_weight_eta=config.coverage_weight_eta,
-            pad_dropped_steps=args.fsdp,
+            pad_to_chunk_size=args.fsdp,
         )
         chunk_batch_size = 1
         if args.fsdp:
@@ -1259,14 +1323,24 @@ def main():
                 rank=_rank(),
                 shuffle=False,
             )
+        else:
+            train_sampler = SessionChunkSampler(
+                train_dataset, shuffle=True, seed=config.seed,
+            )
+            val_sampler = SessionChunkSampler(
+                val_dataset, shuffle=False, seed=config.seed,
+            )
         if _is_main_process():
-            print(f"[train] Chunked mode: batch_size={chunk_batch_size} "
-                  f"× {config.chunk_size} steps/chunk/GPU")
+            print(
+                f"[train] Stateful TBPTT: batch_size={chunk_batch_size} × "
+                f"{config.chunk_size} connected steps/chunk/GPU; detached "
+                "state carries across ordered chunks"
+            )
         pad_token_id = raw_model.tokenizer.pad_token_id or 0
         train_loader = DataLoader(
             train_dataset,
             batch_size=chunk_batch_size,
-            shuffle=train_sampler is None,
+            shuffle=False,
             sampler=train_sampler,
             collate_fn=lambda b: session_collate_fn(b, pad_token_id),
             num_workers=8,

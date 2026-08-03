@@ -73,7 +73,7 @@ class CompactConfig:
     log_steps: int = 10
     save_steps: int = 500
     val_steps: int = 200
-    tbptt_detach: bool = True         # F6: detach memory between steps (TBPTT-1)
+    tbptt_detach: bool = True         # F6: detach carried state at chunk boundaries
     coverage_weight_eta: float = 0.0  # F7: 0 = off; >0 weights high-novelty samples
 
     # ── Loss weights ──

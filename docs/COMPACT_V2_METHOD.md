@@ -31,7 +31,7 @@ The implementation work order is [COMPACT_V2_IMPLEMENTATION_PLAN.md](COMPACT_V2_
 | Kalman gain | $\sigma(W[Z;\hat M])\odot(1-\hat C)$, per-element, pinned | $K=\hat P/(\hat P+R)$, per-slot scalar, learned $Q_\theta, R_\psi$ |
 | Memory supervision | none (only action CE) | observation-prediction loss $\mathcal{L}_{obs}$ + Gaussian NLL $\mathcal{L}_{nll}$ |
 | Injection | fixed weight, random-init projection | zero-init projection + learnable gate (model = base LLM at init) |
-| Training unit | single steps, memory reset per sample | session chunks of 8 steps, memory carried (TBPTT-1) |
+| Training unit | single steps, memory reset per sample | ordered session chunks; full BPTT inside each chunk, detached state carried across chunks |
 | Generation at eval | base `llm.generate()` — memory discarded | memory-conditioned via KV-cache prefill |
 
 ## 1. Notation
@@ -152,13 +152,16 @@ freedom; in v2, $K$ is trainable end-to-end and is supervised by $\mathcal{L}_{n
 At every step the agent sees only the instruction and the current observation; all
 history lives in $(M_t, P_t)$ carried across steps.
 
-- **Training** uses chunks of 8 consecutive session steps
-  (`SessionChunkDataset`). Memory *values* carry forward inside a chunk; gradients
-  are detached between steps (TBPTT-1), so each step's loss trains the modules
-  against a realistic, evolved memory state. Samples can be weighted by the
-  coverage-delta novelty signal already present in the data ($w_{cov}$). The
-  control input is the actual previous action $a_{t-1}$ (`noop()` at session
-  start), and train/validation splits contain disjoint complete sessions.
+- **Training** uses ordered chunks of 8 consecutive session steps
+  (`SessionChunkDataset`). Memory and gradients remain connected inside each
+  chunk. At a chunk boundary, the final $(M, P, e)$ values are detached and
+  carried into the next chunk from the same contiguous session, implementing
+  truncated BPTT with truncation length equal to `chunk_size`. Complete session
+  sequences may be shuffled, but chunks within a sequence remain chronological.
+  Samples can be weighted by the coverage-delta novelty signal already present
+  in the data ($w_{cov}$). The control input is the actual previous action
+  $a_{t-1}$ (`noop()` at session start), and train/validation splits contain
+  disjoint complete sessions.
 - **Inference** runs one memory-augmented forward over the prompt (updating
   $M, P, e$), then uses the resulting per-layer KV cache in a cache-backed
   incremental decoding loop with the pretrained decoder. It thereby samples
@@ -190,7 +193,7 @@ $$\mathcal{L} = w_{cov}\,\mathcal{L}_{act}
 | Uncertainty | $P_0 = 0.5$; $\lambda_l$ init 0.70/0.85/0.95; $\gamma_e = 1.0$; $e_{max}=10$; $R_{min}=0.01$ |
 | Observation | $k{=}4$ latent queries in $d_{mem}$ after pre-projection |
 | Injection | $g_l{=}0.1$, $W_\uparrow{=}0$; $w_l$ = 0.8/0.5/0.3 |
-| Training | chunk 8 steps, TBPTT-1; $\lambda_{obs}{=}0.1$, $\lambda_{nll}{=}0.1$, $\lambda_{mem}{=}10^{-3}$ |
+| Training | chunk 8 steps, stateful TBPTT-8 with detached cross-chunk carry; $\lambda_{obs}{=}0.1$, $\lambda_{nll}{=}0.1$, $\lambda_{mem}{=}10^{-3}$ |
 | Parameter overhead | ≈ +12% on Qwen3-VL-2B, ≈ +6% on 8B (same order as v1; U1–U3 add < 1M/layer) |
 
 ## 7. Extensions (behind config flags, one at a time)

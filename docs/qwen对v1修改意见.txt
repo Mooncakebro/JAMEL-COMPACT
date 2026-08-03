@@ -1,0 +1,673 @@
+### USER
+the created slide COMPACTv1 is @docs/COMPACT_v1.pdf and i get the feedback @docs/COMPACTv1+Reply.txt we are gonna share not the tech but also the thinking/idea/insight of our model. The good reference is in @docs/exploration-driven-learning分享-田世祚.pdf , you can check that out. So think, how can we best present our work. The listener is a big boss and think about what he really cares. Less is More. Need improve our presentation in a way this guy like.
+
+### ASSISTANT
+# Restructuring COMPACT for the Big Boss
+
+## First: Diagnose Why the Current Version Failed
+
+Your boss's feedback boils down to one brutal principle:
+
+> *"一个技术如果讲出来过度复杂，要么是没讲明白核心，要么就是工作质量不高只能堆砌工作量。"*
+
+He doesn't want a **technical report**. He wants a **research insight delivered as a story**. 田世祚's deck is the template: it spends 60% of its time on *thinking* (why, what's the fundamental question) and only 40% on *doing* (architecture, experiments). Your current deck inverts that ratio.
+
+| Current COMPACT deck | 田世祚's deck (what boss likes) |
+|---|---|
+| Title = a model name | Title = a research question / vision |
+| Starts with "GUI Agent needs memory" | Starts with "AI's next frontier is continual learning" |
+| 3 challenges framed as engineering gaps | 3 challenges framed as **fundamental questions of intelligence** |
+| Slides 8–10: Kalman filter, RNN, cross-attn diagrams | One clean diagram, zero equations |
+| Differentiation buried in a 3-column taxonomy table | One sentence: "We do X, they do Y" |
+| 19 slides, symbol-heavy | ~18 slides, almost zero symbols |
+
+---
+
+## The One-Sentence Core You Must Nail Down
+
+Before touching any slide, agree on **the single insight** in one sentence. I'd propose:
+
+> **"Good agent memory is not about remembering the past — it's about anticipating the future. The agent itself should be its own memory, not a model plus a compressor."**
+
+Everything else is supporting evidence for this sentence. If a slide doesn't serve it, cut it.
+
+---
+
+## Proposed New Structure (≈ 12 slides)
+
+### Slide 1 – Title
+**Kill "流式记忆自压缩智能体."** It sounds like an engineering component. Reframe around the *question*:
+
+> **记忆即预测：让智能体自己学会记住**
+> *Memory as Anticipation: Agents That Learn to Remember by Themselves*
+>
+> 汇报人 / 日期 / AIR logo
+
+Why: The boss said "感觉是一个模型而不是智能体." The title must foreground the **agent** and the **idea**, not the mechanism.
+
+---
+
+### Slide 2 – The Big Picture (田世祚 style)
+**One question. One image. No bullet list.**
+
+> **AI's Next Bottleneck Is Not Reasoning — It's Memory.**
+>
+> Today's agents: trained offline → deployed → context window fills up → performance collapses.
+>
+> The agent *cannot* keep learning from its own interaction history.
+
+Use a simple visual: a timeline of agent steps, context growing → explosion. No text beyond the headline. The boss should *feel* the problem in 3 seconds.
+
+---
+
+### Slide 3 – What Does "Good Memory" Mean? (The Insight Slide)
+This is your Pearl-quote moment. **No architecture. Pure thinking.**
+
+> 人脑不是录像机。
+> 你不会记住今天看到的每一帧画面，但你**能预测**下一秒会发生什么。
+>
+> **好的记忆 ≠ 存储过去。好的记忆 = 预期未来。**
+
+Three criteria (borrow your own, but phrase them as *principles*, not specs):
+
+| 原则 | 一句话 |
+|---|---|
+| **Useful** | 记忆为当下的决策服务 |
+| **Predictive** | 记忆让我能预见下一步 |
+| **Efficient** | 容量固定，更新代价恒定 |
+
+No symbols. No formulas. This slide should be readable by someone who has never seen a transformer.
+
+---
+
+### Slide 4 – Three Fundamental Questions (mirror 田世祚's 3 Problems)
+Frame them as **open questions of agent intelligence**, not engineering gaps:
+
+> **Q1: 记忆应该怎样演化？**
+> 静态存储 vs. 随动作不断推演？
+>
+> **Q2: 什么值得被记住？**
+> 全部写入 vs. 只写"意外"？
+>
+> **Q3: 记忆如何与思考融为一体？**
+> 外挂模块 vs. 原生能力？
+
+One question per line. No answers yet. Let the boss sit with the questions. This is exactly how 田世祚 structures his Problem 1/2/3.
+
+---
+
+### Slide 5 – What's Missing Today (Simplify the related work into ONE picture)
+**Kill the 3-column taxonomy table.** Replace with a single visual:
+
+> 现有路线：模型 + 外挂压缩器 → 两个系统，各管各的
+>
+> **我们的路线：一个模型，同时记忆、预测、决策**
+
+Draw two boxes:
+- Left: [LLM] + [Compressor] + [Memory Bank] → three pieces, arrows everywhere
+- Right: [One Unified Model: remembers · anticipates · decides] → one box
+
+The boss's complaint was *"我们不也是compressor吗？"* — so the differentiation must be **architectural philosophy**, not mechanism. The key sentence:
+
+> 我们不是"更好的压缩器"。我们取消了"压缩器"这个概念——**模型本身就是记忆。**
+
+---
+
+### Slide 6 – Our Answer in One Diagram (THE most important slide)
+**One clean figure. Zero equations. Zero Greek letters.**
+
+Show the agent loop:
+
+```
+Observe → [Memory predicts what comes next] → Surprise? → Update memory → Act
+              ↑_________________________________↓
+                    (the agent learns to remember)
+```
+
+Annotate with three plain-language labels:
+1. **先想一想**（Anticipate）：根据记忆和动作，先预测下一步会看到什么
+2. **只记新的**（Write the surprise）：预测对了→不更新；预测错了→写入差异
+3. **自然地用**（Native injection）：记忆以零扰动方式融入模型每一层
+
+No Kalman gain formula. No RNN diagram. The boss should understand the *logic* without understanding the *math*.
+
+---
+
+### Slide 7 – Why "Predictive Memory" Works (Intuition, not proof)
+A concrete, vivid example (like 田世祚's baby-with-toys example):
+
+> 一个 GUI 智能体第 3 次打开同一个 App。
+> - **没有预测性记忆**：重新截图、重新理解、重新试错。
+> - **有预测性记忆**：它已经"预期"到点击这个按钮会弹出那个窗口。当窗口真的出现——不更新。当出现了一个新弹窗——立刻写入。
+>
+> **记忆越准，需要记的越少。**
+
+This is the intellectual payoff. One example beats three architecture diagrams.
+
+---
+
+### Slide 8 – Results (ONE table, THREE numbers)
+**Kill the 4-row ablation table on first pass.** Lead with the headline:
+
+> | Method | Avg. Exploration Reward |
+> |---|---|
+> | No Memory | 15.9 |
+> | JAMEL (prior SOTA) | — |
+> | **COMPACT (ours)** | **18.0** |
+>
+> +13% over memory-less baseline, trained on 80 apps, tested on 10 unseen apps.
+
+One sentence takeaway. Ablations go to backup slides.
+
+---
+
+### Slide 9 – Where This Goes (Vision, 田世祚-style)
+Three bullets, each one line, each pointing to a big future:
+
+> - **跨 Session 记忆**：今天学到的，明天还在。
+> - **从数字到物理**：GUI → 机器人操作，记忆架构不变。
+> - **Agentic 预训练**：让探索与记忆成为预训练的原生能力，而非部署后的补丁。
+
+This echoes 田世祚's closing: *"Agent应当在预训练阶段具有原生的自主探索能力。"* The boss wants to see you're thinking at that altitude.
+
+---
+
+### Slide 10 – Thank You + Contact
+Clean. One line.
+
+---
+
+### Backup Slides (only if asked)
+- Detailed architecture (your current slides 8–10, simplified)
+- Full ablation table
+- Related work taxonomy
+
+---
+
+## Presentation Delivery Tips (for the big boss)
+
+1. **First 60 seconds = the "why."** Do not open with "我们的模型结构是…" Open with "今天所有agent都面临一个根本问题…"
+2. **Never say a symbol aloud.** If you must reference Kalman gain, say "根据不确定度决定写多少." The boss hears words, not equations.
+3. **Every technical choice maps to a principle.** Don't say "我们用RNN做状态转移." Say "记忆必须随动作演化，所以我们让模型先'想象'行动后果."
+4. **If a slide takes >30 seconds to explain, it's too complex.** The boss's own words: *"看不懂的话没有交流的价值."*
+5. **End on vision, not on ablations.** The last thing he should remember is *"这个组在想agent记忆的本质问题"*，not *"他们的卡尔曼增益调了0.3."*
+
+---
+
+**Bottom line:** Your current deck answers *"how does COMPACT work?"* The boss wants to hear *"why should I care, and what does this tell us about intelligence?"* Restructure around the insight, strip the engineering to backup, and let the thinking carry the talk. Less is more.
+
+### USER
+用中文给我说
+
+### ASSISTANT
+这份反馈非常精准，且与田世祚的PPT风格完全一致。老板的核心诉求是：**不要工程汇报，要思想引领；不要公式堆砌，要直觉洞察；Less is More。**
+
+下面我直接给你一套**可直接落地的重构方案**，逐页对照老板的反馈，给出修改后的标题、核心内容、配图建议及“人话”翻译。
+
+---
+### 🔍 核心诊断：为什么现在的版本老板不喜欢？
+| 现有PPT写法 | 老板/田世祚想要的写法 |
+|:---|:---|
+| 标题是模块名（流式记忆自压缩智能体） | 标题是研究命题（记忆即预测） |
+| 开头讲GUI工程瓶颈 | 开头讲智能体持续学习的本质问题 |
+| 用公式和符号证明“我们做了很多” | 用直觉和逻辑图证明“我们想得很透” |
+| “外挂压缩器+模型” | “模型本身就是记忆，取消压缩器” |
+| 技术细节占70%，洞察占30% | 洞察占70%，实现细节占30%（放备份） |
+
+---
+### 📝 重构后的PPT结构（建议 10-12 页）
+
+#### **Slide 1：标题页**
+- **旧标题**：`COMPACT：一个模型，压缩记忆、预期未来、做出决策 ——流式记忆自压缩智能体`
+- **新标题**：`记忆即预测：让智能体自主学会“记住”`
+  `Memory as Anticipation: Agents That Learn to Remember`
+- **理由**：老板原话“感觉是一个模型而不是智能体”。新标题突出**智能体的自主性**和**核心思想**，去掉“流式/自压缩”等工程词汇。
+
+#### **Slide 2：大背景（去GUI化，讲普适瓶颈）**
+- **标题**：`AI的下一个瓶颈：不是推理，是记忆`
+- **内容**：
+  - 当前Agent：离线训练 → 上线交互 → 历史轨迹爆炸 → 性能崩溃
+  - 核心矛盾：模型容量固定，但交互环境持续演化
+  - **关键提问**：如果Agent不能自己学会“记住”，就无法真正持续适应新环境
+- **配图**：一条随时间膨胀的“交互历史”曲线，最后压垮“模型能力”。**无文字堆砌，只有视觉冲击。**
+
+#### **Slide 3：理想记忆的3个本质问题（对标田的3 Problems）**
+- **标题**：`什么是“好”的记忆？`
+- **内容**（纯直觉，无指标）：
+  1. **记忆如何演化？** 静态存储 vs. 随动作不断推演？
+  2. **什么值得记住？** 全量写入 vs. 只记“意外”？
+  3. **记忆与决策是分离还是融合？** 外挂模块 vs. 原生能力？
+- **理由**：把工程挑战升维成智能体基础问题，让老板进入“思考模式”。
+
+#### **Slide 4：现有路线 vs 我们的路线（回应“为什么不也是compressor”）**
+- **标题**：`我们不是“更好的压缩器”，我们是“取消了压缩器”`
+- **内容**：
+  - **现有路线（外挂式）**：`[LLM] + [独立Compressor] + [Memory Bank]` → 两个系统，各管各的，计算图分离
+  - **我们的路线（内生式）**：`[一体化Agent：记忆演化 · 预测更新 · 决策生成]` → 记忆就是模型状态的一部分，没有独立压缩模块
+  - **一句话点透**：现有方法靠“压缩历史”腾空间；我们靠“预测未来”省更新。模型本身就是记忆。
+- **配图**：左右对比框图。左边三层积木箭头乱飞，右边一个完整圆环。
+
+#### **Slide 5：核心洞察（THE KEY SLIDE，放这里）**
+- **标题**：`先预测，再更新：记忆是“猜”出来的，不是“记”出来的`
+- **内容**（用白话讲逻辑）：
+  1. **想一想（Anticipate）**：根据当前记忆和即将执行的动作，先预测下一步会看到什么
+  2. **只记新的（Surprise）**：预测对了 → 不更新（省计算）；预测错了 → 写入差异
+  3. **自然地用（Native）**：记忆更新直接融入模型前向传播，不破坏预训练权重
+- **配图**：一个干净的闭环流程图：`记忆/动作 → 预测观测 → 计算“惊讶值” → 按惊讶值更新记忆 → 决策`。**无公式，无希腊字母。**
+
+#### **Slide 6-8：替代原8-10页（去符号、换人话）**
+老板原话：*“8-10页太复杂，符号太多，看不懂没有交流价值。标题英文晦涩，改中文。挑战与解法太抽象。”*
+
+| 原Slide | 新标题（中文） | 核心直觉（演讲词） | 配图建议 |
+|:---|:---|:---|:---|
+| 8. 挑战1+RNN状态转移 | `行动前“想一想”后果` | 记忆不能静态。我们让动作直接驱动记忆状态推演，模型先“想象”行动后的记忆变化。 | 动作箭头指向记忆状态，旁边标“推演(Prediction)” |
+| 9. 挑战2+卡尔曼滤波 | `信记忆还是信观测？` | 写多少合适？我们引入“不确定度”：记忆越稳，越信自己；观测越新，越信观测。动态平衡，不硬写。 | 天平图：左边“记忆不确定度”，右边“观测噪声”，中间“动态写入强度” |
+| 10. 挑战3+交叉注意/门控 | `记忆自然融入，不打扰思考` | 外挂记忆一开始会冲击模型。我们让注入模块从0开始学，各层按需决定“借多少记忆”，训练完自然长进模型里。 | 漏斗/门控图：记忆流经各层，每层一个滑动条“借用强度” |
+
+> 💡 **执行建议**：这3页每张只留**1个核心逻辑框+3行以内中文说明**。所有公式（卡尔曼增益、交叉注意力公式、RNN递推式）全部打入 `Backup Slides`。
+
+#### **Slide 9：实验结果（Less is More）**
+- **标题**：`在未知环境中，自主探索奖励提升 13%`
+- **内容**：
+  - 仅放核心对比柱状图/表格：`Baseline(15.9) vs COMPACT(18.0)`
+  - 一句话结论：`固定记忆容量 + O(1)更新 → 显著提升未知环境探索效率`
+- **理由**：老板要结论，不要消融实验过程。所有 `w/o aux loss / w/o mem writing` 放入备份页。
+
+#### **Slide 10：未来愿景（对标田的结尾）**
+- **标题**：`迈向原生的 Agent 持续学习`
+- **内容**（3条，每条1行）：
+  - **跨 Session 记忆**：今天学到的，明天还能用（数字世界长期适应）
+  - **从屏幕到物理**：GUI → 机器人，记忆架构统一（具身智能扩展）
+  - **Agent 预训练**：让“探索与记忆”成为预训练的原生能力，而非部署后的补丁
+- **理由**：呼应田世祚的 `Agent应当在预训练阶段具有原生的自主探索能力`，展现战略高度。
+
+#### **Slide 11：Q&A / Thank You**
+干净结束。
+
+---
+### 🗣️ 给老板汇报的 4 条铁律
+
+1. **前90秒绝不碰架构**：开场只讲“为什么所有Agent都面临记忆瓶颈”和“人脑记忆的本质是预测而非录像”。
+2. **永远用“现象-直觉-方案”代替“公式-推导-实现”**：不要说“我们引入卡尔曼增益公式”，要说“我们让模型自己学会根据不确定度动态决定写多少”。
+3. **遇到技术细节，主动降维**：如果老板问“交叉注意力具体怎么做的？”，回答：“核心逻辑是记忆按需查询，数学形式化我们放在备份页了，核心是为了保证注入时零扰动。”
+4. **结尾必须拔高**：不要停在“消融实验证明了模块有效性”。要停在“这套机制为Agent预训练提供了一条低开销持续学习的路径”。
+
+按这个结构改完，你的PPT会从“一个复杂的工程实现”变成“一个有哲学洞察的智能体研究”。如果需要，我可以帮你把某一张具体PPT的旧文案直接“翻译”成老板喜欢的新文案。
+
+### USER
+Backup Slides是放在thank you后面还是单独做一个PPT？给一版你上述思路的markdown，包含ppt骨架与每一页文案等细节。优化一下用语，人读起来明白通顺，又具有学术的严谨性。
+
+### ASSISTANT
+# 关于 Backup Slides 的放置
+
+**推荐：放在 Thank You 后面，同一个文件内。**
+
+理由：
+- 老板问到技术细节时，你可以自然地说"这部分我准备了备份页"，然后直接翻页，不手忙脚乱切文件。
+- 体现"我想了很多，但选择只讲核心"的从容感，而不是"我全堆在主流程里"。
+- 如果备份超过 8 页，可以单独存一份 PDF 备用，但主文件里保留 3–5 页最可能被问到的。
+
+---
+
+# COMPACT 汇报 PPT 完整文案（Markdown）
+
+---
+
+## Slide 1 · 标题页
+
+**标题：**
+> 记忆即预测：让智能体自主学会"记住"
+
+**副标题：**
+> Memory as Anticipation — Agents That Learn to Remember by Themselves
+
+**信息栏：**
+> 汇报人：宋玥兵 ｜ 2026.8.5 ｜ AIR, Tsinghua University
+
+**设计说明：**
+- 背景干净，AIR logo 居右上角
+- 不放任何模型架构图、不放公式
+- 标题字号大，一眼可读
+
+---
+
+## Slide 2 · 大背景：AI 的下一个瓶颈
+
+**标题：**
+> AI 的下一个瓶颈：不是推理，是记忆
+
+**正文（3 行，不超过 3 行）：**
+> - 当前范式：云端预训练 → 部署推理 → 上下文窗口填满 → 性能坍塌
+> - 核心矛盾：模型容量固定，但交互历史无限增长
+> - 关键问题：**智能体能否在部署后，继续从自身交互中学习？**
+
+**配图建议：**
+- 左侧：一条随时间无限膨胀的"交互轨迹"曲线
+- 右侧：一个固定大小的"模型容量"方框，被曲线压满溢出
+- 中间用一个红色"×"或断裂符号表示"此路不通"
+
+**演讲提示：**
+> "今天我们所有的大模型 Agent，训练完就定格了。部署之后，它只能靠上下文窗口'硬撑'。窗口一满，要么截断，要么性能崩。这不是工程问题，这是范式问题。"
+
+---
+
+## Slide 3 · 什么是"好的记忆"？
+
+**标题：**
+> 人脑不是录像机——好的记忆是"预期"，不是"存储"
+
+**正文：**
+> 人不会记住今天看到的每一帧画面，但能**预测**下一秒会发生什么。
+>
+> 由此，我们提出好记忆的三条判据：
+
+| 判据 | 含义 |
+|:---:|:---|
+| **Useful** | 记忆为当下决策服务，而非无差别堆积 |
+| **Predictive** | 记忆让我能预见行动后果，而非仅回溯过去 |
+| **Efficient** | 容量固定、更新代价恒定，不随交互步数膨胀 |
+
+**配图建议：**
+- 上方：一个婴儿玩玩具的示意图（致敬田世祚风格），旁边标注"预测→验证→更新认知"
+- 下方：三列表格，简洁排版
+
+**演讲提示：**
+> "传统记忆系统在做'录像'——把历史压短、存起来。但人脑不是这样工作的。人脑是一个预测机器：我记住的不是过去，而是'接下来大概会怎样'。COMPACT 的出发点就是：把记忆从'回顾'变成'预期'。"
+
+---
+
+## Slide 4 · 三个根本问题
+
+**标题：**
+> 让智能体"学会记住"，需要回答三个根本问题
+
+**正文（每问一行，不展开）：**
+
+> **Q1：记忆如何随行动演化？**
+> 静态存储无法跟上动态世界。记忆必须随动作"推演"。
+>
+> **Q2：什么信息值得被写入？**
+> 全量写入既昂贵又冗余。应当只写"预期之外"的部分。
+>
+> **Q3：记忆如何与推理融为一体？**
+> 外挂模块破坏模型原生能力。记忆应当"长"在模型里面。
+
+**配图建议：**
+- 三行文字，左侧各配一个极简 icon（齿轮/过滤器/融合环）
+- 不放任何技术名词
+
+**演讲提示：**
+> "这三个问题不是我们发明的工程需求，而是任何持续学习的智能体都绕不开的基本问题。接下来我逐一讲我们的回答。"
+
+---
+
+## Slide 5 · 现有路线 vs 我们的路线
+
+**标题：**
+> 我们不是"更好的压缩器"——我们取消了"压缩器"这个概念
+
+**正文：**
+
+> **现有路线（外挂式）：**
+> `[交互历史] → [独立 Compressor] → [Latent Token] → [LLM 决策]`
+> 三个模块各管各的；Compressor 额外占显存；记忆随交互线性增长。
+>
+> **我们的路线（内生式）：**
+> `[一体化 Agent：记忆演化 · 预测更新 · 决策生成，同一前向传播完成]`
+> 没有独立压缩模块；记忆容量固定；更新代价 O(1)。
+
+**配图建议：**
+- 上半部分：三个分离的方框，箭头连接，标注"Compressor / Memory / LLM"
+- 下半部分：一个完整的圆环，内部标注"记忆 · 预测 · 决策"，无外部箭头
+- 中间一个醒目的对比分隔线
+
+**演讲提示：**
+> "老板之前问：你们不也是 compressor 吗？关键区别在这里：传统方法有一个'独立于模型之外'的压缩器，它是一个额外模块、额外计算图。我们没有这个东西。记忆的读写、更新、注入，全部发生在模型自身的前向传播里。模型本身就是记忆。"
+
+---
+
+## Slide 6 · 核心机制：先预测，再更新
+
+**标题：**
+> 核心逻辑：先"想一想"，只记"意外"
+
+**正文（四步闭环，每步一句话）：**
+
+> ① **预测（Anticipate）**：根据当前记忆 + 即将执行的动作，先推演"下一步会看到什么"
+>
+> ② **对比（Compare）**：将预测与实际观测对比，计算"惊讶程度"
+>
+> ③ **更新（Write the Surprise）**：惊讶大 → 写入差异；惊讶小 → 不更新，节省容量
+>
+> ④ **决策（Act）**：基于更新后的记忆做出下一步行动
+
+**配图建议：**
+- 一个干净的环形流程图，四个节点用中文标注
+- 环中心写一行字：**"记忆越准，需要记的越少"**
+- 无公式、无符号
+
+**演讲提示：**
+> "这是整个方法最核心的一句话：记忆不是'看到什么记什么'，而是'预测错了才记'。就像人走路，你不会记住每一步踩到了哪块砖，但如果你踩空了一级台阶，你立刻会记住。这就是'只记意外'。"
+
+---
+
+## Slide 7 · 回答 Q1：记忆随行动演化
+
+**标题：**
+> Q1 的回答：行动前，先"想象"后果
+
+**正文：**
+> - 传统记忆：静态存储，与动作无关
+> - 我们的做法：将动作编码为控制信号，驱动记忆状态向前推演
+> - 效果：记忆不再是"过去的快照"，而是"对未来的预期"
+> - 预测质量受辅助损失直接监督——"想错了"会被纠正
+
+**配图建议：**
+- 左侧：一个静止的记忆方块（标注"传统：静态"）
+- 右侧：动作箭头推动记忆方块变形/演化（标注"我们：动态推演"）
+- 下方一行小字：`记忆状态 ← 动作驱动转移 ← 预测损失监督`
+
+**演讲提示：**
+> "记忆不能是死的。你点了一个按钮，记忆就应该'预演'点完之后界面会变成什么样。我们用动作信号驱动记忆状态转移，并用预测损失确保这个推演是准确的。"
+
+---
+
+## Slide 8 · 回答 Q2：只写"意外"
+
+**标题：**
+> Q2 的回答：信记忆还是信观测？由不确定度动态决定
+
+**正文：**
+> - 核心问题：观测来了，写多少进记忆？
+> - 我们的做法：建模记忆的"不确定度"
+>   - 记忆越确定 → 越信自己 → 少写
+>   - 观测越新颖 → 越信观测 → 多写
+> - 效果：写入强度不是固定规则，而是随情境自适应调节
+
+**配图建议：**
+- 一个天平图：左盘"记忆确定度"，右盘"观测新颖度"
+- 天平倾斜方向决定"写入量"的大小
+- 旁边标注：`确定 → 少写 ｜ 意外 → 多写`
+
+**演讲提示：**
+> "写入多少，不能一刀切。我们借鉴卡尔曼滤波的思想：如果记忆已经很确定了，新观测来了也不急着改；如果记忆本身不确定、观测又很新，那就大幅更新。这个权衡是模型自己学出来的，不是我们手调的。"
+
+---
+
+## Slide 9 · 回答 Q3：记忆自然融入模型
+
+**标题：**
+> Q3 的回答：记忆"长"进模型，不干扰原有能力
+
+**正文：**
+> - 问题：外挂记忆一上来就冲击预训练权重，模型"不适应"
+> - 我们的做法：
+>   - 注入模块从零开始学习 → 训练起点严格等价于原始模型
+>   - 每一层自行决定"借多少记忆" → 按需注入，不强制
+>   - 端到端联合优化 → 记忆与推理共同进化
+> - 效果：推理时，记忆已完全融入模型，无额外开销
+
+**配图建议：**
+- 一个竖向的 Transformer 层叠图
+- 旁边有一条"记忆流"，通过小阀门（门控）接入每一层
+- 标注：`零初始化 → 渐进生长 → 自然融合`
+
+**演讲提示：**
+> "外挂记忆最大的问题是'排异反应'——一插进去，模型原有的能力就被打乱了。我们的解法是：让记忆注入从零开始'长'出来。一开始完全不影响模型，随着训练慢慢学会在哪些层、什么时机借用记忆。最终，记忆和模型浑然一体。"
+
+---
+
+## Slide 10 · 实验结果
+
+**标题：**
+> 在未见环境中，自主探索奖励提升 13%
+
+**正文：**
+> | 方法 | 平均探索奖励 |
+> |:---:|:---:|
+> | Baseline（无记忆） | 15.9 |
+> | **COMPACT（本文）** | **18.0** |
+>
+> - 训练：80+ App 上的 2400 步专家演示
+> - 测试：10 个**从未见过**的 App，每个交互 50 步
+> - 关键：固定记忆容量，O(1) 更新，无上下文膨胀
+
+**配图建议：**
+- 一个简洁的柱状图，两根柱子，颜色对比鲜明
+- 旁边一行大字：`+13%`
+- 不放消融表格（放 Backup）
+
+**演讲提示：**
+> "在完全没见过的 App 上，有记忆的 COMPACT 比无记忆基线高了 13%。更重要的是：这个提升是在记忆容量完全固定的条件下取得的，不靠堆上下文。"
+
+---
+
+## Slide 11 · 愿景与未来
+
+**标题：**
+> 迈向原生的 Agent 持续学习
+
+**正文（三条，每条一行）：**
+> - **跨 Session 记忆**：今天学到的，明天还在——数字世界的长期适应
+> - **从屏幕到物理**：GUI → 机器人操作——记忆架构统一，场景可扩展
+> - **Agent 预训练**：让探索与记忆成为预训练的原生能力，而非部署后的补丁
+
+**配图建议：**
+- 三个并列的圆角矩形，分别标注上述三个方向
+- 底部一行总结：`记忆不是附加模块，而是智能的基本能力`
+
+**演讲提示：**
+> "最后说一下我们看的方向。COMPACT 不只是一个 GUI 记忆方案。它的核心思想——预测性记忆、按需更新、内生融合——是通用的。下一步我们会把它推到跨 Session 的长期记忆、推到具身智能、最终推到 Agent 预训练阶段。让'学会记住'变成 Agent 的天生能力。"
+
+---
+
+## Slide 12 · Thank You
+
+> **Thank You**
+>
+> 宋玥兵 ｜ AIR, Tsinghua University
+>
+> *Q & A*
+
+---
+
+---
+
+# Backup Slides（放在 Thank You 之后，同一文件）
+
+## Backup A · 模型整体架构图
+
+**标题：** `附录：COMPACT 模型整体架构`
+
+- 放完整的模型框架图（原 Slide 7 的图）
+- 标注三个核心模块：记忆推演 / 校准更新 / 层级注入
+- 不展开公式，仅做结构说明
+
+---
+
+## Backup B · 记忆状态转移的数学形式
+
+**标题：** `附录：动作驱动的记忆状态转移`
+
+- RNN 状态转移公式（简化版）
+- 辅助预测损失的定义
+- 一页讲完，不超过 5 行公式
+
+---
+
+## Backup C · 不确定度校准更新的数学形式
+
+**标题：** `附录：基于不确定度的校准式更新`
+
+- 卡尔曼增益的直觉解释 + 简化公式
+- 交叉注意力生成"新息"的示意
+- 一页讲完
+
+---
+
+## Backup D · 零初始化注入的数学形式
+
+**标题：** `附录：零初始化生长的层级注入`
+
+- 门控机制公式
+- 互注意力注入的计算流程
+- 一页讲完
+
+---
+
+## Backup E · 完整消融实验
+
+**标题：** `附录：COMPACT-2B 消融实验`
+
+| Configuration | Avg. Reward |
+|:---:|:---:|
+| Baseline | 15.9 |
+| w/o mem. writing | 16.8 |
+| w/o aux. loss | 14.5 |
+| **COMPACT** | **18.0** |
+
+- 简要说明每个消融的含义
+
+---
+
+## Backup F · 与三类记忆路线的详细对比
+
+**标题：** `附录：三类记忆路线对比`
+
+- 明文记忆 / 参数化记忆 / 隐状态记忆的完整对比表
+- 标注 COMPACT 在隐状态记忆中的定位
+
+---
+
+# 附：关键用语优化对照表
+
+| 原表述（工程味重） | 优化后（直觉 + 学术严谨） |
+|:---|:---|
+| 摒弃 Compressor | 取消独立压缩模块，将记忆管理内化为模型自身能力 |
+| 卡尔曼增益 × 新息 | 基于不确定度动态决定写入强度：记忆越确定，更新越保守 |
+| RNN 预测记忆的转移 | 以动作信号驱动记忆状态向前推演 |
+| 交叉注意力各槽位按需检索 | 各记忆单元自主决定从观测中提取哪些差异信息 |
+| 零初始化生长 | 注入模块从"零影响"起步，随训练渐进融入模型 |
+| 侧边记忆库 | 模型内部的固定容量记忆状态 |
+| O(1) 更新 | 每步更新代价恒定，不随交互步数增长 |
+| 流式记忆自压缩智能体 | 让智能体自主学会"记住"——记忆即预测 |
+
+---
+
+# 最终检查清单（对照老板反馈逐条确认）
+
+| 老板原话 | 本版处理 |
+|:---|:---|
+| "题目感觉是一个模型而不是智能体" | ✅ 改为"让智能体自主学会记住" |
+| "没必要说 GUI Agent，讲普适一点" | ✅ 全篇以"智能体/Agent"为主语，不绑定 GUI |
+| "为什么不也是 compressor？" | ✅ Slide 5 专页解释：内生 vs 外挂的本质区别 |
+| "8-10 页太复杂，看不懂" | ✅ 拆为 Slide 7/8/9，每页一个直觉，零公式 |
+| "符号太多" | ✅ 主流程无任何数学符号，全部移入 Backup |
+| "标题英文晦涩，改中文" | ✅ 所有标题改为中文 |
+| "挑战与解法太抽象" | ✅ 每个挑战用一句"现象"引入，解法用一句"直觉"概括 |
+| "让 PPT 自解释" | ✅ 每页文字不超过 5 行，配图承载主要信息 |
+| "Less is More" | ✅ 主流程 12 页，技术细节全部进 Backup |
+
+---
+
+如果需要，我可以进一步帮你把每一页的**配图草图**用文字描述得更具体（方便你交给设计或直接画），或者帮你写**逐页演讲逐字稿**。

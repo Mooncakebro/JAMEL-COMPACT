@@ -22,10 +22,9 @@ The dataset yields:
 from __future__ import annotations
 
 import io
-import json
 import random
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import List
 
 import pandas as pd
 from PIL import Image
@@ -532,21 +531,24 @@ def session_collate_fn(batch, pad_token_id: int = 0) -> dict:
         "step_indices": [item["step_idx"] for item in chunk],
         "step_valids": step_valids,
         "chunk_size": len(chunk),
+        "state_id": chunk[0].get("_chunk_state_id", chunk[0]["session_id"]),
+        "chunk_index": int(chunk[0].get("_chunk_chunk_index", 0)),
+        "is_first_chunk": bool(chunk[0].get("_chunk_is_first_chunk", True)),
+        "is_last_chunk": bool(chunk[0].get("_chunk_is_last_chunk", True)),
+        "is_dummy_chunk": bool(chunk[0].get("_chunk_is_dummy", False)),
+        "distributed_loss_scale": float(chunk[0].get("_chunk_loss_scale", 1.0)),
     }
 
     return result
 
 
 class SessionChunkDataset(Dataset):
-    """
-    Dataset that groups consecutive steps from the same session into chunks.
+    """Group consecutive session steps into ordered TBPTT chunks.
 
-    This enables sequence-level training where the side memory (FiLM-GRU +
-    Kalman filter) evolves across multiple steps, training the recurrent
-    dynamics that the model needs at inference time.
-
-    Each item is a list of consecutive step dicts from the same session.
-    The chunk_size parameter controls how many steps per chunk.
+    Chunks from one contiguous session run retain their chronological order.
+    Samplers may shuffle complete runs, but they must never shuffle chunks
+    within a run because the training loop carries recurrent state across
+    chunk boundaries.
     """
 
     def __init__(
@@ -573,8 +575,6 @@ class SessionChunkDataset(Dataset):
         self.image_key = image_key
         self.action_key = action_key
 
-        # Accept either an already-built CompactDataset (avoids re-reading
-        # parquet files) or parquet file paths to build a new one.
         if isinstance(base_dataset_or_files, CompactDataset):
             self._base = base_dataset_or_files
         else:
@@ -597,73 +597,102 @@ class SessionChunkDataset(Dataset):
                 image_key=image_key,
                 action_key=action_key,
             )
-        # F7: propagate coverage weight eta to the base dataset
         self._base._coverage_weight_eta = coverage_weight_eta
         self.dataframe = self._base.dataframe
         self._build_chunks()
 
     def _build_chunks(self):
-        """Group consecutive steps from the same session into chunks."""
+        """Build ordered chunks and split state sequences at missing steps."""
         df = self.dataframe
         valid_indices = self._base._valid_indices
 
-        # Group by session_id. session_step_idx is monotonic across reset-local
-        # episodes; step_idx restarts at every reset and must not be used here.
         session_groups = {}
         for dataset_idx, row_idx in enumerate(valid_indices):
             row = df.iloc[row_idx]
-            sid = str(row.get("session_id", ""))
+            session_id = str(row.get("session_id", ""))
             order_idx = int(row.get("session_step_idx", row.get("step_idx", 0)))
-            if sid not in session_groups:
-                session_groups[sid] = []
-            # Store CompactDataset positions, not raw dataframe indices.
-            session_groups[sid].append((order_idx, dataset_idx))
+            session_groups.setdefault(session_id, []).append((order_idx, dataset_idx))
 
-        # Sort by the continuous session index and split at missing steps so a
-        # dropped sample cannot silently bridge unrelated observations.
         self._chunks = []
-        for sid, steps in session_groups.items():
-            steps.sort(key=lambda x: x[0])
+        self._chunk_metadata = []
+        self._sequence_chunks = []
+        for session_id, steps in session_groups.items():
+            steps.sort(key=lambda value: value[0])
             runs = []
             run = []
             previous_order = None
-            for order_idx, row_idx in steps:
+            for order_idx, dataset_idx in steps:
                 if previous_order is not None and order_idx != previous_order + 1:
                     if run:
                         runs.append(run)
                     run = []
-                run.append((order_idx, row_idx))
+                run.append((order_idx, dataset_idx))
                 previous_order = order_idx
             if run:
                 runs.append(run)
 
-            for run in runs:
-                for i in range(0, len(run), self.chunk_size):
-                    chunk = run[i:i + self.chunk_size]
-                    if chunk:
-                        self._chunks.append([idx for _, idx in chunk])
+            for run_index, contiguous_run in enumerate(runs):
+                run_chunks = [
+                    contiguous_run[offset:offset + self.chunk_size]
+                    for offset in range(0, len(contiguous_run), self.chunk_size)
+                ]
+                sequence_indices = []
+                state_id = f"{session_id}::run{run_index}"
+                for chunk_index, chunk in enumerate(run_chunks):
+                    dataset_chunk_index = len(self._chunks)
+                    self._chunks.append([dataset_idx for _, dataset_idx in chunk])
+                    self._chunk_metadata.append({
+                        "session_id": session_id,
+                        "state_id": state_id,
+                        "chunk_index": chunk_index,
+                        "num_chunks": len(run_chunks),
+                        "is_first_chunk": chunk_index == 0,
+                        "is_last_chunk": chunk_index + 1 == len(run_chunks),
+                    })
+                    sequence_indices.append(dataset_chunk_index)
+                if sequence_indices:
+                    self._sequence_chunks.append(sequence_indices)
 
-        # Shuffle chunk order (DataLoader will also shuffle, but this helps
-        # when shuffle=True samples are drawn)
-        random.shuffle(self._chunks)
-
-        total_steps = sum(len(c) for c in self._chunks)
-        print(f"[data] SessionChunkDataset: {len(self._chunks)} chunks "
-              f"(chunk_size={self.chunk_size}), {total_steps} total steps, "
-              f"avg {total_steps / max(len(self._chunks), 1):.1f} steps/chunk")
+        total_steps = sum(len(chunk) for chunk in self._chunks)
+        print(
+            f"[data] SessionChunkDataset: {len(self._chunks)} chunks across "
+            f"{len(self._sequence_chunks)} ordered sequence(s) "
+            f"(chunk_size={self.chunk_size}), {total_steps} total steps, "
+            f"avg {total_steps / max(len(self._chunks), 1):.1f} steps/chunk"
+        )
 
     def __len__(self) -> int:
         return len(self._chunks)
 
-    def __getitem__(self, index: int) -> list[dict]:
-        """Return a list of step dicts for one chunk."""
-        chunk_indices = self._chunks[index]
+    def __getitem__(self, index) -> list[dict]:
+        """Return one real chunk or an all-invalid synchronization chunk."""
+        index_kind = index[0] if isinstance(index, tuple) and index else None
+        is_dummy = index_kind == "__dummy__"
+        is_weighted = index_kind == "__weighted__"
+        actual_index = int(index[1]) if is_dummy or is_weighted else int(index)
+        loss_scale = float(index[2]) if is_weighted else (0.0 if is_dummy else 1.0)
+        chunk_indices = self._chunks[actual_index]
+        metadata = dict(self._chunk_metadata[actual_index])
+        if is_dummy:
+            metadata.update({
+                "session_id": f"__dummy_rank{index[2]}",
+                "state_id": f"__dummy_rank{index[2]}_{index[3]}",
+                "chunk_index": 0,
+                "num_chunks": 1,
+                "is_first_chunk": True,
+                "is_last_chunk": True,
+            })
+
         items = []
         for item_index in chunk_indices:
             item = self._base[item_index]
             if item is not None:
                 item = dict(item)
-                item["_chunk_step_valid"] = True
+                item["_chunk_step_valid"] = not is_dummy
+                item["_chunk_is_dummy"] = is_dummy
+                item["_chunk_loss_scale"] = loss_scale
+                for key, value in metadata.items():
+                    item[f"_chunk_{key}"] = value
                 items.append(item)
 
         target_length = None
@@ -687,8 +716,37 @@ class SessionChunkDataset(Dataset):
         return items
 
 
+class SessionChunkSampler(Sampler):
+    """Shuffle complete state sequences while preserving chunk order."""
+
+    def __init__(self, dataset: SessionChunkDataset, shuffle: bool = True, seed: int = 0):
+        self.dataset = dataset
+        self.shuffle = shuffle
+        self.seed = seed
+        self.epoch = 0
+
+    def _indices(self) -> list[int]:
+        sequence_order = list(range(len(self.dataset._sequence_chunks)))
+        if self.shuffle:
+            random.Random(self.seed + self.epoch).shuffle(sequence_order)
+        return [
+            chunk_index
+            for sequence_index in sequence_order
+            for chunk_index in self.dataset._sequence_chunks[sequence_index]
+        ]
+
+    def __iter__(self):
+        return iter(self._indices())
+
+    def __len__(self) -> int:
+        return len(self.dataset)
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
+
+
 class SynchronizedChunkDistributedSampler(Sampler):
-    """Assign equal-length recurrent chunks to all ranks per iteration."""
+    """Assign complete ordered sequences to ranks with equal iteration counts."""
 
     def __init__(
         self,
@@ -705,45 +763,49 @@ class SynchronizedChunkDistributedSampler(Sampler):
         self.seed = seed
         self.epoch = 0
 
-    def _groups(self) -> list[list[int]]:
-        buckets = {}
-        for index, chunk in enumerate(self.dataset._chunks):
-            buckets.setdefault(len(chunk), []).append(index)
-
+    def _rank_indices(self) -> list[list]:
+        sequence_order = list(range(len(self.dataset._sequence_chunks)))
         rng = random.Random(self.seed + self.epoch)
-        groups = []
-        for chunk_length in sorted(buckets):
-            indices = list(buckets[chunk_length])
-            if self.shuffle:
-                rng.shuffle(indices)
-            group_count = (
-                len(indices) + self.num_replicas - 1
-            ) // self.num_replicas
-            padded_count = group_count * self.num_replicas
-            padded_indices = [
-                indices[position % len(indices)]
-                for position in range(padded_count)
-            ]
-            groups.extend([
-                padded_indices[start:start + self.num_replicas]
-                for start in range(0, padded_count, self.num_replicas)
-            ])
-
         if self.shuffle:
-            rng.shuffle(groups)
-        return groups
+            rng.shuffle(sequence_order)
+        sequence_order.sort(
+            key=lambda index: len(self.dataset._sequence_chunks[index]),
+            reverse=True,
+        )
+
+        rank_indices = [[] for _ in range(self.num_replicas)]
+        for sequence_index in sequence_order:
+            target_rank = min(
+                range(self.num_replicas),
+                key=lambda rank: len(rank_indices[rank]),
+            )
+            rank_indices[target_rank].extend(
+                self.dataset._sequence_chunks[sequence_index]
+            )
+
+        real_lengths = [len(indices) for indices in rank_indices]
+        target_length = max(real_lengths, default=0)
+        template_index = 0
+        for rank, indices in enumerate(rank_indices):
+            for padding_index in range(target_length - len(indices)):
+                indices.append(("__dummy__", template_index, rank, padding_index))
+
+        for position in range(target_length):
+            active_ranks = sum(position < length for length in real_lengths)
+            loss_scale = self.num_replicas / max(active_ranks, 1)
+            for rank in range(self.num_replicas):
+                if position < real_lengths[rank]:
+                    rank_indices[rank][position] = (
+                        "__weighted__", rank_indices[rank][position], loss_scale,
+                    )
+        return rank_indices
 
     def __iter__(self):
-        return iter(group[self.rank] for group in self._groups())
+        return iter(self._rank_indices()[self.rank])
 
     def __len__(self) -> int:
-        bucket_counts = {}
-        for chunk in self.dataset._chunks:
-            bucket_counts[len(chunk)] = bucket_counts.get(len(chunk), 0) + 1
-        return sum(
-            (count + self.num_replicas - 1) // self.num_replicas
-            for count in bucket_counts.values()
-        )
+        rank_indices = self._rank_indices()
+        return len(rank_indices[self.rank])
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = epoch
