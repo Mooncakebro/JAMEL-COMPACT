@@ -44,3 +44,5 @@ trouble_list.txt
 *.png
 *.pdf
 *Reply.txt
+qwen*
+deck_outline.md
