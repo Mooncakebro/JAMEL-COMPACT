@@ -355,6 +355,21 @@ def run_browser_evaluation(
                     think = result["think"]
                     raw_response = result["raw_response"]
                     prompt = result["prompt"]
+                    model_debug = {
+                        key: result.get(key)
+                        for key in (
+                            "model_input_text",
+                            "chat_messages_json",
+                            "input_token_count_before_truncation",
+                            "model_input_token_count",
+                            "input_truncated",
+                            "input_image_size",
+                            "previous_action",
+                            "memory_before_summary",
+                            "memory_after_summary",
+                        )
+                        if key in result
+                    }
 
                     if on_step_decision is not None:
                         on_step_decision(app, step_idx_in_session)
@@ -381,6 +396,7 @@ def run_browser_evaluation(
                             "think": think,
                             "raw_response": raw_response,
                             "prompt": prompt,
+                            **model_debug,
                             "reward": 0.0,
                             "delta_score": 0,
                             "previous_score": last_coverage_score,
@@ -414,6 +430,7 @@ def run_browser_evaluation(
                             "think": think,
                             "raw_response": raw_response,
                             "prompt": prompt,
+                            **model_debug,
                             "reward": 0.0,
                             "delta_score": 0,
                             "previous_score": last_coverage_score,
@@ -468,6 +485,7 @@ def run_browser_evaluation(
                         "think": think,
                         "raw_response": raw_response,
                         "prompt": prompt,
+                        **model_debug,
                         "reward": reward,
                         "delta_score": reward_details.get("delta_score", 0),
                         "previous_score": reward_details.get("previous_score", 0),

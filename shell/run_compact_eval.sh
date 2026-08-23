@@ -32,6 +32,7 @@ RESET_RETRIES=${RESET_RETRIES:-3}
 MAX_INPUT_TOKENS=${MAX_INPUT_TOKENS:-8192}
 MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-256}
 SAVE_SCREENSHOTS=${SAVE_SCREENSHOTS:-0}
+SAVE_VLM_DEBUG=${SAVE_VLM_DEBUG:-0}
 ENABLE_LINEAR_PROBE=${ENABLE_LINEAR_PROBE:-0}
 PORT=${PORT:-0}                  # 0 = automatically reserve a free port
 RESUME=${RESUME:-1}              # 1 = skip completed app/session entries
@@ -59,6 +60,9 @@ fi
 if [[ "$SAVE_SCREENSHOTS" == "1" ]]; then
     OPTIONAL_ARGS+=(--save-screenshots)
 fi
+if [[ "$SAVE_VLM_DEBUG" == "1" ]]; then
+    OPTIONAL_ARGS+=(--save-vlm-debug)
+fi
 if [[ "$ENABLE_LINEAR_PROBE" == "1" ]]; then
     OPTIONAL_ARGS+=(--enable-linear-probe)
 fi
@@ -79,6 +83,7 @@ echo "  Reset retries: $RESET_RETRIES"
 echo "  Browser ms:   $BROWSER_TIMEOUT_MS"
 echo "  Input tokens: $MAX_INPUT_TOKENS"
 echo "  New tokens:   $MAX_NEW_TOKENS"
+echo "  VLM debug:    $SAVE_VLM_DEBUG"
 echo "  Linear probe: $ENABLE_LINEAR_PROBE"
 echo "  Port:         $([[ "$PORT" == "0" ]] && echo auto || echo "$PORT")"
 echo "  Resume:       $RESUME"

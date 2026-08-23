@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import json
 import os
 import re
 import sys
@@ -102,6 +103,7 @@ class BaselineAgent:
         max_new_tokens: int = 256,
         max_input_tokens: int = 8192,
         image_resize: tuple = (640, 360),
+        save_vlm_debug: bool = False,
     ):
         print(f"[agent] Loading baseline Qwen3-VL from {checkpoint} ...")
 
@@ -188,6 +190,7 @@ class BaselineAgent:
         self.max_new_tokens = max_new_tokens
         self.max_input_tokens = max_input_tokens
         self.image_resize = image_resize
+        self.save_vlm_debug = save_vlm_debug
 
         # Step counter (for prompt building, same format as compact eval)
         self._session_step_idx = 0
@@ -261,10 +264,12 @@ class BaselineAgent:
 
         # Truncate to max_input_tokens (keep the most recent tokens)
         orig_len = inputs["input_ids"].shape[1]
+        input_truncated = orig_len > self.max_input_tokens
         if orig_len > self.max_input_tokens:
             for k in list(inputs.keys()):
                 if hasattr(inputs[k], "shape") and inputs[k].shape[-1] == orig_len:
                     inputs[k] = inputs[k][..., -self.max_input_tokens:]
+        model_input_len = inputs["input_ids"].shape[1]
 
         # ── Generate (standard HF generate, no memory) ──
         # Do not kill the whole evaluator from a background timer.  A slow
@@ -288,12 +293,22 @@ class BaselineAgent:
 
         self._session_step_idx += 1
 
-        return {
+        result = {
             "action": action,
             "think": think,
             "raw_response": raw_response,
             "prompt": prompt,
         }
+        if self.save_vlm_debug:
+            result.update({
+                "model_input_text": prompt_text,
+                "chat_messages_json": json.dumps(messages, ensure_ascii=False),
+                "input_token_count_before_truncation": int(orig_len),
+                "model_input_token_count": int(model_input_len),
+                "input_truncated": bool(input_truncated),
+                "input_image_size": list(image.size),
+            })
+        return result
 
 
 # ── Evaluation loop (same structure as compact eval) ──
@@ -316,6 +331,7 @@ def run_eval(
     max_input_tokens: int = 8192,
     max_new_tokens: int = 256,
     save_screenshots: bool = False,
+    save_vlm_debug: bool = False,
     resume: bool = True,
 ):
     """Run baseline Qwen3-VL evaluation with per-session crash recovery."""
@@ -328,6 +344,7 @@ def run_eval(
         top_p=top_p,
         max_input_tokens=max_input_tokens,
         max_new_tokens=max_new_tokens,
+        save_vlm_debug=save_vlm_debug,
     )
     return run_browser_evaluation(
         agent=agent,
@@ -375,6 +392,8 @@ def main():
     parser.add_argument("--max-new-tokens", type=int, default=256)
     parser.add_argument("--save-screenshots", action="store_true",
                         help="Save before/after screenshots (uses extra disk and CPU)")
+    parser.add_argument("--save-vlm-debug", action="store_true",
+                        help="Record exact processor-rendered VLM input metadata")
     parser.add_argument("--no-resume", action="store_true",
                         help="Ignore prior eval_summary.json results and rerun all sessions")
     args = parser.parse_args()
@@ -440,6 +459,7 @@ def main():
             max_input_tokens=args.max_input_tokens,
             max_new_tokens=args.max_new_tokens,
             save_screenshots=args.save_screenshots,
+            save_vlm_debug=args.save_vlm_debug,
             resume=not args.no_resume,
         )
     finally:

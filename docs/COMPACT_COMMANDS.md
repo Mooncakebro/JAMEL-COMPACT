@@ -603,7 +603,44 @@ outputs/compact_eval_debug/weibo/session0/
 └── trajectory_weibo_*.parquet
 ```
 
-### 3g. Convert eval screenshots to MP4 video
+### 3g. Render complete VLM inputs and outputs for debugging
+
+Each trajectory row stores the canonical user prompt (including the pruned
+AXTree), raw response, parsed action, and reward. New evaluations also store the
+exact text after `apply_chat_template()`, token/truncation metadata, chat roles,
+the previous action, and COMPACT memory/variance/surprise summaries. Render one
+complete, tall PNG per step:
+
+```bash
+python scripts/render_eval_debug.py \
+    outputs/compact_eval_debug/weibo/session0
+```
+
+Create the PNGs plus a readable scrolling video:
+
+```bash
+python scripts/render_eval_debug.py \
+    outputs/compact_eval_debug/weibo/session0 \
+    --video outputs/compact_eval_debug/weibo/session0/vlm_debug.mp4 \
+    --seconds-per-step 8
+```
+
+For future evaluations, enable screenshots so the debug view contains both the
+VLM image input and the browser result after its action:
+
+```bash
+SAVE_SCREENSHOTS=1 \
+SAVE_VLM_DEBUG=1 \
+EVAL_OUTPUT=outputs/compact_eval_debug \
+bash shell/run_compact_eval.sh
+```
+
+Older trajectories remain supported. They contain the canonical user prompt and
+response, but not the exact rendered chat-template text, token counts, previous
+action, or recurrent-state summaries. Runs without `SAVE_SCREENSHOTS=1` render a
+placeholder because the original image cannot be reconstructed afterward.
+
+### 3h. Convert eval screenshots to a simple MP4 video
 
 After evaluation, convert the per-step `before`/`after` screenshots into a video for visualization:
 

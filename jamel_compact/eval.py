@@ -79,6 +79,7 @@ class CompactAgent:
         max_new_tokens: int = 256,
         max_input_tokens: int = 8192,
         image_resize: tuple = (640, 360),
+        save_vlm_debug: bool = False,
     ):
         print(f"[agent] Loading JAMEL-COMPACT from {checkpoint} ...")
         use_model_parallel = device == "cuda" and torch.cuda.device_count() > 1
@@ -127,6 +128,7 @@ class CompactAgent:
         self.max_new_tokens = max_new_tokens
         self.max_input_tokens = max_input_tokens
         self.image_resize = image_resize
+        self.save_vlm_debug = save_vlm_debug
 
         # Session state
         self._memory_states = None
@@ -169,6 +171,40 @@ class CompactAgent:
             open_urls=open_urls,
             pruned_axtree=pruned_axtree,
         )
+
+    def _memory_summary(self) -> str:
+        """Return compact JSON statistics for the recurrent model state."""
+        rows = []
+        memory_states = self._memory_states or []
+        variance_states = self._variance_states or []
+        surprise_states = self._e_prev_list or []
+        for layer_idx, memory_state in enumerate(memory_states):
+            memory_float = memory_state.detach().float()
+            variance_state = (
+                variance_states[layer_idx]
+                if layer_idx < len(variance_states)
+                else None
+            )
+            surprise_state = (
+                surprise_states[layer_idx]
+                if layer_idx < len(surprise_states)
+                else None
+            )
+            row = {
+                "layer": layer_idx,
+                "memory_l2": float(memory_float.norm().item()),
+                "memory_mean": float(memory_float.mean().item()),
+                "memory_std": float(memory_float.std(unbiased=False).item()),
+            }
+            if variance_state is not None:
+                variance_float = variance_state.detach().float()
+                row["variance_mean"] = float(variance_float.mean().item())
+                row["variance_max"] = float(variance_float.max().item())
+            if surprise_state is not None:
+                surprise_float = surprise_state.detach().float()
+                row["surprise_mean"] = float(surprise_float.mean().item())
+            rows.append(row)
+        return json.dumps(rows, ensure_ascii=False)
 
     def _get_action_embedding(self) -> torch.Tensor:
         """Get action embedding from the last action string."""
@@ -220,13 +256,19 @@ class CompactAgent:
 
         # Truncate to max_input_tokens
         orig_len = inputs["input_ids"].shape[1]
+        input_truncated = orig_len > self.max_input_tokens
         if orig_len > self.max_input_tokens:
             for k in list(inputs.keys()):
                 if hasattr(inputs[k], "shape") and inputs[k].shape[-1] == orig_len:
                     inputs[k] = inputs[k][..., -self.max_input_tokens:]
+        model_input_len = inputs["input_ids"].shape[1]
 
         # Get action embedding
         action_embed_input = self._get_action_embedding()
+
+        memory_before_summary = (
+            self._memory_summary() if self.save_vlm_debug else None
+        )
 
         # Do not kill the whole evaluator from a background timer.  A slow
         # generation should be handled by the per-session error boundary.
@@ -250,6 +292,9 @@ class CompactAgent:
         self._memory_states = outputs["new_memory"]
         self._variance_states = outputs["new_variance"]
         self._e_prev_list = outputs.get("e_list")
+        memory_after_summary = (
+            self._memory_summary() if self.save_vlm_debug else None
+        )
 
         # Decode response — batch_decode matches original JAMEL eval exactly
         generated_ids = outputs["generated_ids"]
@@ -258,16 +303,30 @@ class CompactAgent:
         )[0]
         action, think = parse_action(raw_response)
 
-        # Update state
+        # Update state after capturing the action that conditioned this step.
+        previous_action = self._last_action
         self._last_action = action
         self._session_step_idx += 1
 
-        return {
+        result = {
             "action": action,
             "think": think,
             "raw_response": raw_response,
             "prompt": prompt,
         }
+        if self.save_vlm_debug:
+            result.update({
+                "model_input_text": prompt_text,
+                "chat_messages_json": json.dumps(messages, ensure_ascii=False),
+                "input_token_count_before_truncation": int(orig_len),
+                "model_input_token_count": int(model_input_len),
+                "input_truncated": bool(input_truncated),
+                "input_image_size": list(image.size),
+                "previous_action": previous_action,
+                "memory_before_summary": memory_before_summary,
+                "memory_after_summary": memory_after_summary,
+            })
+        return result
 
     def get_memory_snapshot(self) -> list:
         """Return current memory states for F8 linear probe."""
@@ -295,6 +354,7 @@ def run_eval(
     max_input_tokens: int = 8192,
     max_new_tokens: int = 256,
     save_screenshots: bool = False,
+    save_vlm_debug: bool = False,
     enable_linear_probe: bool = False,
     resume: bool = True,
 ):
@@ -308,6 +368,7 @@ def run_eval(
         top_p=top_p,
         max_input_tokens=max_input_tokens,
         max_new_tokens=max_new_tokens,
+        save_vlm_debug=save_vlm_debug,
     )
     agent._freeze_memory = freeze_memory_init
     if freeze_memory_init:
@@ -403,6 +464,8 @@ def main():
     parser.add_argument("--max-new-tokens", type=int, default=256)
     parser.add_argument("--save-screenshots", action="store_true",
                         help="Save before/after screenshots (uses extra disk and CPU)")
+    parser.add_argument("--save-vlm-debug", action="store_true",
+                        help="Record exact rendered VLM inputs and COMPACT state summaries")
     parser.add_argument("--enable-linear-probe", action="store_true",
                         help="Enable the optional memory probe; disabled by default")
     parser.add_argument("--no-resume", action="store_true",
@@ -470,6 +533,7 @@ def main():
             max_input_tokens=args.max_input_tokens,
             max_new_tokens=args.max_new_tokens,
             save_screenshots=args.save_screenshots,
+            save_vlm_debug=args.save_vlm_debug,
             enable_linear_probe=args.enable_linear_probe,
             resume=not args.no_resume,
         )
