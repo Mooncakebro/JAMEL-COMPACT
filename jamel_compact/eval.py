@@ -80,6 +80,9 @@ class CompactAgent:
         max_input_tokens: int = 8192,
         image_resize: tuple = (640, 360),
         save_vlm_debug: bool = False,
+        save_uncertainty: bool = False,
+        gain_mode: str = "learned",
+        fixed_gain: float = 0.5,
     ):
         print(f"[agent] Loading JAMEL-COMPACT from {checkpoint} ...")
         use_model_parallel = device == "cuda" and torch.cuda.device_count() > 1
@@ -129,6 +132,9 @@ class CompactAgent:
         self.max_input_tokens = max_input_tokens
         self.image_resize = image_resize
         self.save_vlm_debug = save_vlm_debug
+        self.save_uncertainty = save_uncertainty
+        self.gain_mode = gain_mode
+        self.fixed_gain = float(fixed_gain)
 
         # Session state
         self._memory_states = None
@@ -286,6 +292,11 @@ class CompactAgent:
                 mm_token_type_ids=inputs.get("mm_token_type_ids"),
                 e_prev_list=self._e_prev_list,
                 freeze_memory=self._freeze_memory,
+                gain_mode=self.gain_mode,
+                fixed_gain=self.fixed_gain,
+                collect_diagnostics=(
+                    self.save_uncertainty or self.gain_mode != "learned"
+                ),
             )
 
         # Update memory states
@@ -314,6 +325,13 @@ class CompactAgent:
             "raw_response": raw_response,
             "prompt": prompt,
         }
+        if self.save_uncertainty or self.gain_mode != "learned":
+            result["uncertainty_diagnostics"] = json.dumps({
+                "gain_mode": self.gain_mode,
+                "fixed_gain": self.fixed_gain,
+                "layers": outputs.get("uncertainty_diagnostics") or [],
+            }, ensure_ascii=False)
+
         if self.save_vlm_debug:
             result.update({
                 "model_input_text": prompt_text,
@@ -355,6 +373,9 @@ def run_eval(
     max_new_tokens: int = 256,
     save_screenshots: bool = False,
     save_vlm_debug: bool = False,
+    save_uncertainty: bool = False,
+    gain_mode: str = "learned",
+    fixed_gain: float = 0.5,
     enable_linear_probe: bool = False,
     resume: bool = True,
 ):
@@ -369,6 +390,9 @@ def run_eval(
         max_input_tokens=max_input_tokens,
         max_new_tokens=max_new_tokens,
         save_vlm_debug=save_vlm_debug,
+        save_uncertainty=save_uncertainty,
+        gain_mode=gain_mode,
+        fixed_gain=fixed_gain,
     )
     agent._freeze_memory = freeze_memory_init
     if freeze_memory_init:
@@ -415,7 +439,11 @@ def run_eval(
         headless=headless,
         port=port,
         seed=seed,
-        model_type="jamel_compact",
+        model_type=(
+            "jamel_compact"
+            if gain_mode == "learned"
+            else f"jamel_compact_gain_{gain_mode}_{fixed_gain:g}"
+        ),
         summary_title="EVALUATION SUMMARY (JAMEL-COMPACT)",
         browser_timeout_ms=browser_timeout_ms,
         reset_retries=reset_retries,
@@ -466,6 +494,13 @@ def main():
                         help="Save before/after screenshots (uses extra disk and CPU)")
     parser.add_argument("--save-vlm-debug", action="store_true",
                         help="Record exact rendered VLM inputs and COMPACT state summaries")
+    parser.add_argument("--save-uncertainty", action="store_true",
+                        help="Record per-layer/per-slot P, Q, R, K, surprise, and write diagnostics")
+    parser.add_argument("--gain-mode", choices=["learned", "fixed", "zero", "one"],
+                        default="learned",
+                        help="Kalman-gain mode for eval; fixed uses --fixed-gain")
+    parser.add_argument("--fixed-gain", type=float, default=0.5,
+                        help="Gain used with --gain-mode fixed (default: 0.5)")
     parser.add_argument("--enable-linear-probe", action="store_true",
                         help="Enable the optional memory probe; disabled by default")
     parser.add_argument("--no-resume", action="store_true",
@@ -534,6 +569,9 @@ def main():
             max_new_tokens=args.max_new_tokens,
             save_screenshots=args.save_screenshots,
             save_vlm_debug=args.save_vlm_debug,
+            save_uncertainty=args.save_uncertainty,
+            gain_mode=args.gain_mode,
+            fixed_gain=args.fixed_gain,
             enable_linear_probe=args.enable_linear_probe,
             resume=not args.no_resume,
         )

@@ -880,3 +880,80 @@ bash shell/run_baseline_train.sh
 | Qwen3-VL-8B | 4096 | 36 | 13.66M | 508.7M | ~8.0B | **6.4%** |
 
 The overhead **decreases** for larger base models because the projection layers (which scale with $d \times d_{mem}$) become a smaller fraction of the total.
+
+### 3d. Save uncertainty dynamics for paper analysis
+
+Use this mode for a normal COMPACT run when you want per-step diagnostics for
+$P_{t-1}$, $Q_t$, surprise inflation, $\hat P_t$, $R_t$, learned $K_t$, posterior
+$P_t$, innovation/write magnitudes, injection strength, and lightweight browser
+metadata. The data is stored in each session's `trajectory_*.parquet` (or JSONL
+fallback).
+
+```bash
+CHECKPOINT=outputs/compact_ckpt_v2/final \
+APPS_MODE=test10 \
+MAX_STEPS=50 \
+NUM_SESSIONS=3 \
+EVAL_OUTPUT=outputs/compact_eval_uncertainty \
+SAVE_UNCERTAINTY=1 \
+bash shell/run_compact_eval.sh
+```
+
+Plot the final memory layer's dynamics, calibration, event alignment, or slot
+heatmaps:
+
+```bash
+python scripts/plot_uncertainty_diagnostics.py \
+  --eval-dir outputs/compact_eval_uncertainty \
+  --app weibo --session 0 --layer -1 \
+  --mode dynamics \
+  --output outputs/compact_eval_uncertainty/weibo_session0_dynamics.pdf
+
+python scripts/plot_uncertainty_diagnostics.py \
+  --eval-dir outputs/compact_eval_uncertainty \
+  --mode calibration \
+  --output outputs/compact_eval_uncertainty/calibration.pdf
+
+python scripts/plot_uncertainty_diagnostics.py \
+  --eval-dir outputs/compact_eval_uncertainty \
+  --mode event --event-window 5 \
+  --output outputs/compact_eval_uncertainty/event_alignment.pdf
+
+python scripts/plot_uncertainty_diagnostics.py \
+  --eval-dir outputs/compact_eval_uncertainty \
+  --app weibo --session 0 --layer -1 \
+  --mode heatmap \
+  --output outputs/compact_eval_uncertainty/weibo_session0_heatmap.pdf
+```
+
+### 3e. Counterfactual gain ablations
+
+These modes keep the same observation and memory architecture but replace the
+learned Kalman gain only during evaluation. Use separate output directories and
+`RESUME=0` for each condition.
+
+```bash
+# Learned COMPACT gain (reference)
+GAIN_MODE=learned SAVE_UNCERTAINTY=1 RESUME=0 \
+  EVAL_OUTPUT=outputs/compact_eval_gain_learned \
+  bash shell/run_compact_eval.sh
+
+# Fixed gain: equal weighting of prior and observation
+GAIN_MODE=fixed FIXED_GAIN=0.5 SAVE_UNCERTAINTY=1 RESUME=0 \
+  EVAL_OUTPUT=outputs/compact_eval_gain_fixed05 \
+  bash shell/run_compact_eval.sh
+
+# No memory write / no observation correction
+GAIN_MODE=zero SAVE_UNCERTAINTY=1 RESUME=0 \
+  EVAL_OUTPUT=outputs/compact_eval_gain_zero \
+  bash shell/run_compact_eval.sh
+
+# Always accept the observation
+GAIN_MODE=one SAVE_UNCERTAINTY=1 RESUME=0 \
+  EVAL_OUTPUT=outputs/compact_eval_gain_one \
+  bash shell/run_compact_eval.sh
+```
+
+The counterfactual run still logs the model's original `k_learned` alongside the
+actual `k` used for the update, so the resulting trajectories directly show the
+behavioral effect of changing the gain rule.

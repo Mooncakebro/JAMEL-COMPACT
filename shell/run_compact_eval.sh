@@ -33,6 +33,9 @@ MAX_INPUT_TOKENS=${MAX_INPUT_TOKENS:-8192}
 MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-256}
 SAVE_SCREENSHOTS=${SAVE_SCREENSHOTS:-0}
 SAVE_VLM_DEBUG=${SAVE_VLM_DEBUG:-0}
+SAVE_UNCERTAINTY=${SAVE_UNCERTAINTY:-0}
+GAIN_MODE=${GAIN_MODE:-learned}
+FIXED_GAIN=${FIXED_GAIN:-0.5}
 ENABLE_LINEAR_PROBE=${ENABLE_LINEAR_PROBE:-0}
 PORT=${PORT:-0}                  # 0 = automatically reserve a free port
 RESUME=${RESUME:-1}              # 1 = skip completed app/session entries
@@ -63,12 +66,16 @@ fi
 if [[ "$SAVE_VLM_DEBUG" == "1" ]]; then
     OPTIONAL_ARGS+=(--save-vlm-debug)
 fi
+if [[ "$SAVE_UNCERTAINTY" == "1" || "$GAIN_MODE" != "learned" ]]; then
+    OPTIONAL_ARGS+=(--save-uncertainty)
+fi
 if [[ "$ENABLE_LINEAR_PROBE" == "1" ]]; then
     OPTIONAL_ARGS+=(--enable-linear-probe)
 fi
 if [[ "$RESUME" != "1" ]]; then
     OPTIONAL_ARGS+=(--no-resume)
 fi
+OPTIONAL_ARGS+=(--gain-mode "$GAIN_MODE" --fixed-gain "$FIXED_GAIN")
 
 echo "=== JAMEL-COMPACT Evaluation ==="
 echo "  Checkpoint:   $CHECKPOINT"
@@ -84,6 +91,9 @@ echo "  Browser ms:   $BROWSER_TIMEOUT_MS"
 echo "  Input tokens: $MAX_INPUT_TOKENS"
 echo "  New tokens:   $MAX_NEW_TOKENS"
 echo "  VLM debug:    $SAVE_VLM_DEBUG"
+echo "  Uncertainty:  $SAVE_UNCERTAINTY"
+echo "  Gain mode:    $GAIN_MODE"
+echo "  Fixed gain:   $FIXED_GAIN"
 echo "  Linear probe: $ENABLE_LINEAR_PROBE"
 echo "  Port:         $([[ "$PORT" == "0" ]] && echo auto || echo "$PORT")"
 echo "  Resume:       $RESUME"

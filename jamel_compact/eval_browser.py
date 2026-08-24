@@ -85,6 +85,22 @@ def _obs_to_bytes(obs: dict | None, key: str) -> bytes | None:
     return buffer.getvalue()
 
 
+def _observation_metadata(obs: dict | None) -> dict:
+    """Extract lightweight, serializable event metadata from a browser observation."""
+    if not isinstance(obs, dict):
+        return {}
+    screenshot = obs.get("screenshot")
+    metadata = {
+        "open_pages_urls": [str(url) for url in obs.get("open_pages_urls", ())],
+        "active_page_index": obs.get("active_page_index"),
+        "observation_chars": len(str(obs.get("observation", ""))),
+        "axtree_chars": len(str(obs.get("axtree", ""))),
+    }
+    if screenshot is not None and hasattr(screenshot, "shape"):
+        metadata["screenshot_shape"] = list(screenshot.shape)
+    return metadata
+
+
 def _save_trajectory(trajectory: list[dict], path: Path) -> Path:
     fallback_path = path.with_suffix(".jsonl")
     with fallback_path.open("w", encoding="utf-8") as output_file:
@@ -351,10 +367,13 @@ def run_browser_evaluation(
                     )
                     timestamp = datetime.now().isoformat()
                     result = agent.decide_action(obs, target_url, start_url, max_steps)
-                    action = result["action"] or "noop()"
+                    parsed_action = result["action"]
+                    action = parsed_action or "noop()"
+                    action_valid = bool(parsed_action and parsed_action.strip())
                     think = result["think"]
                     raw_response = result["raw_response"]
                     prompt = result["prompt"]
+                    before_observation_metadata = _observation_metadata(obs)
                     model_debug = {
                         key: result.get(key)
                         for key in (
@@ -367,9 +386,13 @@ def run_browser_evaluation(
                             "previous_action",
                             "memory_before_summary",
                             "memory_after_summary",
+                            "uncertainty_diagnostics",
                         )
                         if key in result
                     }
+                    model_debug["observation_metadata_before"] = json.dumps(
+                        before_observation_metadata, ensure_ascii=False,
+                    )
 
                     if on_step_decision is not None:
                         on_step_decision(app, step_idx_in_session)
@@ -393,6 +416,7 @@ def run_browser_evaluation(
                             "session_idx": session_idx,
                             "episode_idx": episode_idx,
                             "action": action,
+                            "action_valid": action_valid,
                             "think": think,
                             "raw_response": raw_response,
                             "prompt": prompt,
@@ -407,6 +431,9 @@ def run_browser_evaluation(
                             "start_url": start_url,
                             "timestamp": timestamp,
                             "episode_boundary": True,
+                            "observation_metadata_after": json.dumps(
+                                _observation_metadata(obs), ensure_ascii=False,
+                            ),
                         })
                         if coverage_path is not None:
                             history_coverage_paths.append(coverage_path)
@@ -427,6 +454,7 @@ def run_browser_evaluation(
                             "session_idx": session_idx,
                             "episode_idx": episode_idx,
                             "action": action,
+                            "action_valid": action_valid,
                             "think": think,
                             "raw_response": raw_response,
                             "prompt": prompt,
@@ -441,6 +469,9 @@ def run_browser_evaluation(
                             "start_url": start_url,
                             "timestamp": timestamp,
                             "error": f"{type(error).__name__}: {error}",
+                            "observation_metadata_after": json.dumps(
+                                _observation_metadata(obs), ensure_ascii=False,
+                            ),
                         })
                         if coverage_path is not None:
                             history_coverage_paths.append(coverage_path)
@@ -482,6 +513,7 @@ def run_browser_evaluation(
                         "session_idx": session_idx,
                         "episode_idx": episode_idx,
                         "action": action,
+                        "action_valid": action_valid,
                         "think": think,
                         "raw_response": raw_response,
                         "prompt": prompt,
@@ -497,6 +529,15 @@ def run_browser_evaluation(
                         "target_url": target_url,
                         "start_url": start_url,
                         "timestamp": timestamp,
+                        "observation_metadata_after": json.dumps(
+                            _observation_metadata(next_obs), ensure_ascii=False,
+                        ),
+                        "page_changed": (
+                            before_observation_metadata.get("open_pages_urls")
+                            != _observation_metadata(next_obs).get("open_pages_urls")
+                            or before_observation_metadata.get("active_page_index")
+                            != _observation_metadata(next_obs).get("active_page_index")
+                        ),
                     })
                     obs = next_obs
                     global_step += 1

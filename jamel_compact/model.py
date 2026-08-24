@@ -212,7 +212,7 @@ class SideMemoryModule(nn.Module):
 
     def predict(self, m_prev: torch.Tensor, p_prev: torch.Tensor,
                 action_embed: torch.Tensor,
-                e_prev: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+                e_prev: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """FiLM-GRU predict + variance prediction (U2).
 
         Args:
@@ -224,6 +224,8 @@ class SideMemoryModule(nn.Module):
         Returns:
             m_hat: [B, N_m, d_mem] — predicted memory state
             p_hat: [B, N_m] — predicted variance
+            q_noise: [B, N_m] — learned process-noise contribution
+            surprise_inflation: [B, N_m] — surprise-driven variance contribution
         """
         B, N_m, d_mem = m_prev.shape
         a_down = self.action_down(action_embed)  # [B, d_mem]
@@ -237,20 +239,27 @@ class SideMemoryModule(nn.Module):
         lam = torch.sigmoid(self.lambda_l_raw)  # [N_m]
         q_noise = F.softplus(self.Q_theta(a_down))  # [B, N_m]
         p_hat = lam.unsqueeze(0) * p_prev + q_noise  # [B, N_m]
+        surprise_inflation = torch.zeros_like(p_hat)
         if e_prev is not None and self.gamma_e > 0:
             # Clamp the surprise before inflating variance: e is an MSE in an
             # unbounded space, and without a cap a single large e drives
             # P_hat -> inf, K -> 1, and the memory into a write-overwrite
             # feedback loop (observed as mem_l2/nll blow-up during training).
             e_inflate = e_prev.detach().clamp(max=self.surprise_clip)
-            p_hat = p_hat + self.gamma_e * e_inflate.unsqueeze(-1)  # broadcast [B,1]→[B,N_m]
+            surprise_inflation = self.gamma_e * e_inflate.unsqueeze(-1)
+            p_hat = p_hat + surprise_inflation  # broadcast [B,1]→[B,N_m]
 
-        return m_hat, p_hat
+        return m_hat, p_hat, q_noise, surprise_inflation
 
     def correct(self, m_hat: torch.Tensor, p_hat: torch.Tensor,
-                z_down: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor,
-                                               torch.Tensor, torch.Tensor,
-                                               torch.Tensor]:
+                z_down: torch.Tensor, gain_mode: str = "learned",
+                fixed_gain: float = 0.5,
+                q_noise: Optional[torch.Tensor] = None,
+                surprise_inflation: Optional[torch.Tensor] = None,
+                p_prev: Optional[torch.Tensor] = None,
+                return_diagnostics: bool = False) -> Tuple[torch.Tensor, torch.Tensor,
+                                                               torch.Tensor, torch.Tensor,
+                                                               torch.Tensor, Optional[dict]]:
         """Learned Kalman filter update (U2) + observation model (U3).
 
         Args:
@@ -279,7 +288,19 @@ class SideMemoryModule(nn.Module):
         R = F.softplus(self.R_psi(z_mean)) + self.r_min  # [B, N_m]
 
         # ── U2: Kalman gain K = P_hat / (P_hat + R) ──
-        K = p_hat / (p_hat + R + eps)  # [B, N_m]
+        learned_K = p_hat / (p_hat + R + eps)  # [B, N_m]
+        if gain_mode == "learned":
+            K = learned_K
+        elif gain_mode == "fixed":
+            K = torch.full_like(learned_K, float(fixed_gain)).clamp(0.0, 1.0)
+        elif gain_mode == "zero":
+            K = torch.zeros_like(learned_K)
+        elif gain_mode == "one":
+            K = torch.ones_like(learned_K)
+        else:
+            raise ValueError(
+                f"Unknown gain_mode={gain_mode!r}; expected learned, fixed, zero, or one"
+            )
         K_exp = K.unsqueeze(-1)  # [B, N_m, 1]
 
         # ── Kalman update ──
@@ -308,15 +329,60 @@ class SideMemoryModule(nn.Module):
         # Surprise for next step (detached)
         e = e_per_sample.detach()  # [B]
 
+        diagnostics = None
+        if return_diagnostics:
+            def _slot_values(value: torch.Tensor) -> list:
+                return value.detach().float().cpu().tolist()
+
+            diagnostics = {
+                "layer": self.layer_idx,
+                "p_prev": _slot_values(p_prev if p_prev is not None else p_hat),
+                "q_noise": _slot_values(
+                    q_noise if q_noise is not None else torch.zeros_like(p_hat)
+                ),
+                "surprise_inflation": _slot_values(
+                    surprise_inflation
+                    if surprise_inflation is not None
+                    else torch.zeros_like(p_hat)
+                ),
+                "p_hat": _slot_values(p_hat),
+                "r": _slot_values(R),
+                "k_learned": _slot_values(learned_K),
+                "k": _slot_values(K),
+                "p_new": _slot_values(p_new),
+                "innovation_norm": _slot_values(delta_m.norm(dim=-1)),
+                "write_norm": _slot_values((K_exp * delta_m).norm(dim=-1)),
+                "memory_pred_norm": _slot_values(m_hat.norm(dim=-1)),
+                "memory_new_norm": _slot_values(m_new.norm(dim=-1)),
+                "surprise": _slot_values(e),
+            }
+
+        if return_diagnostics:
+            return m_new, p_new, e, loss_obs, loss_nll, diagnostics
         return m_new, p_new, e, loss_obs, loss_nll
 
-    def inject(self, h: torch.Tensor, m_new: torch.Tensor) -> torch.Tensor:
+    def inject(self, h: torch.Tensor, m_new: torch.Tensor,
+               return_diagnostics: bool = False):
         """F4: Zero-output-projection gated injection."""
         h_down = self.h_down(h)
         delta_down, _ = self.inject_cross_attn(h_down, m_new, m_new)
         delta_up = self.delta_up(delta_down)  # zero-init → 0 at start
         w = self.inject_w_max * torch.tanh(self.inject_gate)
-        return h + w * delta_up
+        injected_delta = w * delta_up
+        injected_h = h + injected_delta
+        if return_diagnostics:
+            hidden_norm = h.detach().float().norm(dim=-1).mean()
+            injection_norm = injected_delta.detach().float().norm(dim=-1).mean()
+            return injected_h, {
+                "injection_norm": float(injection_norm.cpu().item()),
+                "hidden_norm": float(hidden_norm.cpu().item()),
+                "injection_ratio": float(
+                    (injection_norm / hidden_norm.clamp_min(1e-8)).cpu().item()
+                ),
+                "gate": float(torch.tanh(self.inject_gate).detach().float().cpu().item()),
+                "layer_weight": float(self.inject_w_max),
+            }
+        return injected_h
 
     def extract_observation(self, h: torch.Tensor,
                             attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -1092,7 +1158,7 @@ class JAMELCompactWrapper(nn.Module):
                 e_prev = e_prev.to(layer_device)
 
             # 4a. Memory Predict (FiLM-GRU + variance predict)
-            m_hat, p_hat = sm.predict(
+            m_hat, p_hat, q_noise, surprise_inflation = sm.predict(
                 memory_state, variance_state, action_embed_layer,
                 e_prev=e_prev,
             )
@@ -1131,7 +1197,8 @@ class JAMELCompactWrapper(nn.Module):
 
             # 4d. Memory Correct (learned Kalman + obs model)
             m_new, p_new, e, loss_obs_l, loss_nll_l = sm.correct(
-                m_hat, p_hat, z_down,
+                m_hat, p_hat, z_down, q_noise=q_noise,
+                surprise_inflation=surprise_inflation, p_prev=variance_state,
             )
 
             # 4e. Memory Inject (F4: zero-init gated)
@@ -1198,6 +1265,9 @@ class JAMELCompactWrapper(nn.Module):
         mm_token_type_ids: Optional[torch.Tensor] = None,
         e_prev_list: Optional[List[Optional[torch.Tensor]]] = None,
         freeze_memory: bool = False,
+        gain_mode: str = "learned",
+        fixed_gain: float = 0.5,
+        collect_diagnostics: bool = False,
         **kwargs,
     ) -> dict:
         """F5: Memory-conditioned generation.
@@ -1267,6 +1337,7 @@ class JAMELCompactWrapper(nn.Module):
         # and populates the DynamicCache with its K/V projections.
         new_memory, new_variance = [], []
         e_list = []
+        uncertainty_diagnostics = []
         for l, (layer, sm) in enumerate(zip(decoder_layers, self.side_memories)):
             layer_device = self._module_device(layer)
             h = h.to(layer_device)
@@ -1276,7 +1347,7 @@ class JAMELCompactWrapper(nn.Module):
             e_prev = e_prev_list[l]
             if isinstance(e_prev, torch.Tensor):
                 e_prev = e_prev.to(layer_device)
-            m_hat, p_hat = sm.predict(
+            m_hat, p_hat, q_noise, surprise_inflation = sm.predict(
                 memory_state, variance_state, action_embed_layer,
                 e_prev=e_prev,
             )
@@ -1305,11 +1376,30 @@ class JAMELCompactWrapper(nn.Module):
             z_down = sm.extract_observation(
                 h_layer, attention_mask.to(layer_device),
             )
-            m_new, p_new, e, _, _ = sm.correct(m_hat, p_hat, z_down)
-            h = sm.inject(h_layer, m_new)
+            diagnostics = None
+            if collect_diagnostics:
+                m_new, p_new, e, _, _, diagnostics = sm.correct(
+                    m_hat, p_hat, z_down, gain_mode=gain_mode,
+                    fixed_gain=fixed_gain, q_noise=q_noise,
+                    surprise_inflation=surprise_inflation, p_prev=variance_state,
+                    return_diagnostics=True,
+                )
+                h, injection_diagnostics = sm.inject(
+                    h_layer, m_new, return_diagnostics=True,
+                )
+                diagnostics.update(injection_diagnostics)
+            else:
+                m_new, p_new, e, _, _ = sm.correct(
+                    m_hat, p_hat, z_down, gain_mode=gain_mode,
+                    fixed_gain=fixed_gain, q_noise=q_noise,
+                    surprise_inflation=surprise_inflation, p_prev=variance_state,
+                )
+                h = sm.inject(h_layer, m_new)
             new_memory.append(m_new)
             new_variance.append(p_new)
             e_list.append(e)
+            if collect_diagnostics:
+                uncertainty_diagnostics.append(diagnostics)
 
         # If freeze_memory (F5 ablation), don't write back new memory
         if freeze_memory:
@@ -1358,6 +1448,7 @@ class JAMELCompactWrapper(nn.Module):
             "new_memory": new_memory,
             "new_variance": new_variance,
             "e_list": e_list,
+            "uncertainty_diagnostics": uncertainty_diagnostics if collect_diagnostics else None,
         }
 
     @torch.inference_mode()
