@@ -85,19 +85,39 @@ def _obs_to_bytes(obs: dict | None, key: str) -> bytes | None:
     return buffer.getvalue()
 
 
+def _json_safe(value: Any) -> Any:
+    """Convert NumPy/browser values into JSON-compatible Python values."""
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return value
+
+
+def _json_dumps(value: Any) -> str:
+    return json.dumps(_json_safe(value), ensure_ascii=False)
+
+
 def _observation_metadata(obs: dict | None) -> dict:
     """Extract lightweight, serializable event metadata from a browser observation."""
     if not isinstance(obs, dict):
         return {}
     screenshot = obs.get("screenshot")
+    open_pages = obs.get("open_pages_urls", ())
+    if isinstance(open_pages, str):
+        open_pages = [open_pages]
     metadata = {
-        "open_pages_urls": [str(url) for url in obs.get("open_pages_urls", ())],
-        "active_page_index": obs.get("active_page_index"),
+        "open_pages_urls": [str(url) for url in _json_safe(open_pages)],
+        "active_page_index": _json_safe(obs.get("active_page_index")),
         "observation_chars": len(str(obs.get("observation", ""))),
         "axtree_chars": len(str(obs.get("axtree", ""))),
     }
     if screenshot is not None and hasattr(screenshot, "shape"):
-        metadata["screenshot_shape"] = list(screenshot.shape)
+        metadata["screenshot_shape"] = [int(size) for size in screenshot.shape]
     return metadata
 
 
@@ -390,8 +410,8 @@ def run_browser_evaluation(
                         )
                         if key in result
                     }
-                    model_debug["observation_metadata_before"] = json.dumps(
-                        before_observation_metadata, ensure_ascii=False,
+                    model_debug["observation_metadata_before"] = _json_dumps(
+                        before_observation_metadata,
                     )
 
                     if on_step_decision is not None:
@@ -431,8 +451,8 @@ def run_browser_evaluation(
                             "start_url": start_url,
                             "timestamp": timestamp,
                             "episode_boundary": True,
-                            "observation_metadata_after": json.dumps(
-                                _observation_metadata(obs), ensure_ascii=False,
+                            "observation_metadata_after": _json_dumps(
+                                _observation_metadata(obs),
                             ),
                         })
                         if coverage_path is not None:
@@ -469,8 +489,8 @@ def run_browser_evaluation(
                             "start_url": start_url,
                             "timestamp": timestamp,
                             "error": f"{type(error).__name__}: {error}",
-                            "observation_metadata_after": json.dumps(
-                                _observation_metadata(obs), ensure_ascii=False,
+                            "observation_metadata_after": _json_dumps(
+                                _observation_metadata(obs),
                             ),
                         })
                         if coverage_path is not None:
@@ -529,8 +549,8 @@ def run_browser_evaluation(
                         "target_url": target_url,
                         "start_url": start_url,
                         "timestamp": timestamp,
-                        "observation_metadata_after": json.dumps(
-                            _observation_metadata(next_obs), ensure_ascii=False,
+                        "observation_metadata_after": _json_dumps(
+                            _observation_metadata(next_obs),
                         ),
                         "page_changed": (
                             before_observation_metadata.get("open_pages_urls")
