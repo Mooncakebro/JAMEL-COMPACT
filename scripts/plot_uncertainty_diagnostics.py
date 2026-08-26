@@ -99,6 +99,7 @@ def _diagnostic_rows(paths: list[Path], layer: int) -> pd.DataFrame:
                 "app": row.get("app", path.parent.parent.name),
                 "session": row.get("session_idx", path.parent.name.replace("session", "")),
                 "step": int(row.get("step", len(records))),
+                "layer": int(data.get("layer", layer_index)),
                 "reward": float(row.get("reward", 0.0) or 0.0),
                 "delta_score": float(row.get("delta_score", 0.0) or 0.0),
                 "current_score": float(row.get("current_score", 0.0) or 0.0),
@@ -145,18 +146,41 @@ def _save_dynamics(frame: pd.DataFrame, output: Path, title: str | None) -> None
     _style()
     fig, axes = plt.subplots(4, 1, figsize=(7.2, 7.4), sharex=True, constrained_layout=True)
     x = frame["step"].to_numpy()
-    axes[0].plot(x, frame["current_score"], color="#1f77b4", lw=1.8, label="coverage")
-    axes[0].plot(x, frame["cumulative_reward"], color="#2ca02c", lw=1.2, label="cumulative reward")
-    axes[0].set_ylabel("Environment")
+    axes[0].plot(
+        x,
+        frame["cumulative_reward"],
+        color="#2ca02c",
+        lw=1.8,
+        drawstyle="steps-post",
+        label="cumulative reward",
+    )
+    rewarded = frame["reward"] > 0
+    axes[0].scatter(
+        x[rewarded],
+        frame.loc[rewarded, "cumulative_reward"],
+        color="#2ca02c",
+        edgecolors="white",
+        linewidths=0.4,
+        s=20,
+        zorder=3,
+        label="rewarded action",
+    )
+    axes[0].set_ylabel("Reward")
     axes[0].legend(loc="upper left", ncol=2)
 
     axes[1].plot(x, frame.get("surprise_mean", np.nan), color="#d62728", lw=1.6, label="surprise $e$")
-    axes[1].plot(x, frame.get("surprise_inflation_mean", np.nan), color="#9467bd", lw=1.2, label="surprise inflation")
+    axes[1].plot(
+        x,
+        frame.get("surprise_inflation_mean", np.nan),
+        color="#9467bd",
+        lw=1.2,
+        label=r"variance inflation $\gamma_e\,\mathrm{clip}(e_{t-1})$",
+    )
     axes[1].set_ylabel("Prediction error")
     axes[1].legend(loc="upper left", ncol=2)
 
     axes[2].plot(x, frame.get("p_hat_mean", np.nan), color="#ff7f0e", lw=1.5, label="$\\hat P$")
-    axes[2].plot(x, frame.get("p_new_mean", np.nan), color="#17becf", lw=1.5, label="$P_t$")
+    axes[2].plot(x, frame.get("p_new_mean", np.nan), color="#17becf", lw=1.5, label="posterior $P$")
     axes[2].plot(x, frame.get("r_mean", np.nan), color="#7f7f7f", lw=1.2, label="$R$")
     axes[2].set_ylabel("Uncertainty")
     axes[2].legend(loc="upper left", ncol=3)
@@ -170,8 +194,6 @@ def _save_dynamics(frame: pd.DataFrame, output: Path, title: str | None) -> None
 
     for axis in axes:
         axis.grid(axis="y", color="#dddddd", lw=0.5, alpha=0.8)
-        for delta_step in frame.loc[frame["delta_score"] > 0, "step"].tolist():
-            axis.axvline(delta_step, color="#222222", lw=0.45, alpha=0.18)
     if title:
         fig.suptitle(title, y=1.01, fontsize=11, fontweight="bold")
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -302,7 +324,12 @@ def _save_heatmap(paths: list[Path], output: Path, layer: int, title: str | None
 
     _style()
     fields = ["k", "p_hat", "r", "write_norm"]
-    labels = ["Kalman gain $K$", "Predicted variance $\\hat P$", "Observation noise $R$", "Effective write"]
+    labels = [
+        "Kalman gain $K$",
+        "Predicted variance $\\hat P$",
+        "Observation noise $R$",
+        r"Effective memory write $\|K\odot\Delta M\|$",
+    ]
     matrices = _slot_matrices(paths, layer, fields)
     if not any(matrix.size for matrix in matrices.values()):
         raise ValueError("No per-slot uncertainty arrays found")
@@ -316,6 +343,7 @@ def _save_heatmap(paths: list[Path], output: Path, layer: int, title: str | None
         axis.set_title(label)
         axis.set_xlabel("Evaluation step")
         axis.set_ylabel("Memory slot")
+        axis.set_yticks(np.arange(matrix.shape[1]))
         fig.colorbar(image, ax=axis, fraction=0.046, pad=0.04)
     if title:
         fig.suptitle(title, y=1.02, fontsize=11, fontweight="bold")
@@ -339,14 +367,16 @@ def main() -> None:
 
     paths = _find_trajectories(args.trajectory, args.eval_dir, args.app, args.session)
     frame = _diagnostic_rows(paths, args.layer)
+    layer_title = f"Layer {int(frame['layer'].iloc[0])}"
+    titled_layer = f"{args.title} — {layer_title}" if args.title else layer_title
     if args.mode == "dynamics":
-        _save_dynamics(frame, args.output, args.title)
+        _save_dynamics(frame, args.output, titled_layer)
     elif args.mode == "calibration":
         _save_calibration(frame, args.output, args.title)
     elif args.mode == "event":
         _save_event_alignment(frame, args.output, args.title, args.event_window)
     else:
-        _save_heatmap(paths, args.output, args.layer, args.title)
+        _save_heatmap(paths, args.output, args.layer, titled_layer)
     print(f"Saved {args.mode} plot to {args.output} using {len(frame)} diagnostic steps")
 
 
