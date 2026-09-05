@@ -16,6 +16,9 @@ Usage:
     # Only "after" screenshots:
     python scripts/snapshots_to_mp4.py session0/ --mode after_only --fps 2
 
+    # Clean screen-only video with action and accumulated reward overlays:
+    python scripts/snapshots_to_mp4.py session0/ --mode before_action --fps 2
+
 Requirements:
     pip install opencv-python numpy
 """
@@ -65,9 +68,60 @@ def load_image(path: Path | None) -> np.ndarray | None:
     return img
 
 
+def load_annotations(session_dir: Path) -> dict[int, tuple[str, float]]:
+    """Load action and cumulative reward annotations from the session trajectory."""
+    trajectories = sorted(session_dir.glob("trajectory_*.parquet"))
+    trajectories.extend(sorted(session_dir.glob("trajectory_*.jsonl")))
+    if not trajectories:
+        raise FileNotFoundError(f"No trajectory found in {session_dir}")
+
+    trajectory = max(trajectories, key=lambda path: path.stat().st_mtime)
+    if trajectory.suffix.lower() == ".jsonl":
+        import json
+
+        rows = [
+            json.loads(line)
+            for line in trajectory.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+    else:
+        try:
+            import pandas as pd
+        except ImportError as error:
+            raise RuntimeError(
+                "Reading parquet annotations requires pandas and pyarrow."
+            ) from error
+        rows = pd.read_parquet(trajectory).to_dict(orient="records")
+
+    annotations: dict[int, tuple[str, float]] = {}
+    running_reward = 0.0
+    for row_index, row in enumerate(rows):
+        try:
+            step = int(row.get("step", row_index)) + 1
+        except (TypeError, ValueError):
+            step = row_index + 1
+        action = str(row.get("action") or "(empty)")
+        try:
+            if row.get("cumulative_reward") is not None:
+                running_reward = float(row["cumulative_reward"])
+            else:
+                running_reward += float(row.get("reward") or 0.0)
+        except (TypeError, ValueError):
+            pass
+        annotations[step] = (action, running_reward)
+    return annotations
+
+
+def _shorten_text(text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    return text[: max(1, max_chars - 3)] + "..."
+
+
 def build_frames(
     step_entries: list[dict],
     mode: str,
+    annotations: dict[int, tuple[str, float]] | None = None,
     gap_color=(0, 0, 0),
     gap_width=4,
     label_height=36,
@@ -81,6 +135,7 @@ def build_frames(
       - side_by_side: before | after concatenated horizontally, one frame per step
       - before_only:  only the before screenshot
       - after_only:   only the after screenshot
+      - before_action: before screenshot with action and cumulative reward
     """
     frames: list[np.ndarray] = []
     font = cv2.FONT_HERSHEY_SIMPLEX
@@ -96,6 +151,30 @@ def build_frames(
         cv2.putText(
             bar, text, (10, label_height - 10),
             font, font_scale, label_fg, font_thickness, cv2.LINE_AA,
+        )
+        return np.vstack([bar, img])
+
+    def add_action_label(img: np.ndarray, step: int) -> np.ndarray:
+        if img is None:
+            return None
+        action, cumulative_reward = "(not recorded)", 0.0
+        if annotations and step in annotations:
+            action, cumulative_reward = annotations[step]
+        _, width = img.shape[:2]
+        bar_height = 78
+        bar = np.full((bar_height, width, 3), (48, 61, 82), dtype=np.uint8)
+        action_text = _shorten_text(
+            f"Step {step:03d}    Action: {action}",
+            max(32, width // 15),
+        )
+        reward_text = f"Accumulated reward: {cumulative_reward:.2f}"
+        cv2.putText(
+            bar, action_text, (14, 30), font, 0.72,
+            (255, 255, 255), 2, cv2.LINE_AA,
+        )
+        cv2.putText(
+            bar, reward_text, (14, 64), font, 0.68,
+            (150, 235, 170), 2, cv2.LINE_AA,
         )
         return np.vstack([bar, img])
 
@@ -152,6 +231,10 @@ def build_frames(
         elif mode == "after_only":
             if after_img is not None:
                 frames.append(add_label(after_img, f"Step {step} — After"))
+
+        elif mode == "before_action":
+            if before_img is not None:
+                frames.append(add_action_label(before_img, step))
 
     return frames
 
@@ -214,7 +297,10 @@ def main():
     )
     parser.add_argument(
         "--mode",
-        choices=["sequential", "side_by_side", "before_only", "after_only"],
+        choices=[
+            "sequential", "side_by_side", "before_only", "after_only",
+            "before_action",
+        ],
         default="sequential",
         help="Frame arrangement (default: sequential — before then after per step)",
     )
@@ -228,6 +314,12 @@ def main():
         "--codec",
         default="mp4v",
         help="FourCC codec (default: mp4v)",
+    )
+    parser.add_argument(
+        "--frames-dir",
+        type=Path,
+        default=None,
+        help="Optionally save the generated video frames as PNG files.",
     )
     args = parser.parse_args()
 
@@ -249,8 +341,16 @@ def main():
     print(f"  Mode: {args.mode}, FPS: {args.fps}")
     print(f"  Output: {output_path}")
 
-    frames = build_frames(step_entries, mode=args.mode)
+    annotations = load_annotations(session_dir) if args.mode == "before_action" else None
+    frames = build_frames(step_entries, mode=args.mode, annotations=annotations)
     print(f"  Built {len(frames)} frames")
+
+    if args.frames_dir is not None:
+        args.frames_dir.mkdir(parents=True, exist_ok=True)
+        for frame_index, frame in enumerate(frames, start=1):
+            frame_path = args.frames_dir / f"step_{frame_index:03d}_screen_action.png"
+            cv2.imwrite(str(frame_path), frame)
+        print(f"  Saved frames → {args.frames_dir}")
 
     write_video(frames, output_path, fps=args.fps, codec=args.codec)
 

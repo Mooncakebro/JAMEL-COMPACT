@@ -623,6 +623,22 @@ python scripts/render_eval_debug.py \
     outputs/compact_eval_debug/weibo/session0 \
     --video outputs/compact_eval_debug/weibo/session0/vlm_debug.mp4 \
     --seconds-per-step 8
+
+Create a clean screen-only video with one browser screenshot per step. The
+video contains no VLM prompt, response, AXTree, or memory panels; it only shows
+the parsed action and accumulated reward in a compact top banner:
+
+```bash
+python scripts/render_eval_debug.py \
+    outputs/compact_eval_debug/weibo/session0 \
+    --screen-only \
+    --output-dir outputs/compact_eval_debug/weibo/session0/screen_action_frames \
+    --video outputs/compact_eval_debug/weibo/session0/vlm_action.mp4 \
+    --fps 4 \
+    --seconds-per-step 0.5 \
+    --video-width 1280 \
+    --video-height 720
+```
 ```
 
 For future evaluations, enable screenshots so the debug view contains both the

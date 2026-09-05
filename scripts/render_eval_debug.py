@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Render complete per-step VLM debug frames and an optional scrolling video.
 
+Use ``--screen-only`` to create a clean screen-recording-style video containing
+only each browser screenshot, the parsed action, and accumulated reward.
+
 The renderer is backward compatible with existing JAMEL-COMPACT trajectories:
 old rows use ``prompt`` as the canonical user prompt; newer rows additionally
 show the exact processor-rendered chat template, token counts, previous action,
@@ -62,6 +65,7 @@ SECTION_FONT = _font(24, bold=True)
 MONO_FONT = _font(18, mono=True)
 MONO_BOLD_FONT = _font(18, mono=True, bold=True)
 SMALL_FONT = _font(16)
+ACTION_FONT = _font(20, mono=True, bold=True)
 
 
 def _clean_value(value: Any) -> Any:
@@ -222,12 +226,35 @@ def _draw_panel(
     return y + height
 
 
+def _draw_action_banner(
+    canvas: Image.Image,
+    x: int,
+    y: int,
+    width: int,
+    action: Any,
+    label: str,
+) -> None:
+    draw = ImageDraw.Draw(canvas)
+    text = f"{label}: {action or '(empty)'}"
+    draw.rectangle((x, y, x + width, y + 58), fill=OUTPUT_COLOR)
+    _draw_wrapped(
+        draw,
+        (x + 14, y + 9),
+        text,
+        font=ACTION_FONT,
+        fill="#FFFFFF",
+        chars_per_line=max(40, int(width / 12)),
+        line_spacing=2,
+    )
+
+
 def _render_step(
     row: dict,
     row_index: int,
     session_dir: Path,
     output_path: Path,
     width: int,
+    action_on_image: bool = False,
 ) -> dict:
     margin = 36
     gap = 28
@@ -328,14 +355,26 @@ def _render_step(
         width=2,
     )
     canvas.paste(screenshot, (left_x, left_y))
-    draw.text(
-        (left_x + 12, left_y + 10),
-        "IMAGE INPUT (browser screenshot; resized to 640×360 for VLM)",
-        font=MONO_BOLD_FONT,
-        fill="#FFFFFF",
-        stroke_width=2,
-        stroke_fill="#000000",
-    )
+    if action_on_image:
+        _draw_action_banner(canvas, left_x, left_y, left_width, row.get("action"), "ACTION")
+    if action_on_image:
+        draw.text(
+            (left_x + 12, left_y + 72),
+            "IMAGE INPUT (browser screenshot; resized to 640×360 for VLM)",
+            font=MONO_BOLD_FONT,
+            fill="#FFFFFF",
+            stroke_width=2,
+            stroke_fill="#000000",
+        )
+    else:
+        draw.text(
+            (left_x + 12, left_y + 10),
+            "IMAGE INPUT (browser screenshot; resized to 640×360 for VLM)",
+            font=MONO_BOLD_FONT,
+            fill="#FFFFFF",
+            stroke_width=2,
+            stroke_fill="#000000",
+        )
     left_y += screenshot.height + gap
     if after_image is not None:
         draw.rounded_rectangle(
@@ -346,14 +385,33 @@ def _render_step(
             width=2,
         )
         canvas.paste(after_image, (left_x, left_y))
-        draw.text(
-            (left_x + 12, left_y + 10),
-            "ENVIRONMENT OUTPUT AFTER ACTION",
-            font=MONO_BOLD_FONT,
-            fill="#FFFFFF",
-            stroke_width=2,
-            stroke_fill="#000000",
-        )
+        if action_on_image:
+            _draw_action_banner(
+                canvas,
+                left_x,
+                left_y,
+                left_width,
+                row.get("action"),
+                "ACTION → ENVIRONMENT",
+            )
+        if action_on_image:
+            draw.text(
+                (left_x + 12, left_y + 72),
+                "ENVIRONMENT OUTPUT AFTER ACTION",
+                font=MONO_BOLD_FONT,
+                fill="#FFFFFF",
+                stroke_width=2,
+                stroke_fill="#000000",
+            )
+        else:
+            draw.text(
+                (left_x + 12, left_y + 10),
+                "ENVIRONMENT OUTPUT AFTER ACTION",
+                font=MONO_BOLD_FONT,
+                fill="#FFFFFF",
+                stroke_width=2,
+                stroke_fill="#000000",
+            )
         left_y += after_image.height + gap
     left_y = _draw_panel(
         canvas, left_x, left_y, left_width,
@@ -387,6 +445,65 @@ def _render_step(
         "has_before_screenshot": before_screenshot is not None,
         "has_after_screenshot": after_screenshot is not None,
         "has_exact_model_input": bool(row.get("model_input_text")),
+    }
+
+
+def _render_screen_action_step(
+    row: dict,
+    row_index: int,
+    session_dir: Path,
+    output_path: Path,
+    video_width: int,
+    video_height: int,
+) -> dict:
+    margin = 18
+    banner_height = 82
+    step_number = _step_number(row, row_index)
+    screenshot_path = _screenshot_path(session_dir, step_number, "before")
+    screenshot = _load_screenshot(
+        screenshot_path,
+        max(1, video_width - 2 * margin),
+    )
+    content_height = max(1, video_height - banner_height - 2 * margin)
+    if screenshot.height > content_height:
+        screenshot = screenshot.resize(
+            (
+                max(1, round(screenshot.width * content_height / screenshot.height)),
+                content_height,
+            ),
+            Image.Resampling.LANCZOS,
+        )
+
+    canvas = Image.new("RGB", (video_width, video_height), "#171D27")
+    draw = ImageDraw.Draw(canvas)
+    draw.rectangle((0, 0, video_width, banner_height), fill="#30435F")
+    action = str(row.get("action") or "(empty)")
+    action_text = f"Step {step_number:03d}    Action: {action}"
+    max_action_chars = max(40, int(video_width / 13))
+    if len(action_text) > max_action_chars:
+        action_text = action_text[: max_action_chars - 3] + "..."
+    draw.text((18, 12), action_text, font=ACTION_FONT, fill="#FFFFFF")
+    draw.text(
+        (18, 48),
+        f"Accumulated reward: {row.get('cumulative_reward', 0)}",
+        font=ACTION_FONT,
+        fill="#A8E6B8",
+    )
+    canvas.paste(
+        screenshot,
+        (
+            (video_width - screenshot.width) // 2,
+            banner_height + (content_height - screenshot.height) // 2 + margin,
+        ),
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    canvas.save(output_path, quality=95)
+    return {
+        "step": step_number,
+        "frame": str(output_path),
+        "has_screenshot": screenshot_path is not None,
+        "action": action,
+        "cumulative_reward": row.get("cumulative_reward", 0),
     }
 
 
@@ -474,7 +591,10 @@ def _write_scrolling_video(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Render complete per-step VLM inputs/outputs from an eval session."
+        description=(
+            "Render per-step VLM debug frames, or a clean screenshot video "
+            "with action/reward overlays."
+        )
     )
     parser.add_argument("session_dir", type=Path)
     parser.add_argument("--trajectory", type=Path, default=None)
@@ -491,6 +611,16 @@ def main() -> None:
     parser.add_argument("--seconds-per-step", type=float, default=8.0)
     parser.add_argument("--video-width", type=int, default=1920)
     parser.add_argument("--video-height", type=int, default=1080)
+    parser.add_argument(
+        "--action-on-image",
+        action="store_true",
+        help="Draw the parsed action in a banner at the top of each screenshot.",
+    )
+    parser.add_argument(
+        "--screen-only",
+        action="store_true",
+        help="Render only the browser screenshot with action and reward overlays.",
+    )
     args = parser.parse_args()
 
     session_dir = args.session_dir.resolve()
@@ -510,11 +640,61 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     manifest = []
     frame_paths = []
+    if args.screen_only:
+        output_dir = args.output_dir or (session_dir / "screen_action_frames")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        for row_index, row in enumerate(rows):
+            frame_path = output_dir / f"step_{_step_number(row, row_index):03d}_screen_action.png"
+            manifest.append(
+                _render_screen_action_step(
+                    row,
+                    row_index,
+                    session_dir,
+                    frame_path,
+                    args.video_width,
+                    args.video_height,
+                )
+            )
+            frame_paths.append(frame_path)
+        manifest_path = output_dir / "manifest.json"
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "session_dir": str(session_dir),
+                    "trajectory": str(trajectory_path),
+                    "frames": manifest,
+                },
+                indent=2,
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        if args.video is None:
+            parser.error("--screen-only requires --video")
+        _write_scrolling_video(
+            frame_paths,
+            args.video,
+            args.fps,
+            args.seconds_per_step,
+            args.video_width,
+            args.video_height,
+        )
+        print(f"[debug] Screen-only frames: {output_dir}")
+        print(f"[debug] Video: {args.video}")
+        return
+
     for row_index, row in enumerate(rows):
         step_number = _step_number(row, row_index)
         frame_path = output_dir / f"step_{step_number:03d}_vlm_debug.png"
         manifest.append(
-            _render_step(row, row_index, session_dir, frame_path, args.width)
+            _render_step(
+                row,
+                row_index,
+                session_dir,
+                frame_path,
+                args.width,
+                action_on_image=args.action_on_image,
+            )
         )
         frame_paths.append(frame_path)
         print(f"[debug] Rendered {frame_path}")
